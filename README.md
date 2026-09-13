@@ -2,7 +2,7 @@
 
 [![Latest release](https://img.shields.io/github/v/release/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/releases/latest) [![Last commit](https://img.shields.io/github/last-commit/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/commits/main) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![PowerShell 7.4+](https://img.shields.io/badge/PowerShell-7.4%2B-5391FE)](https://github.com/PowerShell/PowerShell) [![GitHub Sponsors](https://img.shields.io/github/sponsors/countzero?label=Sponsor&logo=GitHub)](https://github.com/sponsors/countzero) [![Ko-fi](https://img.shields.io/badge/Ko--fi-Tip-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/finnkumkar)
 
-A zero-dependency PowerShell utility for Claude Code on Windows and Linux that combines secure multi-account management with a live usage dashboard and automated limit-based rotation.
+A zero-dependency PowerShell utility for Claude Code on Windows, Linux, and macOS that combines secure multi-account management with a live usage dashboard and automated limit-based rotation.
 
 <p align="center">
   <img src="docs/images/monitor.svg" alt="sca monitor: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, a right-aligned '▶ switching slot at 95%' header indicator, and a '[Monitor] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
@@ -28,23 +28,22 @@ A zero-dependency PowerShell utility for Claude Code on Windows and Linux that c
 
 **Reliability & footprint**
 
-- **Atomic-safe writes**: slot-file updates use an atomic rename (`MoveFileEx` on Windows, `rename(2)` on Linux) with retry so they survive a running Claude Code on `.credentials.json`; `save` / `switch` still refuse to run while it's open to protect `~/.claude.json`
+- **Atomic-safe writes**: slot-file updates use an atomic rename (`MoveFileEx` on Windows, `rename(2)` on Unix) with retry so they survive a running Claude Code on `.credentials.json`; `save` / `switch` still refuse to run while it's open to protect `~/.claude.json`
 - **Zero dependencies**: pure PowerShell 7.4+, no external packages, no companion assets
 
 ## Installation
 
 ### Requisite
 
-**Requires PowerShell 7.4+** on **Windows or Linux**. Run everything from `pwsh`.
+**Requires PowerShell 7.4+** on **Windows, Linux, or macOS**. Run everything from `pwsh`.
 
-| Platform | Install PowerShell | Supported |
-|----------|--------------------|-----------|
-| Windows  | `winget install Microsoft.PowerShell` (stock Windows ships 5.1, which is not supported) | Yes |
-| Linux    | [Microsoft's package instructions](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-linux) | Yes |
-| macOS    | — | **No**, see below |
+| Platform | Install PowerShell |
+|----------|--------------------|
+| Windows  | `winget install Microsoft.PowerShell` (stock Windows ships 5.1, which is not supported) |
+| Linux    | [Microsoft's package instructions](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-linux) |
+| macOS    | [Microsoft's package instructions](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-macos) |
 
-> [!IMPORTANT]
-> **macOS is not supported and the script refuses to run there.** Claude Code stores credentials in the encrypted macOS Keychain rather than in `~/.claude/.credentials.json`, so replacing that file has no effect: `switch` would report success while Claude Code kept authenticating and billing the previous account. Refusing is safer than swapping accounts silently incorrectly. Supporting macOS needs a Keychain backend, which is not implemented yet.
+The test suite runs on all three on every push.
 
 ### Download
 
@@ -260,13 +259,13 @@ Credentials, slot files, and the state file live in `~/.claude/` (`%USERPROFILE%
 
 Setting `CLAUDE_CONFIG_DIR` moves the whole tree, including `.claude.json`, and `sca` follows it. The value is used exactly as given: a leading `~` is **not** expanded and a relative path resolves against the current directory, matching what Claude Code itself does. When the variable relocates the directory, `sca` prints one line naming the directory in use and how many slots are being left behind in the default location.
 
-### File permissions (Linux)
+### File permissions (Linux and macOS)
 Every file `sca` writes is created `0600` before being moved into place, matching what Claude Code does. This includes `.credentials.json`, slot files, identity sidecars, the state file, and `~/.claude.json`.
 
 ### Name sanitization
 Spaces, filename-unsafe characters (`\ / : * ? " < > |` and control chars), PowerShell wildcard brackets (`[` `]`), and parentheses (`(` `)`) are automatically replaced with `_`. Trailing dots are stripped. Reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`) are rejected.
 
-These rules are Windows-strict on every platform by design, so a slot name yields the same filename everywhere and a `~/.claude` directory copied from Linux to Windows stays usable.
+These rules are Windows-strict on every platform by design, so a slot name yields the same filename everywhere and a `~/.claude` directory copied from Linux or macOS to Windows stays usable.
 
 - `my personal` → `my_personal`
 - `foo/bar` → `foo_bar`

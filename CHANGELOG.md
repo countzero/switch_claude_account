@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.0] - 2026-09-13
+
+### Added
+
+- macOS is supported. The 4.0.0 refusal rested on Claude Code keeping credentials in the encrypted Keychain there, and it does not: its credential storage ships exactly two backends, a plaintext `.credentials.json` used on every platform and a Windows Credential Manager backend that is off by default. The Keychain holds only a device key. macOS therefore reads and writes the same file as Linux, and `Assert-SupportedPlatform` has been removed rather than left as a guard with nothing to assert.
+- The test workflow runs on `macos-latest` alongside `windows-latest` and `ubuntu-latest`. Coverage and its 90% gate still run on Windows only, because the gate counts one run and each platform necessarily leaves the others' branches untouched.
+- An on-demand workflow step re-checks Claude Code's credential backends against the darwin build and fails if the plaintext backend ever disappears. Gated to `workflow_dispatch`: it pulls a ~200 MB package for a fact that changes at most once a release.
+
+### Changed
+
+- The `save` / `switch` / `monitor` refusal-while-running guard is documented as unable to detect an npm-installed Claude Code on macOS, alongside the Windows gap it already carried. PowerShell defines `Process.CommandLine` as a script property branching on `$IsWindows` and `$IsLinux` and nothing else, so the command-line probe is always `$null` on Darwin. A Claude Code installed by the native installer is still detected everywhere, by process name.
+
 ## [4.0.0] - 2026-09-08
 
 ### Changed

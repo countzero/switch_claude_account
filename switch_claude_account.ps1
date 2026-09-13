@@ -3,7 +3,7 @@
 
 <#
 .SYNOPSIS
-Switch between multiple Claude Code accounts on Windows and Linux.
+Switch between multiple Claude Code accounts on Windows, Linux, and macOS.
 
 .DESCRIPTION
 This script manages named credential slots for Claude Code. It saves, switches,
@@ -164,7 +164,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '4.0.0'
+$Script:ScriptVersion = '4.1.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -252,6 +252,46 @@ $Script:ProfileTimeoutSec   = 10
 # run instantly).
 $Script:TokenRefreshRetryMax     = 3
 $Script:TokenRefreshRetryDelayMs = 2000
+
+# --- Where Claude Code actually keeps the active login ---
+#
+# Everything this tool does rests on .credentials.json being the active login,
+# so it is worth recording what that premise is and how it could stop holding.
+# Extracted from claude.exe 2.1.270 with the same string-scan recipe as above.
+#
+# Claude Code's secureStorage module defines exactly two credential backends:
+#
+#   name:"plaintext"        <CredDir>/.credentials.json, every platform
+#   name:"windows-credman"  Windows Credential Manager, via Bun.secrets
+#
+# There is no macOS Keychain credential backend. The Keychain holds only the
+# device key, under service "Claude Code-device-keys", and the one Keychain
+# API-key path is behind a hardcoded `let s=!1`. macOS reads and writes the
+# same .credentials.json as Linux, which is why `sca` supports it.
+#
+# windows-credman is NOT active by default. It is selected by
+#
+#   $env:CLAUDE_CODE_FORCE_WINDOWS_CREDMAN -eq '1'
+#     -or (.claude.json).cachedGrowthBookFeatures.tengu_windows_credman -eq $true
+#
+# a server-controlled GrowthBook flag, so it can turn on without the user doing
+# anything. When it does, storage becomes credman-primary with plaintext as
+# fallback, and the first successful credman write DELETES .credentials.json.
+# From that point `sca switch` writes a file Claude Code no longer reads: it
+# would report success while the previous account stayed authenticated and
+# billing, which is the exact failure this tool exists to prevent.
+#
+# The credman item is service "Claude Code" + OAUTH_FILE_SUFFIX ("" in
+# production) + "-credentials", suffixed with -<sha256(CLAUDE_CONFIG_DIR)[0..8]>
+# when that variable is set, under account "claude-code-user"; payloads over
+# 2400 bytes are split into base64 chunks named <service>#0..#n with a #m
+# manifest. Reading it back would mean P/Invoking CredRead/CredWrite and
+# reimplementing that chunking, which is not worth building against a flag
+# nobody has been observed to receive.
+#
+# Symptom to watch for: .credentials.json missing or stale on Windows while
+# Claude Code is logged in and `sca switch` silently fails to change /status.
+# Check with `cmdkey /list` for a "Claude Code-credentials" entry.
 
 # Per-slot record of the last /api/oauth/usage attempt, keyed by slot path.
 # One structure (not two parallel maps) so the data and the throttle state
@@ -496,7 +536,7 @@ function Get-CredentialSlotFiles {
 # so the function is pure and the suite can drive every branch by argument,
 # rather than leaning on PowerShell's dynamic scoping to reach in and rebind
 # globals (which reads as dead assignments to both PSScriptAnalyzer and to the
-# next person). Same reasoning as Assert-SupportedPlatform.
+# next person). Assert-CredentialDir takes its directory the same way.
 function Get-ConfigDirAdvisory {
     Param (
         [AllowNull()] [AllowEmptyString()] [String] $ConfigDir = $ScaConfigDir,
@@ -536,28 +576,6 @@ function Get-ConfigDirAdvisory {
     return $message
 }
 
-# Refuse to run on macOS.
-#
-# Claude Code stores credentials in the encrypted macOS Keychain, falling back
-# to .credentials.json only when the Keychain rejects the write (a locked
-# keychain in an SSH session, for example). This tool swaps accounts by writing
-# .credentials.json, which the Keychain-backed path ignores: `switch` would
-# report success while Claude Code kept authenticating and billing the previous
-# account. Silence is the worst outcome for a tool whose entire job is knowing
-# which account is active, so refuse until a Keychain backend exists.
-#
-# The platform arrives as a parameter defaulting to $IsMacOS because $IsMacOS
-# is a read-only automatic variable that no test can assign, and Pester cannot
-# mock a variable. A default-valued parameter keeps the production call site
-# argument-free while letting the suite exercise both arms from any OS.
-function Assert-SupportedPlatform {
-    Param ([bool] $IsMacOSPlatform = $IsMacOS)
-
-    if ($IsMacOSPlatform) {
-        throw "macOS is not supported: Claude Code keeps credentials in the encrypted Keychain, so replacing .credentials.json has no effect and 'switch' would silently leave the previous account active and billing. Windows and Linux are supported."
-    }
-}
-
 # Refuse when no credentials directory could be resolved.
 #
 # $CredDir is blank only when the platform's home variable is unset AND
@@ -568,8 +586,8 @@ function Assert-SupportedPlatform {
 # paths are left blank instead of throwing at load time.
 #
 # The directory arrives as a parameter defaulting to the script value for the
-# same reason as Assert-SupportedPlatform: it keeps the production call site
-# argument-free while letting the suite drive both arms.
+# reason spelled out on Get-ConfigDirAdvisory: it keeps the production call
+# site argument-free while letting the suite drive both arms.
 function Assert-CredentialDir {
     Param ([AllowNull()] [AllowEmptyString()] [String] $Directory = $CredDir)
 
@@ -737,12 +755,23 @@ function Update-ScaState {
 # it entirely; on Unix the second probe matches the package's own entry
 # point in the command line instead.
 #
-# The command-line probe is Unix-only, and the reason is measured, not
-# stylistic: reading .CommandLine off every process costs ~53 s on Windows,
-# where the property is backed by a per-process CIM query, against a few ms
-# on Linux, where it is a /proc/<pid>/cmdline read. A guard that runs before
-# every save / switch / rotation cannot spend that. The residual gap is an
-# npm-installed Claude Code on Windows.
+# The command-line probe skips Windows, and the reason is measured, not
+# stylistic: reading .CommandLine off every process costs ~53 s there, where
+# the property is backed by a per-process CIM query, against a few ms on Linux,
+# where it is a /proc/<pid>/cmdline read. A guard that runs before every
+# save / switch / rotation cannot spend that.
+#
+# On macOS the probe runs but cannot match: PowerShell defines .CommandLine as
+# a ScriptProperty whose body branches on $IsWindows and $IsLinux and nothing
+# else (types.ps1xml, verified against 7.4), so it is always $null on Darwin.
+# The call is left in rather than short-circuited because reading a
+# guaranteed-null property is cheap, and it would start working on its own if
+# PowerShell ever grows a Darwin branch, where a hardcoded early return would
+# freeze the gap in place.
+#
+# The residual gap is therefore an npm-installed Claude Code on Windows or
+# macOS: the name probe cannot see it and the command-line probe does not run
+# or cannot match.
 #
 # Get-Process enumerates processes from ALL users on the system (limited
 # detail for processes owned by other users, but the Process objects
@@ -5656,20 +5685,19 @@ function Invoke-Main {
         return
     }
 
-    # After -Version / help so those stay informational on every platform,
-    # and before the credentials directory is created so an unsupported
-    # platform leaves no trace on disk.
+    # After -Version / help so those stay informational everywhere, and before
+    # the credentials directory is created so a refused run leaves no trace on
+    # disk.
     #
-    # `uninstall` is exempt from both preconditions, and from the directory
-    # creation below: it touches nothing but the PowerShell profile, so
-    # neither the Keychain risk nor a missing home directory applies to it.
-    # Refusing it would strand the alias block on any machine that cannot
-    # satisfy the guards, with no way to remove it but a hand edit, and
-    # $PROFILE.CurrentUserAllHosts is the same path on Linux and macOS, so a
-    # synced profile puts a block there without anyone installing it.
+    # `uninstall` is exempt from the precondition, and from the directory
+    # creation below: it touches nothing but the PowerShell profile, so a
+    # missing home directory does not apply to it. Refusing it would strand the
+    # alias block on any machine that cannot satisfy the guard, with no way to
+    # remove it but a hand edit, and $PROFILE.CurrentUserAllHosts is the same
+    # path on Linux and macOS, so a synced profile puts a block there without
+    # anyone installing it.
     $profileOnly = ($Action -eq 'uninstall')
     if (-not $profileOnly) {
-        Assert-SupportedPlatform
         Assert-CredentialDir
     }
 

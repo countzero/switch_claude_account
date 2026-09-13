@@ -2370,30 +2370,11 @@ Describe 'switch_claude_account' {
         }
     }
 
-    Context 'Assert-SupportedPlatform' {
-        # $IsMacOS is a read-only automatic variable and Pester cannot mock a
-        # variable, which is why the platform arrives as a parameter. That
-        # lets both arms run on every OS instead of only on a Mac.
-
-        It 'throws on macOS, naming the Keychain as the reason' {
-            { Assert-SupportedPlatform -IsMacOSPlatform $true } |
-                Should -Throw -ExpectedMessage '*Keychain*'
-        }
-
-        It 'does not throw on Windows or Linux' {
-            { Assert-SupportedPlatform -IsMacOSPlatform $false } | Should -Not -Throw
-        }
-
-        It 'defaults to the running platform, which the suite never runs on macOS' {
-            { Assert-SupportedPlatform } | Should -Not -Throw
-        }
-    }
-
     Context 'Assert-CredentialDir' {
         # $CredDir is blank only when neither the platform's home variable nor
-        # CLAUDE_CONFIG_DIR is set. Both arrive as a parameter for the same
-        # reason as Assert-SupportedPlatform: they bind once at load time, so
-        # the suite drives the branches by argument.
+        # CLAUDE_CONFIG_DIR is set. The directory arrives as a parameter
+        # because it binds once at load time, so the suite drives the branches
+        # by argument.
 
         It 'throws naming both variables when no directory resolved: <Case>' -ForEach @(
             @{ Case = 'null';       Directory = $null }
