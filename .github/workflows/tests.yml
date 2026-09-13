@@ -1,19 +1,29 @@
 name: Tests
 
+# `push` is main-only on purpose. Every branch here reaches main through a pull
+# request, so listing `develop` too matched both triggers for one commit and ran
+# the whole 3-OS matrix twice. Deduplicating with a concurrency group cannot fix
+# that: the two events carry different refs (`refs/heads/develop` against
+# `refs/pull/N/merge`), and normalising the key so they collide would make the
+# two runs cancel each other, with no say in which survives. A cancelled run
+# reads as a failed required check, so that trades duplicate work for a flaky
+# gate. Narrowing the trigger is deterministic instead.
+#
+# The gap: a push to a branch with no open pull request runs nothing. That is
+# the state in which nobody is reading the verdict yet, and `workflow_dispatch`
+# covers wanting it anyway.
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# A push to `develop` while a PR from it is open matches both triggers, so the
-# whole 3-OS matrix ran twice for one commit. Keyed on the ref rather than the
-# event so those two runs collapse into one. Superseded runs are cancelled:
-# the tip is the only revision anyone reads a verdict from, and a 70-second
-# suite is not worth protecting a stale one.
+# Supersede a run whose commit is no longer the tip of its pull request. The tip
+# is the only revision anyone reads a verdict from, and cancelling within one
+# ref is unambiguous in a way that cancelling across two events is not.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
