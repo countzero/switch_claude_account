@@ -1799,11 +1799,13 @@ Describe 'switch_claude_account' {
             $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
 
             # 1 condition line (errors only; no-oauth matches no bucket)
-            # + 2 messages + 1 grouped remedy.
+            # + 1 grouped remedy + 2 messages. Remedies precede the per-slot
+            # messages because they are the group that must survive
+            # $Script:AdvisoryMaxLines; see Format-UsageAdvisory.
             $lines.Count | Should -Be 4
-            $lines[1] | Should -Be '[Usage] y-dead: boom y-dead'
-            $lines[2] | Should -Be '[Usage] z-dead: boom z-dead'
-            $lines[3] | Should -Be "[Usage] 'a-apikey', 'b-apikey', 'c-apikey': api key or non-claude.ai slot"
+            $lines[1] | Should -Be "[Usage] 'a-apikey', 'b-apikey', 'c-apikey': api key or non-claude.ai slot"
+            $lines[2] | Should -Be '[Usage] y-dead: boom y-dead'
+            $lines[3] | Should -Be '[Usage] z-dead: boom z-dead'
         }
 
         # Every production path that yields 'expired' stamps an Error
@@ -1823,10 +1825,10 @@ Describe 'switch_claude_account' {
 
             $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results $rows)) -split "`n")
 
-            # 1 condition line + 3 capped messages + 1 grouped remedy.
+            # 1 condition line + 1 grouped remedy + 3 capped messages.
             $lines.Count | Should -Be 5
             @($lines | Where-Object { $_ -match 'z-expired' }).Count | Should -Be 1
-            $lines[4] | Should -Be "[Usage] 'z-expired': token refresh failed; run sca switch to refresh"
+            $lines[1] | Should -Be "[Usage] 'z-expired': token refresh failed; run sca switch to refresh"
         }
 
         It 'prefers the message over the remedy when the slot fits inside the cap' {
@@ -1854,10 +1856,51 @@ Describe 'switch_claude_account' {
 
             $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results $rows)) -split "`n")
 
-            # 1 condition line + 3 capped messages + the remedy.
+            # 1 condition line + the remedy + 3 capped messages.
             $lines.Count | Should -Be 5
             @($lines | Where-Object { $_ -match ': boom ' }).Count | Should -Be 3
-            $lines[-1] | Should -Be "[Usage] 'revoked': token revoked; run sca switch then /login"
+            $lines[1] | Should -Be "[Usage] 'revoked': token revoked; run sca switch then /login"
+        }
+
+        # The block is painted inside a watch frame addressed with ESC[H plus
+        # per-line erase, which stops being in-place the moment the frame is
+        # taller than the terminal. Ten lines of advisory, several wrapping at
+        # $Script:AdvisoryReasonMaxWidth, is enough to push the table off a
+        # 24-row screen on its own.
+        It 'never exceeds AdvisoryMaxLines, and drops only per-slot detail' {
+            # Four distinct conditions (one slot each) so every condition line
+            # fires, plus three hard-failure statuses for three remedies, plus
+            # enough messages to overflow.
+            $rows = @()
+            $e = New-RlRow -Name 'bare-err' -Status 'error';        $e.Error = 'boom bare-err';   $rows += $e
+            $l = New-RlRow -Name 'bare-lim' -Status 'rate-limited'; $rows += $l
+            $n = New-RlRow -Name 'cach-net' -Status 'error';        $n.Error = 'boom cach-net'
+            $n.IsCachedFallback = $true; $n.FallbackReason = 'network';  $rows += $n
+            $c = New-RlRow -Name 'cach-lim' -Status 'rate-limited'
+            $c.IsCachedFallback = $true; $c.FallbackReason = 'rate-limit'; $rows += $c
+            $x = New-RlRow -Name 'gone-exp' -Status 'expired';      $x.Error = 'boom gone-exp'; $rows += $x
+            $rows += (New-RlRow -Name 'gone-401' -Status 'unauthorized')
+            $rows += (New-RlRow -Name 'gone-key' -Status 'no-oauth')
+
+            $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results $rows)) -split "`n")
+
+            $lines.Count | Should -BeLessOrEqual $Script:AdvisoryMaxLines
+
+            # Coverage survives the cap: all four condition lines and all three
+            # remedies are present, so no failing slot goes unmentioned.
+            @($lines | Where-Object { $_ -match 'could not be read; usage unknown' }).Count      | Should -Be 1
+            @($lines | Where-Object { $_ -match 'currently rate-limited or at a plan limit\.' }).Count | Should -Be 1
+            @($lines | Where-Object { $_ -match 'could not be read live; showing last known usage' }).Count | Should -Be 1
+            @($lines | Where-Object { $_ -match 'plan limit; showing last known usage' }).Count            | Should -Be 1
+            $lines | Should -Contain "[Usage] 'gone-exp': token refresh failed; run sca switch to refresh"
+            $lines | Should -Contain "[Usage] 'gone-401': token revoked; run sca switch then /login"
+            $lines | Should -Contain "[Usage] 'gone-key': api key or non-claude.ai slot"
+
+            # gone-exp is the case the remedy budget is reserved for: it
+            # carries a message, so a reason-first budget would drop that
+            # message to the cap AND its remedy to $reported, leaving the one
+            # failure class that never clears on its own with no line at all.
+            @($lines | Where-Object { $_ -match 'gone-exp' }).Count | Should -Be 1
         }
 
         It 'ok rows never produce a reason line' {

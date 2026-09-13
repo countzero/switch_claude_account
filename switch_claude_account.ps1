@@ -470,6 +470,22 @@ $Script:AccountColumnMaxWidth  = 32
 # frame.
 $Script:AdvisoryReasonMaxWidth = 200
 
+# Total lines Format-UsageAdvisory may emit for one frame.
+#
+# The advisory block sits inside a watch frame that is painted with cursor-home
+# plus per-line erase, which only works while the frame fits the terminal: once
+# it is taller, the terminal scrolls and ESC[H no longer addresses the frame's
+# first row. The block replaced a single Status-column cell, and unbounded it
+# reaches ten lines (four condition lines, three remedies, three reasons),
+# several of which wrap at $Script:AdvisoryReasonMaxWidth. Against a 24-row
+# terminal with five slots that is enough to push the table off screen on its
+# own.
+#
+# Eight is four condition lines plus three remedies plus one, so the two groups
+# that carry coverage always fit and the per-slot reasons spend whatever is
+# left; see Format-UsageAdvisory for why those are the droppable ones.
+$Script:AdvisoryMaxLines = 8
+
 # --- Atomic credential-file write primitives ------------------------------
 #
 # Every credential-shaped file this tool writes (.credentials.json, slot
@@ -4509,9 +4525,20 @@ function Format-SlotNameList {
 # Returns a newline-joined string; Format-UsageFooter splits and colours each
 # line the same way it already splits $Footer.
 #
-# Two groups: condition lines naming the affected slots, then per-slot reason
-# lines. Always names the affected slot(s), because the affected row is
-# usually a non-active peer rather than the '*' active slot.
+# Three groups, emitted in this order because that is their order of value per
+# line under $Script:AdvisoryMaxLines:
+#   1. Condition lines. One per distinct condition, naming every affected slot,
+#      so this group alone guarantees no failing slot goes unmentioned.
+#   2. Remedy lines. One per hard-failure status, a constant covering every
+#      slot sharing it, and the only actionable text in the block.
+#   3. Per-slot reason lines. Detail for at most three slots.
+# Only the third is ever dropped, and dropping it costs detail rather than
+# coverage. Emission order is deliberately NOT computation order: the reason
+# lines are computed first because the remedy grouping skips a slot that
+# already got one.
+#
+# Always names the affected slot(s), because the affected row is usually a
+# non-active peer rather than the '*' active slot.
 #
 # One condition line per distinct condition, worst first, because a slot can
 # only be in one of the four buckets. Collapsing to a single line hides a hard
@@ -4539,7 +4566,7 @@ function Format-UsageAdvisory {
     $cachedNet  = @($rows | Where-Object { $_.IsCachedFallback -and $_.FallbackReason -eq 'network' })
     $cachedLim  = @($rows | Where-Object { $_.IsCachedFallback -and $_.FallbackReason -ne 'network' })
 
-    $lines = [System.Collections.Generic.List[string]]::new()
+    $conditions = [System.Collections.Generic.List[string]]::new()
 
     # NeedsCopula: the limit tails read "<slots> is/are currently ..."; the
     # read-failure tails carry their own verb, so injecting one would produce
@@ -4566,23 +4593,23 @@ function Format-UsageAdvisory {
         if (-not $list) { continue }
         if ($bucket.NeedsCopula) {
             $verb = if ($names.Count -eq 1) { 'is' } else { 'are' }
-            $lines.Add("[Usage] $list $verb $($bucket.Tail)")
+            $conditions.Add("[Usage] $list $verb $($bucket.Tail)")
         } else {
-            $lines.Add("[Usage] $list $($bucket.Tail)")
+            $conditions.Add("[Usage] $list $($bucket.Tail)")
         }
     }
 
-    # Per-slot reason lines below the condition lines. The Status column
-    # carries only a short label, so this is where the detail lands: the row's
-    # own error message when it has one, otherwise the remedy for a hard
-    # failure. A 'rate-limited' row without a message is deliberately silent,
-    # because the condition line above already says exactly that.
+    # Per-slot reason lines. The Status column carries only a short label, so
+    # this is where the detail lands: the row's own error message when it has
+    # one, otherwise the remedy for a hard failure. A 'rate-limited' row
+    # without a message is deliberately silent, because the condition line
+    # already says exactly that.
     #
-    # Messages are capped at 3, for the same reason Format-SlotNameList caps
-    # names: under -Watch a wide failing pool would push the table off screen.
-    # The cap costs detail, not coverage, because the condition lines above
-    # already name every affected slot. Hard failures take the cap first; see
-    # the IsCached sort key below.
+    # Capped at 3, for the same reason Format-SlotNameList caps names: under
+    # -Watch a wide failing pool would push the table off screen. The cap costs
+    # detail, not coverage, because the condition lines already name every
+    # affected slot. Hard failures take the cap first; see the IsCached sort
+    # key below.
     $messages = [System.Collections.Generic.List[pscustomobject]]::new()
     foreach ($row in $rows) {
         if (-not $row.Error) { continue }
@@ -4599,9 +4626,28 @@ function Format-UsageAdvisory {
             })
         }
     }
+    # The reason group is the only one that gets squeezed, so its budget is
+    # whatever $Script:AdvisoryMaxLines has left after the two groups that
+    # carry coverage. The remedy allowance is reserved BEFORE the reasons are
+    # chosen, and reserved at its upper bound (one line per hard-failure status
+    # present), because the two groups are coupled in one direction only:
+    # $reported below suppresses a remedy for a slot whose message is shown, so
+    # showing fewer reasons can only add remedy lines, never remove them.
+    # Letting the reasons spend the budget first therefore put a slot in the
+    # worst of both worlds, dropping its message to the cap and its remedy to
+    # $reported, which is precisely the silent-'expired'-slot regression the
+    # remedy grouping exists to prevent.
+    $maxRemedies = 0
+    foreach ($status in @('expired', 'unauthorized', 'no-oauth')) {
+        if (@($rows | Where-Object { $_.Status -eq $status }).Count -gt 0) { $maxRemedies++ }
+    }
+    $reasonBudget = [Math]::Min(3, $Script:AdvisoryMaxLines - $conditions.Count - $maxRemedies)
+    if ($reasonBudget -lt 0) { $reasonBudget = 0 }
+
+    $reasons  = [System.Collections.Generic.List[string]]::new()
     $reported = [System.Collections.Generic.HashSet[string]]::new()
-    foreach ($message in @($messages | Sort-Object -Property IsCached -Stable | Select-Object -First 3)) {
-        $lines.Add($message.Line)
+    foreach ($message in @($messages | Sort-Object -Property IsCached -Stable | Select-Object -First $reasonBudget)) {
+        $reasons.Add($message.Line)
         [void]$reported.Add($message.Name)
     }
 
@@ -4617,12 +4663,22 @@ function Format-UsageAdvisory {
     # whenever the cap above dropped its message. These three statuses get no
     # condition line, so that silence was total, on the one failure class that
     # does not clear on its own.
+    $remedies = [System.Collections.Generic.List[string]]::new()
     foreach ($status in @('expired', 'unauthorized', 'no-oauth')) {
         $names = @($rows | Where-Object { $_.Status -eq $status -and -not $reported.Contains($_.Name) } | ForEach-Object { $_.Name })
         $list  = Format-SlotNameList -Names $names
         if (-not $list) { continue }
-        $lines.Add("[Usage] ${list}: $(Get-StatusRationale -Label $status)")
+        $remedies.Add("[Usage] ${list}: $(Get-StatusRationale -Label $status)")
     }
+
+    # Conditions and remedies always fit, by construction: their worst case is
+    # 4 + 3 and $Script:AdvisoryMaxLines is set above that, which is what makes
+    # "every failing slot is named" a property of the block rather than of the
+    # pool that happened to fail.
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.AddRange($conditions)
+    $lines.AddRange($remedies)
+    $lines.AddRange($reasons)
 
     if ($lines.Count -eq 0) { return $null }
     return ($lines -join "`n")
