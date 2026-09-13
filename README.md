@@ -39,7 +39,7 @@ A zero-dependency PowerShell utility for Claude Code on Windows, Linux, and macO
 
 | Platform | Install PowerShell |
 |----------|--------------------|
-| Windows  | `winget install Microsoft.PowerShell` (stock Windows ships 5.1, which is not supported) |
+| Windows  | `winget install Microsoft.PowerShell` |
 | Linux    | [Microsoft's package instructions](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-linux) |
 | macOS    | [Microsoft's package instructions](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-macos) |
 
