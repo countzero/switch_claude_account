@@ -240,7 +240,7 @@ sca help         # Show usage info
 5. **Close Claude Code**
 6. Run `sca save personal`
 
-If Claude Code is running when you invoke `save` or `switch`, the action exits immediately with a clear message; no partial writes occur.
+If Claude Code is running when you invoke `save` or `switch`, the action exits immediately with a clear message; no partial writes occur. One install shape escapes that check, see [Why close Claude Code first?](#why-close-claude-code-first).
 
 ### Switching between accounts
 
@@ -251,6 +251,9 @@ If Claude Code is running when you invoke `save` or `switch`, the action exits i
 ### Why close Claude Code first?
 
 `sca save` and `sca switch` read and write `~/.claude.json`'s `oauthAccount` block. Claude Code keeps that block in an in-memory cache that may flush back and clobber the update. Closing the app eliminates the race. (Slot-file updates done by `sca usage`'s token refresh use `MoveFileEx` with retry, so they survive an open Claude Code on `.credentials.json` itself; but the `~/.claude.json` cache race means you still need to close it for the two write actions.)
+
+> [!IMPORTANT]
+> **The guard does not catch every install shape.** Claude Code installed from npm (`@anthropic-ai/claude-code`) runs as a `node` process rather than one named `claude`, so `sca` has to recognise it from the process command line instead. That works on Linux. It does **not** work on Windows, where reading command lines costs ~53 s and a guard on every write cannot spend that, nor on macOS, where PowerShell does not expose process command lines at all. On those two platforms, close Claude Code yourself rather than relying on the refusal. Claude Code from the native installer is detected on all three.
 
 ## Platform Notes
 
