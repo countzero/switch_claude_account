@@ -168,17 +168,56 @@ function Resolve-ScaConfigDir {
 
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
 
-    if ([string]::IsNullOrWhiteSpace($BaseDir)) {
-        # $PWD can sit on a non-filesystem provider (HKCU:\ and friends), whose
-        # ProviderPath is no base for a file path.
-        $BaseDir = if ($PWD.Provider.Name -eq 'FileSystem') { $PWD.ProviderPath } else { [Environment]::CurrentDirectory }
-    }
+    if ([string]::IsNullOrWhiteSpace($BaseDir)) { $BaseDir = Get-PathResolutionBase }
 
     # An unusable value (invalid characters, a base that is not rooted) is
     # handed on verbatim so the failure surfaces as the action's own error
     # naming the directory, not as a load-time throw before `sca help` runs.
     try   { return [System.IO.Path]::GetFullPath($Value, $BaseDir) }
     catch { return $Value }
+}
+
+# The directory a relative path should resolve against: $PWD, unless the
+# session is parked on a provider that has no filesystem location.
+#
+# $PWD can sit on Env:\, HKCU:\, Function:\ and friends, whose ProviderPath is
+# either empty or something like 'HKEY_CURRENT_USER\Software'. GetFullPath
+# validates its basePath argument BEFORE looking at the path, so such a base
+# throws even when the path itself is absolute. Both callers pass absolute
+# production values and would otherwise never notice, which is exactly how the
+# guard came to exist in one of them and not the other.
+function Get-PathResolutionBase {
+    if ($PWD.Provider.Name -eq 'FileSystem') { return $PWD.ProviderPath }
+    return [Environment]::CurrentDirectory
+}
+
+# Two directory paths naming the same location, compared without touching the
+# filesystem (neither need exist).
+#
+# GetFullPath normalises separators and '.' / '..' segments but PRESERVES a
+# trailing separator, so 'C:\x\.claude\' and 'C:\x\.claude' compare unequal as
+# strings. TrimEndingDirectorySeparator removes it and is root-aware, leaving
+# 'C:\' and '/' alone.
+#
+# Symlinks are deliberately not resolved: that requires the path to exist, and
+# the caller's whole point is comparing a configured directory against a
+# default that may never have been created. Two spellings of one directory via
+# a link therefore still read as different, which fails toward saying something
+# rather than staying silent.
+function Test-SamePath {
+    Param (
+        [Parameter(Mandatory)] [AllowEmptyString()] [String] $Left,
+        [Parameter(Mandatory)] [AllowEmptyString()] [String] $Right,
+        [String] $BaseDir
+    )
+
+    if ([string]::IsNullOrWhiteSpace($BaseDir)) { $BaseDir = Get-PathResolutionBase }
+
+    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    return [string]::Equals(
+        [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($Left,  $BaseDir)),
+        [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($Right, $BaseDir)),
+        $comparison)
 }
 
 $ScaConfigDir   = Resolve-ScaConfigDir -Value $env:CLAUDE_CONFIG_DIR
@@ -618,16 +657,13 @@ function Get-CredentialSlotFiles {
 # yellow lines. When the default directory holds no slots, nothing is hidden
 # from anyone and there is nothing to say.
 #
-# GetFullPath normalises separators and relative segments without requiring
-# either path to exist, so the "already the default" case stays quiet instead
-# of emitting a permanent noise line for anyone who sets the variable
-# explicitly to ~/.claude. The base is passed explicitly for the same reason
-# Resolve-ScaConfigDir binds one: the one-argument overload would resolve
-# against [Environment]::CurrentDirectory. Production values arrive absolute
-# from Resolve-ScaConfigDir; the parameter keeps a relative one (a caller's,
-# a test's) comparing against the same base every other read uses. A malformed
-# value fails open into the orphan check rather than being treated as "already
-# the default".
+# "Already the default" is a path question, not a string one, so it goes
+# through Test-SamePath: separators, relative segments and a trailing
+# separator all have to stop mattering, or anyone who spells the variable
+# `~/.claude/` gets a permanent line naming one directory as both the one in
+# use and the one being skipped. A malformed value fails open into the orphan
+# check rather than being treated as already-default.
+#
 # The three inputs arrive as parameters defaulting to the script-scope values
 # so the function is pure and the suite can drive every branch by argument,
 # rather than leaning on PowerShell's dynamic scoping to reach in and rebind
@@ -653,14 +689,7 @@ function Get-ConfigDirAdvisory {
 
     $defaultDir = Join-Path $HomeDir '.claude'
     try {
-        $base       = $PWD.ProviderPath
-        $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
-        if ([string]::Equals(
-                [System.IO.Path]::GetFullPath($defaultDir, $base),
-                [System.IO.Path]::GetFullPath($ActiveDir,  $base),
-                $comparison)) {
-            return $null
-        }
+        if (Test-SamePath -Left $defaultDir -Right $ActiveDir) { return $null }
     }
     catch { Write-Verbose "Config-dir comparison failed, emitting advisory: $_" }
 

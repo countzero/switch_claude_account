@@ -2444,6 +2444,47 @@ Describe 'switch_claude_account' {
                                   -ActiveDir $roundabout | Should -BeNullOrEmpty
         }
 
+        # GetFullPath PRESERVES a trailing separator, so a plain string compare
+        # read 'x/.claude/' and 'x/.claude' as different directories. The
+        # advisory that followed named the SAME directory as the one in use and
+        # as the one holding slots "not in use", on every invocation, forever.
+        It 'returns null when the value differs only by a trailing separator' {
+            $default  = Join-Path $script:SandboxHome '.claude'
+            $trailing = $default + [System.IO.Path]::DirectorySeparatorChar
+            New-SlotPair -CredDir $default -Name 'would-be-misreported' -Content 'A' | Out-Null
+
+            Get-ConfigDirAdvisory -ConfigDir $trailing `
+                                  -HomeDir   $script:SandboxHome `
+                                  -ActiveDir $trailing | Should -BeNullOrEmpty
+        }
+
+        It 'returns null when the value differs only by separator style' -Skip:(-not $IsWindows) {
+            $default = Join-Path $script:SandboxHome '.claude'
+            $slashed = $default -replace '\\', '/'
+            New-SlotPair -CredDir $default -Name 'would-be-misreported' -Content 'A' | Out-Null
+
+            Get-ConfigDirAdvisory -ConfigDir $slashed `
+                                  -HomeDir   $script:SandboxHome `
+                                  -ActiveDir $slashed | Should -BeNullOrEmpty
+        }
+
+        # Resolve-ScaConfigDir has always guarded this; Get-ConfigDirAdvisory
+        # did not, and GetFullPath validates its base BEFORE the path, so an
+        # Env:\ location threw on two absolute arguments. The catch failed open
+        # into the orphan check, producing the same self-contradicting line.
+        It 'compares correctly from a non-filesystem provider location' {
+            $default = Join-Path $script:SandboxHome '.claude'
+            New-SlotPair -CredDir $default -Name 'would-be-misreported' -Content 'A' | Out-Null
+
+            Push-Location Env:\
+            try {
+                Get-ConfigDirAdvisory -ConfigDir $default `
+                                      -HomeDir   $script:SandboxHome `
+                                      -ActiveDir $default | Should -BeNullOrEmpty
+            }
+            finally { Pop-Location }
+        }
+
         It 'names the directory in use when relocated and slots are stranded' {
             $defaultDir = Join-Path $script:SandboxHome '.claude'
             New-SlotPair -CredDir $defaultDir -Name 'left-behind' -Content 'A' | Out-Null
@@ -2543,6 +2584,42 @@ Describe 'switch_claude_account' {
             # Common.ps1 clears CLAUDE_CONFIG_DIR, so the default-bound call
             # must be silent. Covers the production call site in Invoke-Main.
             Get-ConfigDirAdvisory | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Test-SamePath / Get-PathResolutionBase' {
+        It 'ignores a trailing separator' {
+            $sep = [System.IO.Path]::DirectorySeparatorChar
+            Test-SamePath -Left (Join-Path $TestDrive 'a') -Right ((Join-Path $TestDrive 'a') + $sep) |
+                Should -BeTrue
+        }
+
+        It 'still distinguishes genuinely different directories' {
+            Test-SamePath -Left (Join-Path $TestDrive 'a') -Right (Join-Path $TestDrive 'b') |
+                Should -BeFalse
+        }
+
+        It 'normalises relative segments' {
+            Test-SamePath -Left (Join-Path $TestDrive 'a') `
+                          -Right (Join-Path $TestDrive (Join-Path 'sub' (Join-Path '..' 'a'))) |
+                Should -BeTrue
+        }
+
+        It 'is case-insensitive on Windows and case-sensitive elsewhere' {
+            $expected = [bool]$IsWindows
+            Test-SamePath -Left (Join-Path $TestDrive 'Case') -Right (Join-Path $TestDrive 'case') |
+                Should -Be $expected
+        }
+
+        It 'falls back off a non-filesystem location instead of throwing' {
+            Push-Location Env:\
+            try {
+                $PWD.ProviderPath | Should -Not -Be ([Environment]::CurrentDirectory)
+                Get-PathResolutionBase | Should -Be ([Environment]::CurrentDirectory)
+                { Test-SamePath -Left 'rel-a' -Right 'rel-a' } | Should -Not -Throw
+                Test-SamePath -Left 'rel-a' -Right 'rel-a' | Should -BeTrue
+            }
+            finally { Pop-Location }
         }
     }
 
