@@ -581,12 +581,32 @@ Describe 'switch_claude_account' {
         # reports a blind monitor that is in fact armed, for the rest of the
         # watch or until an event that may never come.
         It 'on noop clears a latched rotation-paused line' {
-            Mock Get-AutoRotationDecision { return [pscustomobject]@{ Action = 'noop' } }
+            # FromName is what says the active row was actually read and judged;
+            # Get-AutoRotationDecision stamps it on the steady-state noop only.
+            Mock Get-AutoRotationDecision { return [pscustomobject]@{ Action = 'noop'; FromName = 'slot-1' } }
             $paused = '[Monitor] Active slot usage unknown (error); rotation paused.'
 
             $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 95 -CurrentLatch $paused
 
             $out | Should -Be '[Monitor] Automatic slot switching is enabled.'
+        }
+
+        # 'noop' covers four situations and only the steady-state one judged
+        # anything. In the other three rotation is structurally unable to fire,
+        # so announcing it as enabled swaps one lie for the other.
+        It 'on a noop that judged nothing, keeps the rotation-paused line' -ForEach @(
+            @{ Case = 'no active row in the snapshot'; Snapshot = [pscustomobject]@{
+                   NoSlots = $false
+                   Results = @([pscustomobject]@{ Name = 'a'; IsActive = $false; Status = 'ok'; Data = $null }) } }
+            @{ Case = 'empty Results';                 Snapshot = [pscustomobject]@{ NoSlots = $false; Results = @() } }
+            @{ Case = 'NoSlots';                       Snapshot = [pscustomobject]@{ NoSlots = $true;  Results = @() } }
+        ) {
+            $paused = '[Monitor] Active slot usage unknown (error); rotation paused.'
+
+            # The real Get-AutoRotationDecision, not a mock: the point is that
+            # all three of these reach 'noop' without a FromName.
+            Invoke-AutoRotationStep -Snapshot $Snapshot -Threshold 95 -CurrentLatch $paused |
+                Should -Be $paused -Because "$Case cannot judge the active slot"
         }
 
         It 'on active-unknown does not swap' {

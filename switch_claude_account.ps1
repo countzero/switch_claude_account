@@ -5296,11 +5296,20 @@ function Invoke-AutoRotationStep {
             # the next state change.
             #
             # One exception: a paused latch describes a state we are no longer
-            # in. Reaching 'noop' means the active slot was read and judged, so
-            # leaving "rotation paused" on screen would report a blind monitor
-            # that is in fact armed -- the same lie as the stale 'Rotated' line
-            # the paused arm was added to prevent, pointing the other way.
-            if ($CurrentLatch -and $CurrentLatch.StartsWith($Script:MonitorPausedLatchPrefix)) {
+            # in, so a 'noop' that DID judge the active slot clears it. Leaving
+            # "rotation paused" up would report a blind monitor that is in fact
+            # armed: the same lie as the stale 'Rotated' line the paused arm was
+            # added to prevent, pointing the other way.
+            #
+            # Gated on FromName, because 'noop' covers four situations and only
+            # one of them judged anything. An empty snapshot, a NoSlots
+            # snapshot, and a snapshot with no active row all return the bare
+            # noop, and in every one of those rotation is structurally unable to
+            # fire. Clearing the latch there would swap one lie for the other.
+            # Get-AutoRotationDecision stamps FromName only on the steady-state
+            # noop, which is the one reached after Get-RowMaxUtilization ran.
+            if ($decision.FromName -and $CurrentLatch -and
+                $CurrentLatch.StartsWith($Script:MonitorPausedLatchPrefix)) {
                 return $Script:MonitorSteadyLatch
             }
             return $CurrentLatch
