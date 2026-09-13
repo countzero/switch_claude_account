@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
 # Pester 5 tests for Invoke-SaveAction in switch_claude_account.ps1.
@@ -18,6 +18,8 @@
 BeforeAll {
     $script:OriginalUserProfile = $env:USERPROFILE
     $script:OriginalProfile     = $global:PROFILE
+    $script:OriginalHome        = $env:HOME
+    $script:OriginalConfigDir   = $env:CLAUDE_CONFIG_DIR
 }
 
 Describe 'switch_claude_account' {
@@ -88,7 +90,7 @@ Describe 'switch_claude_account' {
 
             { Invoke-SaveAction -Name 'work' 6>$null } | Should -Throw -ExpectedMessage '*Claude Code is running*'
             # No slot or sidecar created.
-            @(Get-ChildItem -LiteralPath $script:CredDirPath -Filter '.credentials.work*.json').Count | Should -Be 0
+            @(Get-ChildItem -LiteralPath $script:CredDirPath -Filter '.credentials.work*.json' -Force).Count | Should -Be 0
         }
 
         It 'falls back to /api/oauth/profile when ~/.claude.json has no oauthAccount' {
@@ -125,7 +127,7 @@ Describe 'switch_claude_account' {
             { Invoke-SaveAction -Name 'work' 6>$null } | Should -Throw -ExpectedMessage '*Cannot resolve account identity*'
 
             # No slot or sidecar created.
-            @(Get-ChildItem -LiteralPath $script:CredDirPath -Filter '.credentials.work*.json').Count | Should -Be 0
+            @(Get-ChildItem -LiteralPath $script:CredDirPath -Filter '.credentials.work*.json' -Force).Count | Should -Be 0
         }
 
         It 'dedups the label when slot name equals the resolved email' {
@@ -137,7 +139,7 @@ Describe 'switch_claude_account' {
             # Slot name == email -> no parenthesized suffix.
             Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.alice@example.com.json') | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.alice@example.com.account.json') | Should -BeTrue
-            @(Get-ChildItem -LiteralPath $script:CredDirPath -Filter '.credentials.alice@example.com(*).json').Count | Should -Be 0
+            @(Get-ChildItem -LiteralPath $script:CredDirPath -Filter '.credentials.alice@example.com(*).json' -Force).Count | Should -Be 0
         }
 
         # When re-saving a slot whose account has changed, the old labeled
@@ -274,7 +276,9 @@ Describe 'switch_claude_account' {
     }
 
     AfterAll {
-        $env:USERPROFILE = $script:OriginalUserProfile
-        $global:PROFILE  = $script:OriginalProfile
+        $env:USERPROFILE       = $script:OriginalUserProfile
+        $global:PROFILE        = $script:OriginalProfile
+        $env:HOME              = $script:OriginalHome
+        $env:CLAUDE_CONFIG_DIR = $script:OriginalConfigDir
     }
 }

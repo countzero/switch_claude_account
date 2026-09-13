@@ -1,0 +1,124 @@
+name: Tests
+
+# `push` is main-only on purpose. Every branch here reaches main through a pull
+# request, so listing `develop` too matched both triggers for one commit and ran
+# the whole 3-OS matrix twice. Deduplicating with a concurrency group cannot fix
+# that: the two events carry different refs (`refs/heads/develop` against
+# `refs/pull/N/merge`), and normalising the key so they collide would make the
+# two runs cancel each other, with no say in which survives. A cancelled run
+# reads as a failed required check, so that trades duplicate work for a flaky
+# gate. Narrowing the trigger is deterministic instead.
+#
+# The gap: a push to a branch with no open pull request runs nothing. That is
+# the state in which nobody is reading the verdict yet, and `workflow_dispatch`
+# covers wanting it anyway.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Supersede a run whose commit is no longer the tip of its pull request. The tip
+# is the only revision anyone reads a verdict from, and cancelling within one
+# ref is unambiguous in a way that cancelling across two events is not.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pester:
+    # Every platform the script supports. fail-fast is off so one platform's
+    # failure still reports the others, which is the whole point of a matrix
+    # for a tool whose bugs are almost always platform-shaped.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runners ship PowerShell 7, which satisfies the 7.4 floor the
+      # script needs for FileStreamOptions.UnixCreateMode.
+      - name: Report PowerShell version
+        shell: pwsh
+        run: "$PSVersionTable | Format-List"
+
+      # Test-ClaudeRunning early-returns on Windows and falls through to the
+      # .CommandLine probe everywhere else, which is a /proc/<pid>/cmdline read
+      # on Linux with no Darwin equivalent. Whether PowerShell populates the
+      # property on macOS, and what enumerating it costs against the ~53 s that
+      # ruled it out on Windows, is what decides the guard's shape there.
+      # Reported, not asserted: the answer belongs in a comment on that
+      # function, and a test pinning it would pin a PowerShell implementation
+      # detail we neither own nor want to freeze.
+      - name: Probe process command-line availability
+        if: matrix.os == 'macos-latest'
+        shell: pwsh
+        run: |
+          $self = (Get-Process -Id $PID).CommandLine
+          "CommandLine populated for self : $(-not [string]::IsNullOrWhiteSpace($self))"
+          $watch = [System.Diagnostics.Stopwatch]::StartNew()
+          $all = @(Get-Process -ErrorAction SilentlyContinue)
+          $withLine = @($all | Where-Object { $_.CommandLine }).Count
+          $watch.Stop()
+          "Processes enumerated           : $($all.Count)"
+          "With a populated CommandLine   : $withLine"
+          "Enumeration cost               : $([int]$watch.Elapsed.TotalMilliseconds) ms"
+
+      # On-demand only. This tool's entire premise is that .credentials.json is
+      # where Claude Code keeps the active login, and that premise is an
+      # observation about someone else's binary, not a contract. The scan
+      # re-checks it against the darwin build, which is the one platform whose
+      # storage backend this repo previously got wrong. Gated to
+      # workflow_dispatch because it pulls a ~200 MB package: per-push cost
+      # nobody is paying for a fact that changes at most once a release.
+      - name: Verify Claude Code credential backends
+        if: matrix.os == 'macos-latest' && github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          # The step's only value is that its verdict can be trusted, so every
+          # way of scanning nothing has to fail as itself rather than as
+          # "the marker is missing".
+          npm install -g @anthropic-ai/claude-code 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "npm install failed with exit code $LASTEXITCODE; nothing was scanned." }
+          $root = Join-Path (npm root -g) '@anthropic-ai/claude-code'
+          # Both shapes the package has shipped: a cli.js bundle and a
+          # Bun-compiled binary with the JS embedded. Anything over 1 MB is a
+          # candidate; the shim wrappers are far smaller.
+          $blobs = @(Get-ChildItem -LiteralPath $root -Recurse -File |
+              Where-Object { $_.Length -gt 1MB })
+          "Scanning $($blobs.Count) file(s) under $root"
+          if ($blobs.Count -eq 0) { throw "No file over 1MB under $root. The package layout changed, so the marker scan below would prove nothing." }
+          $markers = 'name:"plaintext"', 'windows-credman', 'tengu_windows_credman',
+                     'find-generic-password', 'Claude Code-device-keys'
+          $seen = @{}
+          foreach ($blob in $blobs) {
+              $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($blob.FullName))
+              foreach ($marker in $markers) {
+                  $count = [regex]::Matches($text, [regex]::Escape($marker)).Count
+                  if ($count -gt 0) { $seen[$marker] = $true }
+                  "{0,-24} {1,-26} {2}" -f $blob.Name, $marker, $count
+              }
+          }
+          if (-not $seen['name:"plaintext"']) {
+              throw "No plaintext credential backend found in the darwin build. Claude Code may have moved the active login off .credentials.json; sca's whole swap mechanism is invalid until this is re-established."
+          }
+
+      # Coverage runs on one OS only. The gate counts lines executed in a
+      # single run, and each platform necessarily leaves the other's branches
+      # untouched, so requiring 90% on every leg would fail for the wrong reason.
+      - name: Run tests with coverage
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ./tests/Invoke-Tests.ps1
+
+      - name: Run tests
+        if: matrix.os != 'windows-latest'
+        shell: pwsh
+        run: ./tests/Invoke-Tests.ps1 -SkipCoverage

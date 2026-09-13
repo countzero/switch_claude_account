@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 
 # Local test runner. Auto-installs Pester 5 on first use, runs
 # PSScriptAnalyzer (Warning advisory, Error fatal), then invokes the

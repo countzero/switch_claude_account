@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
 # Pester 5 tests for the small pure-helper functions in
@@ -21,6 +21,8 @@ BeforeAll {
     # was already safe because the mutations died with the subprocess.
     $script:OriginalUserProfile = $env:USERPROFILE
     $script:OriginalProfile     = $global:PROFILE
+    $script:OriginalHome        = $env:HOME
+    $script:OriginalConfigDir   = $env:CLAUDE_CONFIG_DIR
 }
 
 Describe 'switch_claude_account' {
@@ -400,7 +402,6 @@ Describe 'switch_claude_account' {
             return [pscustomobject]@{
                 Results          = @($results)
                 NoSlots          = $false
-                HasCacheFallback = $false
             }
         }
 
@@ -473,7 +474,7 @@ Describe 'switch_claude_account' {
         # --- Bare-suffix fallbacks ------------------------------------
 
         It 'returns bare suffix for empty snapshot (no slots saved)' {
-            $empty = [pscustomobject]@{ Results = @(); NoSlots = $true; HasCacheFallback = $false }
+            $empty = [pscustomobject]@{ Results = @(); NoSlots = $true }
             Format-WatchTitle -Name '' -Snapshot $empty |
                 Should -Be 'Switch Claude Account'
         }
@@ -484,21 +485,21 @@ Describe 'switch_claude_account' {
         # principle if Get-UsageSnapshot is ever changed to seed the
         # shape before populating rows.
         It 'returns bare suffix when Results is empty but NoSlots is false' {
-            $empty = [pscustomobject]@{ Results = @(); NoSlots = $false; HasCacheFallback = $false }
+            $empty = [pscustomobject]@{ Results = @(); NoSlots = $false }
             Format-WatchTitle -Name '' -Snapshot $empty |
                 Should -Be 'Switch Claude Account'
         }
 
-        It 'returns bare suffix when all rows are HTTP-failure (active row included)' {
+        It 'returns bare suffix when all rows are HTTP-failure with no data (active row included)' {
             $snap = New-FakeSnapshot -Rows @(
-                @{ Name = 'a'; Status = 'expired'; FiveUtil = 10; SevenUtil = 10; IsActive = $true }
-                @{ Name = 'b'; Status = 'error';   FiveUtil = 20; SevenUtil = 20 }
+                @{ Name = 'a'; Status = 'expired'; IsActive = $true }
+                @{ Name = 'b'; Status = 'error'   }
             )
             Format-WatchTitle -Name '' -Snapshot $snap |
                 Should -Be 'Switch Claude Account'
         }
 
-        It 'returns bare suffix when active row Status is <Status>' -ForEach @(
+        It 'returns bare suffix when the active row is <Status> with no data' -ForEach @(
             @{ Status = 'expired'      }
             @{ Status = 'unauthorized' }
             @{ Status = 'error'        }
@@ -506,15 +507,39 @@ Describe 'switch_claude_account' {
             @{ Status = 'rate-limited' }
         ) {
             $snap = New-FakeSnapshot -Rows @(
-                @{ Name = 'a'; Status = $Status; FiveUtil = 50; SevenUtil = 50; IsActive = $true }
+                @{ Name = 'a'; Status = $Status; IsActive = $true }
             )
             Format-WatchTitle -Name '' -Snapshot $snap |
                 Should -Be 'Switch Claude Account'
         }
 
-        It 'returns bare suffix when -Name matches but row is not ok' {
+        # The title is judged on the same predicate as the aggregate bars
+        # (Test-RowIsMeasurable), not on Status: a row served from the cache
+        # fallback paints numbers in the table and still counts toward
+        # rotation, so blanking the title for it dropped the alarm signal
+        # during exactly the failure the fallback exists to survive.
+        It 'renders the numbers of a non-ok active row that carries data: <Status>' -ForEach @(
+            @{ Status = 'rate-limited' }
+            @{ Status = 'error'        }
+        ) {
             $snap = New-FakeSnapshot -Rows @(
-                @{ Name = 'a'; Status = 'expired'; FiveUtil = 50; SevenUtil = 50 }
+                @{ Name = 'a'; Status = $Status; FiveUtil = 50; SevenUtil = 50; IsActive = $true }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '50% | 50% | Switch Claude Account'
+        }
+
+        It 'still fires the alarm prefix for a cached at-limit active row' {
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; Status = 'error'; FiveUtil = 100; SevenUtil = 20; IsActive = $true }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '[!] 100% | 20% | Switch Claude Account'
+        }
+
+        It 'returns bare suffix when -Name matches a row that is not ok and has no data' {
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; Status = 'expired' }
             )
             Format-WatchTitle -Name 'a' -Snapshot $snap |
                 Should -Be 'Switch Claude Account'
@@ -610,7 +635,7 @@ Describe 'switch_claude_account' {
                 }
                 Error = $null; IsCachedFallback = $false
             })
-            $snap = [pscustomobject]@{ Results = $rows; NoSlots = $false; HasCacheFallback = $false }
+            $snap = [pscustomobject]@{ Results = $rows; NoSlots = $false }
             $title = Format-WatchTitle -Name '' -Snapshot $snap
             $title | Should -Not -Match "`e"
             $title | Should -Not -Match "`a"
@@ -639,15 +664,32 @@ Describe 'switch_claude_account' {
                 Should -Be '[~] 70% | 70% | Switch Claude Account'
         }
 
-        It '-Aggregate excludes HTTP-failure rows from the mean' {
-            # 2 ok rows + 1 expired. Mean = (40+60)/2 = 50.
+        It '-Aggregate excludes HTTP-failure rows with no data from the mean' {
+            # 2 ok rows + 1 expired. Mean = (40+60)/2 = 50. An 'expired' row
+            # never carries Data in production (Get-SlotUsage's expired arm has
+            # nothing to attach), so omitting the utilizations is the shape
+            # that arm actually produces.
             $snap = New-FakeSnapshot -Rows @(
                 @{ Name = 'a'; FiveUtil = 40; SevenUtil = 40 }
                 @{ Name = 'b'; FiveUtil = 60; SevenUtil = 60; IsActive = $true }
-                @{ Name = 'c'; Status = 'expired'; FiveUtil = 100; SevenUtil = 100 }
+                @{ Name = 'c'; Status = 'expired' }
             )
             Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
                 Should -Be '[~] 50% | 50% | Switch Claude Account'
+        }
+
+        It '-Aggregate counts a non-ok row that carries cached data' {
+            # The cache-fallback ladder produces 'error' / 'rate-limited' rows
+            # carrying last-known percentages. Format-UsageTable prints those
+            # numbers and Get-RowMaxUtilization rotates on them, so the pool
+            # mean has to see them too or the bars contradict the table right
+            # beneath them. Mean = (40+100)/2 = 70.
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = 40;  SevenUtil = 40; IsActive = $true }
+                @{ Name = 'b'; Status = 'error'; FiveUtil = 100; SevenUtil = 100 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[~] 70% | 70% | Switch Claude Account'
         }
 
         It '-Aggregate counts null buckets as 0 (denominator stays N)' {
@@ -675,17 +717,17 @@ Describe 'switch_claude_account' {
             $noName   | Should -Be '[~] 50% | 50% | Switch Claude Account'
         }
 
-        It '-Aggregate returns bare suffix when no HTTP-ok rows exist' {
+        It '-Aggregate returns bare suffix when no row carries usable data' {
             $snap = New-FakeSnapshot -Rows @(
-                @{ Name = 'a'; Status = 'expired'; FiveUtil = 50; SevenUtil = 50; IsActive = $true }
-                @{ Name = 'b'; Status = 'error';   FiveUtil = 50; SevenUtil = 50 }
+                @{ Name = 'a'; Status = 'expired'; IsActive = $true }
+                @{ Name = 'b'; Status = 'error' }
             )
             Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
                 Should -Be 'Switch Claude Account'
         }
 
         It '-Aggregate returns bare suffix for empty snapshot' {
-            $empty = [pscustomobject]@{ Results = @(); NoSlots = $true; HasCacheFallback = $false }
+            $empty = [pscustomobject]@{ Results = @(); NoSlots = $true }
             Format-WatchTitle -Name '' -Snapshot $empty -Aggregate |
                 Should -Be 'Switch Claude Account'
         }
@@ -1086,6 +1128,37 @@ Describe 'switch_claude_account' {
                     'linger past the in-place repaint (no ESC[2J).')
             }
         }
+
+        It 'Invoke-UsageWatch stamps $lastPoll after the poll, never from the pre-poll $now' {
+            # The loop is an infinite Start-Sleep loop and cannot be driven
+            # directly, so this guards the shape instead. $lastPoll = $now uses
+            # the timestamp captured BEFORE the HTTP work, which pre-credits the
+            # interval with the poll's own duration: a poll slower than
+            # -Interval then makes the next iteration due immediately and the
+            # loop polls back-to-back with no delay, hammering an endpoint whose
+            # limiter trips after a handful of calls in a few seconds.
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $script:ScriptPath, [ref]$null, [ref]$null)
+            $func = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq 'Invoke-UsageWatch'
+            }, $true) | Select-Object -First 1
+            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
+
+            $assignments = @($func.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $n.Left.Extent.Text -eq '$lastPoll'
+            }, $true))
+            $assignments.Count | Should -BeGreaterOrEqual 1
+
+            foreach ($a in $assignments) {
+                $a.Right.Extent.Text | Should -Not -Be '$now' -Because (
+                    'the poll interval must be measured from when the poll ' +
+                    'finished, not from the timestamp captured before it ran')
+            }
+        }
     }
 
     Context 'Watch-mode frame capture and in-place repaint' {
@@ -1412,7 +1485,12 @@ Describe 'switch_claude_account' {
             @{ Case = 'limited 7d';        Label = 'limited 7d';        Expected = 'no prompts until 7d window resets' }
             @{ Case = 'limited (both)';    Label = 'limited';           Expected = 'no prompts until both 5h and 7d windows reset' }
             @{ Case = 'ok (no plan data)'; Label = 'ok (no plan data)'; Expected = 'HTTP ok but response carried no bucket data' }
-            @{ Case = 'rate-limited';      Label = 'rate-limited';      Expected = 'temporary API throttle (429), not a plan limit' }
+            # Hard-failure statuses. Keyed on the raw Status value, because
+            # Format-UsageAdvisory's reason lines are where these remedies
+            # render now that the Status column carries only a bare label.
+            @{ Case = 'expired';           Label = 'expired';           Expected = 'token refresh failed; run sca switch to refresh' }
+            @{ Case = 'unauthorized';      Label = 'unauthorized';      Expected = 'token revoked; run sca switch then /login' }
+            @{ Case = 'no-oauth';          Label = 'no-oauth';          Expected = 'api key or non-claude.ai slot' }
         ) {
             (Get-StatusRationale -Label $Label) | Should -Be $Expected
         }
@@ -1423,9 +1501,13 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'at least one bucket$'
         }
 
-        It 'returns $null for labels with no rationale (ok, error, expired, ...)' {
+        It 'returns $null for labels with no rationale' {
             (Get-StatusRationale -Label 'ok')    | Should -BeNullOrEmpty
-            (Get-StatusRationale -Label 'error') | Should -BeNullOrEmpty
+            # 'error' and 'rate-limited' stay absent on purpose: such a row
+            # carries a real message, which the advisory prints instead of a
+            # canned remedy.
+            (Get-StatusRationale -Label 'error')        | Should -BeNullOrEmpty
+            (Get-StatusRationale -Label 'rate-limited') | Should -BeNullOrEmpty
             (Get-StatusRationale -Label '')      | Should -BeNullOrEmpty
         }
     }
@@ -1448,63 +1530,394 @@ Describe 'switch_claude_account' {
         }
     }
 
-    Context 'Format-RateLimitAdvisory' {
+    Context 'Format-UsageAdvisory' {
         BeforeAll {
+            # Rows only. The advisory partitions Results itself, so there is
+            # no snapshot-level condition flag for a fixture to set (and a
+            # fixture that set one would let a regression pass by satisfying
+            # the flag instead of the rows).
             function New-RlSnapshot {
-                Param ($Results, [bool] $Cache, [bool] $Rl)
+                Param ($Results)
                 [pscustomobject]@{
-                    Results = @($Results); NoSlots = $false
-                    HasCacheFallback = $Cache; HasRateLimited = $Rl
+                    Results = @($Results); NoSlots = $false; HasRateLimited = $false
                 }
             }
             function New-RlRow {
-                Param ([string] $Name, [string] $Status = 'rate-limited', [bool] $Cached = $false)
-                [pscustomobject]@{ Name = $Name; Status = $Status; IsCachedFallback = $Cached;
-                    Data = $null; Error = $null; Email = $null; IsActive = $false }
+                Param (
+                    [string] $Name,
+                    [string] $Status = 'rate-limited',
+                    [bool]   $Cached = $false,
+                    [string] $Reason = 'rate-limit'
+                )
+                $fallbackReason = if ($Cached) { $Reason } else { $null }
+                [pscustomobject]@{
+                    Name             = $Name
+                    Status           = $Status
+                    IsCachedFallback = $Cached
+                    FallbackReason   = $fallbackReason
+                    Data             = $null
+                    Error            = $null
+                    Email            = $null
+                    IsActive         = $false
+                }
             }
         }
 
-        It 'returns $null when nothing is rate-limited' {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'a' -Status 'ok')) -Cache $false -Rl $false
-            Format-RateLimitAdvisory -Snapshot $snap | Should -BeNullOrEmpty
+        It 'returns $null when every row read cleanly' {
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'a' -Status 'ok'))
+            Format-UsageAdvisory -Snapshot $snap | Should -BeNullOrEmpty
         }
 
         It 'returns $null for a null snapshot' {
-            Format-RateLimitAdvisory -Snapshot $null | Should -BeNullOrEmpty
+            Format-UsageAdvisory -Snapshot $null | Should -BeNullOrEmpty
+        }
+
+        It 'returns $null for an empty Results set' {
+            Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results @()) |
+                Should -BeNullOrEmpty
         }
 
         It 'no-cache, one slot: names it with "is" and no last-known clause' {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1')) -Cache $false -Rl $true
-            Format-RateLimitAdvisory -Snapshot $snap |
-                Should -Be "[Usage] 'slot-1' is currently rate-limited by Anthropic."
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'))
+            Format-UsageAdvisory -Snapshot $snap |
+                Should -Be "[Usage] 'slot-1' is currently rate-limited or at a plan limit."
         }
 
         It 'no-cache, multiple slots: names them with "are"' {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'), (New-RlRow -Name 'slot-3')) -Cache $false -Rl $true
-            Format-RateLimitAdvisory -Snapshot $snap |
-                Should -Be "[Usage] 'slot-1', 'slot-3' are currently rate-limited by Anthropic."
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'), (New-RlRow -Name 'slot-3'))
+            Format-UsageAdvisory -Snapshot $snap |
+                Should -Be "[Usage] 'slot-1', 'slot-3' are currently rate-limited or at a plan limit."
         }
 
         It 'no-cache, >3 slots: collapses to "and N more" with plural verb' {
             $rows = @('a','b','c','d') | ForEach-Object { New-RlRow -Name $_ }
-            $snap = New-RlSnapshot -Results $rows -Cache $false -Rl $true
-            Format-RateLimitAdvisory -Snapshot $snap |
-                Should -Be "[Usage] 'a', 'b', 'c' and 1 more are currently rate-limited by Anthropic."
+            $snap = New-RlSnapshot -Results $rows
+            Format-UsageAdvisory -Snapshot $snap |
+                Should -Be "[Usage] 'a', 'b', 'c' and 1 more are currently rate-limited or at a plan limit."
         }
 
         It 'cache branch: names the cached slot and adds the last-known clause' {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'cached' -Cached $true)) -Cache $true -Rl $true
-            Format-RateLimitAdvisory -Snapshot $snap |
-                Should -Be "[Usage] 'cached' is currently rate-limited by Anthropic; showing last known usage."
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'cached' -Cached $true))
+            Format-UsageAdvisory -Snapshot $snap |
+                Should -Be "[Usage] 'cached' is currently rate-limited or at a plan limit; showing last known usage."
         }
 
-        It 'cache branch takes precedence and names only the cached rows' {
-            $rows = @((New-RlRow -Name 'cached' -Cached $true), (New-RlRow -Name 'nocache' -Cached $false))
-            $snap = New-RlSnapshot -Results $rows -Cache $true -Rl $true
-            $out  = Format-RateLimitAdvisory -Snapshot $snap
-            $out | Should -Match "'cached'"
-            $out | Should -Not -Match 'nocache'
-            $out | Should -Match 'showing last known usage'
+        # The cache branch used to win outright, so a hard failure could
+        # hide behind a "showing last known usage" note. Both conditions now get
+        # their own line and no row is named twice.
+        It 'emits one line per condition instead of letting the cache branch win' {
+            $rows = @(
+                (New-RlRow -Name 'cached'  -Cached $true),
+                (New-RlRow -Name 'nocache' -Cached $false)
+            )
+            $snap  = New-RlSnapshot -Results $rows
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+
+            $lines.Count | Should -Be 2
+            ($lines -join "`n") | Should -Match "'cached'"
+            ($lines -join "`n") | Should -Match "'nocache'"
+            @($lines | Where-Object { $_ -match 'showing last known usage' }).Count | Should -Be 1
+        }
+
+        It 'words a network fallback as a failed live read, not a rate limit' {
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status 'error' -Cached $true -Reason 'network'))
+            $out  = Format-UsageAdvisory -Snapshot $snap
+            $out | Should -Be "[Usage] 'slot-1' could not be read live; showing last known usage."
+            $out | Should -Not -Match 'rate-limited'
+        }
+
+        It 'names a hard error row with no cached data' {
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status 'error'))
+            Format-UsageAdvisory -Snapshot $snap |
+                Should -Be "[Usage] 'slot-1' could not be read; usage unknown."
+        }
+
+        It 'reports a cached row once, under its fallback line only' {
+            # A stale network fallback carries Status='error' AND
+            # IsCachedFallback, so it matches two buckets by status alone.
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status 'error' -Cached $true -Reason 'network'))
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+            $lines.Count | Should -Be 1
+            $lines[0]    | Should -Match 'showing last known usage'
+        }
+
+        It 'orders no-data failures above cache fallbacks' {
+            $rows = @(
+                (New-RlRow -Name 'cached' -Status 'error' -Cached $true -Reason 'network'),
+                (New-RlRow -Name 'dead'   -Status 'error')
+            )
+            $snap  = New-RlSnapshot -Results $rows
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+            $lines[0] | Should -Match "'dead'"
+            $lines[1] | Should -Match "'cached'"
+        }
+
+        It 'treats a cached row with no FallbackReason as a rate limit' {
+            # The backoff short-circuit in Get-SlotUsage builds its result
+            # inline; older callers/fixtures carry no reason at all.
+            $row = [pscustomobject]@{ Name = 'slot-1'; Status = 'rate-limited'; IsCachedFallback = $true
+                Data = $null; Error = $null; Email = $null; IsActive = $false }
+            $snap = New-RlSnapshot -Results @($row)
+            Format-UsageAdvisory -Snapshot $snap | Should -Match 'rate-limited or at a plan limit; showing last known usage'
+        }
+
+        # --- per-slot reason lines ---
+        #
+        # The Status column carries only a short label, so the detail it used
+        # to inline (a 60-char exception tail, cut mid-word) lands here.
+
+        It "prints the row's own message as its reason line" {
+            $row  = New-RlRow -Name 'slot-1' -Status 'error'
+            $row.Error = 'The operation has timed out.'
+            $snap  = New-RlSnapshot -Results @($row)
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+
+            $lines.Count | Should -Be 2
+            $lines[0]    | Should -Match 'could not be read'
+            $lines[1]    | Should -Be '[Usage] slot-1: The operation has timed out.'
+        }
+
+        It 'collapses a multi-line message onto one reason line and bounds its length' {
+            $row  = New-RlRow -Name 'slot-1' -Status 'error'
+            $row.Error = "first line`r`nsecond line " + ('X' * ($Script:AdvisoryReasonMaxWidth * 2))
+            $snap  = New-RlSnapshot -Results @($row)
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+
+            $lines.Count | Should -Be 2
+            $lines[1] | Should -Match '^\[Usage\] slot-1: first line second line X+\.\.\.$'
+            $lines[1].Length | Should -BeLessThan ($Script:AdvisoryReasonMaxWidth + 30)
+        }
+
+        It 'falls back to the canned remedy for a hard failure with no message: <Case>' -ForEach @(
+            @{ Case = 'expired';      Status = 'expired';      Expected = 'token refresh failed; run sca switch to refresh' }
+            @{ Case = 'unauthorized'; Status = 'unauthorized'; Expected = 'token revoked; run sca switch then /login' }
+            @{ Case = 'no-oauth';     Status = 'no-oauth';     Expected = 'api key or non-claude.ai slot' }
+        ) {
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status $Status))
+            # These statuses match no condition bucket, so the reason line is
+            # the whole advisory.
+            Format-UsageAdvisory -Snapshot $snap | Should -Be "[Usage] 'slot-1': $Expected"
+        }
+
+        # A remedy is a per-status constant, so repeating it once per slot said
+        # nothing new and burned the shared 3-line cap on identical text.
+        It 'names every slot sharing a remedy on one line' {
+            $rows = @('a','b') | ForEach-Object { New-RlRow -Name $_ -Status 'no-oauth' }
+            $snap = New-RlSnapshot -Results $rows
+
+            Format-UsageAdvisory -Snapshot $snap |
+                Should -Be "[Usage] 'a', 'b': api key or non-claude.ai slot"
+        }
+
+        It 'groups per status, worst first, not into one combined line' {
+            $rows = @(
+                (New-RlRow -Name 'a' -Status 'no-oauth'),
+                (New-RlRow -Name 'b' -Status 'expired'),
+                (New-RlRow -Name 'c' -Status 'no-oauth')
+            )
+            $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results $rows)) -split "`n")
+
+            $lines.Count | Should -Be 2
+            # Fixed worst-first status order, matching the condition lines
+            # above, rather than whichever status the caller listed first.
+            $lines[0] | Should -Be "[Usage] 'b': token refresh failed; run sca switch to refresh"
+            $lines[1] | Should -Be "[Usage] 'a', 'c': api key or non-claude.ai slot"
+        }
+
+        It 'stays silent for a rate-limited row with no message (the condition line already says it)' {
+            $snap  = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'))
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+            $lines.Count | Should -Be 1
+            $lines[0]    | Should -Match 'currently rate-limited or at a plan limit'
+        }
+
+        It 'caps the reason block at 3 lines so a wide failing pool cannot push the table off screen' {
+            $rows = @('a','b','c','d','e') | ForEach-Object {
+                $r = New-RlRow -Name $_ -Status 'error'
+                $r.Error = "boom $_"
+                $r
+            }
+            $snap  = New-RlSnapshot -Results $rows
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+
+            # 1 condition line + 3 reason lines.
+            $lines.Count | Should -Be 4
+            @($lines | Where-Object { $_ -match '^\[Usage\] \w: boom' }).Count | Should -Be 3
+            # The condition line still accounts for every affected slot.
+            $lines[0] | Should -Match "and 2 more"
+        }
+
+        # The fresh-cache path is the commonest transient failure there is (a
+        # cache under the TTL), and it used to arrive with its message stripped:
+        # the frame said "showing last known usage" and nothing anywhere said
+        # why, on the one row still painting numbers.
+        It 'explains a fresh cache fallback, which keeps its ok status' {
+            $row = New-RlRow -Name 'blip' -Status 'ok' -Cached $true -Reason 'network'
+            $row.Error = 'The operation has timed out.'
+            $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results @($row))) -split "`n")
+
+            $lines.Count | Should -Be 2
+            $lines[0]    | Should -Be "[Usage] 'blip' could not be read live; showing last known usage."
+            $lines[1]    | Should -Be '[Usage] blip: The operation has timed out.'
+        }
+
+        # Cached rows still have their numbers on screen, so they are the least
+        # urgent thing in the block. Unsorted they could take the whole cap from
+        # rows that have nothing left to show.
+        It 'gives the 3-message cap to hard failures before cache fallbacks' {
+            $rows = @()
+            foreach ($n in @('cached-1', 'cached-2', 'cached-3')) {
+                $r = New-RlRow -Name $n -Status 'ok' -Cached $true -Reason 'network'
+                $r.Error = "blip $n"
+                $rows += $r
+            }
+            foreach ($n in @('dead-1', 'dead-2')) {
+                $r = New-RlRow -Name $n -Status 'error'
+                $r.Error = "boom $n"
+                $rows += $r
+            }
+            $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results $rows)) -split "`n")
+
+            @($lines | Where-Object { $_ -match 'boom ' }).Count | Should -Be 2
+            @($lines | Where-Object { $_ -match 'blip ' }).Count | Should -Be 1
+        }
+
+        It 'reports both the transport errors and the grouped remedy' {
+            # A row-ordered shared cap emitted three 'no-oauth' notices (a
+            # permanent config fact) and dropped both transport errors.
+            $rows = @(
+                (New-RlRow -Name 'a-apikey' -Status 'no-oauth'),
+                (New-RlRow -Name 'b-apikey' -Status 'no-oauth'),
+                (New-RlRow -Name 'c-apikey' -Status 'no-oauth')
+            )
+            foreach ($n in @('y-dead', 'z-dead')) {
+                $r = New-RlRow -Name $n -Status 'error'
+                $r.Error = "boom $n"
+                $rows += $r
+            }
+            $snap  = New-RlSnapshot -Results $rows
+            $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
+
+            # 1 condition line (errors only; no-oauth matches no bucket)
+            # + 1 grouped remedy + 2 messages. Remedies precede the per-slot
+            # messages because they are the group that must survive
+            # $Script:AdvisoryMaxLines; see Format-UsageAdvisory.
+            $lines.Count | Should -Be 4
+            $lines[1] | Should -Be "[Usage] 'a-apikey', 'b-apikey', 'c-apikey': api key or non-claude.ai slot"
+            $lines[2] | Should -Be '[Usage] y-dead: boom y-dead'
+            $lines[3] | Should -Be '[Usage] z-dead: boom z-dead'
+        }
+
+        # Every production path that yields 'expired' stamps an Error
+        # (Resolve-SlotAccessToken, Invoke-SlotActivator), so a remedy pass
+        # keyed on "carries no message" never fired for it, and the message
+        # cap could then drop the slot's only line. 'expired' has no condition
+        # line, so that left nothing on screen at all.
+        It 'falls back to the remedy for an expired slot whose message the cap dropped' {
+            $rows = @('a-dead','b-dead','c-dead') | ForEach-Object {
+                $r = New-RlRow -Name $_ -Status 'error'
+                $r.Error = "boom $_"
+                $r
+            }
+            $late = New-RlRow -Name 'z-expired' -Status 'expired'
+            $late.Error = 'refresh returned 400'
+            $rows += $late
+
+            $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results $rows)) -split "`n")
+
+            # 1 condition line + 1 grouped remedy + 3 capped messages.
+            $lines.Count | Should -Be 5
+            @($lines | Where-Object { $_ -match 'z-expired' }).Count | Should -Be 1
+            $lines[1] | Should -Be "[Usage] 'z-expired': token refresh failed; run sca switch to refresh"
+        }
+
+        It 'prefers the message over the remedy when the slot fits inside the cap' {
+            $row = New-RlRow -Name 'slot-1' -Status 'expired'
+            $row.Error = 'refresh returned 400'
+
+            $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results @($row))) -split "`n")
+
+            $lines.Count | Should -Be 1
+            $lines[0]    | Should -Be '[Usage] slot-1: refresh returned 400'
+        }
+
+        # The regression the shared cap caused: 'expired' / 'unauthorized' /
+        # 'no-oauth' have no condition line, so once three messages filled the
+        # cap the slot the user actually has to act on vanished from the frame
+        # entirely, leaving only a bare label in the Status column.
+        It 'keeps the remedy visible behind a full message cap' {
+            $rows = @()
+            foreach ($n in @('d1','d2','d3','d4')) {
+                $r = New-RlRow -Name $n -Status 'error'
+                $r.Error = "boom $n"
+                $rows += $r
+            }
+            $rows += (New-RlRow -Name 'revoked' -Status 'unauthorized')
+
+            $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results $rows)) -split "`n")
+
+            # 1 condition line + the remedy + 3 capped messages.
+            $lines.Count | Should -Be 5
+            @($lines | Where-Object { $_ -match ': boom ' }).Count | Should -Be 3
+            $lines[1] | Should -Be "[Usage] 'revoked': token revoked; run sca switch then /login"
+        }
+
+        # The block is painted inside a watch frame addressed with ESC[H plus
+        # per-line erase, which stops being in-place the moment the frame is
+        # taller than the terminal. Ten lines of advisory, several wrapping at
+        # $Script:AdvisoryReasonMaxWidth, is enough to push the table off a
+        # 24-row screen on its own.
+        It 'never exceeds AdvisoryMaxLines, and drops only per-slot detail' {
+            # Four distinct conditions (one slot each) so every condition line
+            # fires, plus three hard-failure statuses for three remedies, plus
+            # enough messages to overflow.
+            $rows = @()
+            $e = New-RlRow -Name 'bare-err' -Status 'error';        $e.Error = 'boom bare-err';   $rows += $e
+            $l = New-RlRow -Name 'bare-lim' -Status 'rate-limited'; $rows += $l
+            $n = New-RlRow -Name 'cach-net' -Status 'error';        $n.Error = 'boom cach-net'
+            $n.IsCachedFallback = $true; $n.FallbackReason = 'network';  $rows += $n
+            $c = New-RlRow -Name 'cach-lim' -Status 'rate-limited'
+            $c.IsCachedFallback = $true; $c.FallbackReason = 'rate-limit'; $rows += $c
+            $x = New-RlRow -Name 'gone-exp' -Status 'expired';      $x.Error = 'boom gone-exp'; $rows += $x
+            $rows += (New-RlRow -Name 'gone-401' -Status 'unauthorized')
+            $rows += (New-RlRow -Name 'gone-key' -Status 'no-oauth')
+
+            $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results $rows)) -split "`n")
+
+            $lines.Count | Should -BeLessOrEqual $Script:AdvisoryMaxLines
+
+            # Coverage survives the cap: all four condition lines and all three
+            # remedies are present, so no failing slot goes unmentioned.
+            @($lines | Where-Object { $_ -match 'could not be read; usage unknown' }).Count      | Should -Be 1
+            @($lines | Where-Object { $_ -match 'currently rate-limited or at a plan limit\.' }).Count | Should -Be 1
+            @($lines | Where-Object { $_ -match 'could not be read live; showing last known usage' }).Count | Should -Be 1
+            @($lines | Where-Object { $_ -match 'plan limit; showing last known usage' }).Count            | Should -Be 1
+            $lines | Should -Contain "[Usage] 'gone-exp': token refresh failed; run sca switch to refresh"
+            $lines | Should -Contain "[Usage] 'gone-401': token revoked; run sca switch then /login"
+            $lines | Should -Contain "[Usage] 'gone-key': api key or non-claude.ai slot"
+
+            # gone-exp is the case the remedy budget is reserved for: it
+            # carries a message, so a reason-first budget would drop that
+            # message to the cap AND its remedy to $reported, leaving the one
+            # failure class that never clears on its own with no line at all.
+            @($lines | Where-Object { $_ -match 'gone-exp' }).Count | Should -Be 1
+        }
+
+        It 'ok rows never produce a reason line' {
+            $row = New-RlRow -Name 'slot-1' -Status 'ok'
+            $snap = New-RlSnapshot -Results @($row)
+            Format-UsageAdvisory -Snapshot $snap | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Get-ConsoleWidth' {
+        It 'returns a non-negative integer without throwing in a console-less host' {
+            # Pester runs with no attached console, so [Console]::WindowWidth
+            # throws here; the helper exists to swallow that and hand callers
+            # a 0 they can branch on.
+            $w = Get-ConsoleWidth
+            $w | Should -BeOfType [int]
+            $w | Should -BeGreaterOrEqual 0
         }
     }
 
@@ -1903,7 +2316,7 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'disk full'
 
             # Tokens file landed on disk despite the sidecar failure.
-            $tokenFiles = @(Get-ChildItem -LiteralPath $credDir -Filter '.credentials.auto-*.json' |
+            $tokenFiles = @(Get-ChildItem -LiteralPath $credDir -Filter '.credentials.auto-*.json' -Force |
                 Where-Object { $_.Name -notlike '*.account.json' })
             $tokenFiles.Count | Should -Be 1
             [System.IO.File]::ReadAllBytes($tokenFiles[0].FullName) | Should -Be $bytes
@@ -1935,11 +2348,459 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Get-CredentialSlotFiles' {
+        # The -Force flag this helper exists to centralize is invisible on
+        # Windows and load-bearing on Unix, so assert the exclusions (which
+        # hold everywhere) plus the dotfile visibility itself.
+
+        It 'returns slot files and excludes .credentials.json and sidecars' {
+            New-SlotPair -CredDir $CredDir -Name 'alpha' -Content 'A' | Out-Null
+            New-SlotPair -CredDir $CredDir -Name 'beta'  -Content 'B' | Out-Null
+            Set-Content -LiteralPath $CredFile -Value 'ACTIVE' -NoNewline
+
+            $names = @(Get-CredentialSlotFiles | ForEach-Object { $_.Name } | Sort-Object)
+
+            $names.Count | Should -Be 2
+            $names | Should -Not -Contain '.credentials.json'
+            @($names | Where-Object { $_ -like '*.account.json' }).Count | Should -Be 0
+        }
+
+        It 'finds dotfiles that a -Force-less enumeration would hide' {
+            New-SlotPair -CredDir $CredDir -Name 'gamma' -Content 'G' | Out-Null
+
+            # The regression this guards: without -Force, .NET's Hidden
+            # attribute on dot-prefixed names makes this come back empty on
+            # Linux and macOS while still passing on Windows.
+            @(Get-CredentialSlotFiles).Count | Should -Be 1
+        }
+
+        It 'honors -Directory for a location other than $CredDir' {
+            $other = Join-Path $TestDrive 'other-config'
+            New-Item -ItemType Directory -Path $other -Force | Out-Null
+            New-SlotPair -CredDir $other -Name 'elsewhere' -Content 'E' | Out-Null
+
+            @(Get-CredentialSlotFiles -Directory $other).Count | Should -Be 1
+            @(Get-CredentialSlotFiles).Count                   | Should -Be 0
+        }
+
+        It 'returns nothing for a directory that does not exist' {
+            @(Get-CredentialSlotFiles -Directory (Join-Path $TestDrive 'no-such-dir')).Count |
+                Should -Be 0
+        }
+    }
+
+    Context 'Resolve-ScaConfigDir' {
+        # A relative CLAUDE_CONFIG_DIR has to be bound to a base exactly once.
+        # PowerShell's provider cmdlets resolve against $PWD while the script's
+        # .NET calls resolve against [Environment]::CurrentDirectory, which
+        # PowerShell never syncs to Set-Location, so an unbound relative value
+        # made `sca save` enumerate one directory and write into another.
+
+        It 'returns null for an unset value' {
+            Resolve-ScaConfigDir -Value $null | Should -BeNullOrEmpty
+        }
+
+        It 'returns null for a blank value' {
+            Resolve-ScaConfigDir -Value '   ' | Should -BeNullOrEmpty
+        }
+
+        It 'binds a relative value to the base directory' {
+            $base = Join-Path $TestDrive 'base'
+            Resolve-ScaConfigDir -Value 'claude-cfg' -BaseDir $base |
+                Should -Be (Join-Path $base 'claude-cfg')
+        }
+
+        It 'resolves a relative segment against the base' {
+            $base = Join-Path $TestDrive 'base'
+            Resolve-ScaConfigDir -Value (Join-Path 'sub' (Join-Path '..' 'cfg')) -BaseDir $base |
+                Should -Be (Join-Path $base 'cfg')
+        }
+
+        It 'leaves an absolute value rooted where it was' {
+            $abs = Join-Path $TestDrive 'absolute-cfg'
+            Resolve-ScaConfigDir -Value $abs -BaseDir (Join-Path $TestDrive 'elsewhere') |
+                Should -Be $abs
+        }
+
+        # Claude Code treats a leading ~ as a literal cwd-relative directory
+        # (anthropics/claude-code#78988), so expanding it here would aim sca at
+        # a different directory than the process it mirrors.
+        It 'does not expand a leading tilde' {
+            $base = Join-Path $TestDrive 'base'
+            Resolve-ScaConfigDir -Value (Join-Path '~' 'cfg') -BaseDir $base |
+                Should -Be (Join-Path $base (Join-Path '~' 'cfg'))
+        }
+
+        It 'hands an unusable value back verbatim rather than throwing at load time' {
+            # A base that is not rooted makes GetFullPath throw; `sca help` and
+            # `sca -Version` still have to work so they can say what is wrong.
+            Resolve-ScaConfigDir -Value 'cfg' -BaseDir 'not-a-rooted-base' | Should -Be 'cfg'
+        }
+
+        # End to end: the script's own load-time binding, from the environment
+        # variable through to every derived path.
+        It 'leaves no relative path in $CredDir when the variable is relative' {
+            $env:CLAUDE_CONFIG_DIR = 'rel-cfg'
+            Push-Location -LiteralPath $TestDrive
+            try {
+                . $script:ScriptPath
+                $expected = Join-Path $TestDrive 'rel-cfg'
+                $CredDir        | Should -Be $expected
+                $CredFile       | Should -Be (Join-Path $expected '.credentials.json')
+                $StateFile      | Should -Be (Join-Path $expected '.sca-state.json')
+                $ClaudeJsonPath | Should -Be (Join-Path $expected '.claude.json')
+            }
+            finally {
+                Pop-Location
+                $env:CLAUDE_CONFIG_DIR = $null
+            }
+        }
+    }
+
+    Context 'Get-ConfigDirAdvisory' {
+        # Driven by argument rather than by $env:CLAUDE_CONFIG_DIR, because
+        # $ScaConfigDir / $CredDir / $ScaHomeDir are bound once when
+        # Common.ps1 dot-sources the script: re-setting the environment
+        # variable afterwards would not be observed.
+
+        It 'returns null when CLAUDE_CONFIG_DIR is unset' {
+            Get-ConfigDirAdvisory -ConfigDir $null | Should -BeNullOrEmpty
+        }
+
+        It 'returns null when CLAUDE_CONFIG_DIR is set but blank' {
+            Get-ConfigDirAdvisory -ConfigDir '   ' | Should -BeNullOrEmpty
+        }
+
+        It 'returns null when CLAUDE_CONFIG_DIR points at the default directory' {
+            $default = Join-Path $script:SandboxHome '.claude'
+
+            Get-ConfigDirAdvisory -ConfigDir $default `
+                                  -HomeDir   $script:SandboxHome `
+                                  -ActiveDir $default | Should -BeNullOrEmpty
+        }
+
+        It 'returns null when the value differs only by a redundant path segment' {
+            $roundabout = Join-Path $script:SandboxHome (Join-Path 'sub' (Join-Path '..' '.claude'))
+
+            Get-ConfigDirAdvisory -ConfigDir $roundabout `
+                                  -HomeDir   $script:SandboxHome `
+                                  -ActiveDir $roundabout | Should -BeNullOrEmpty
+        }
+
+        # GetFullPath PRESERVES a trailing separator, so a plain string compare
+        # read 'x/.claude/' and 'x/.claude' as different directories. The
+        # advisory that followed named the SAME directory as the one in use and
+        # as the one holding slots "not in use", on every invocation, forever.
+        It 'returns null when the value differs only by a trailing separator' {
+            $default  = Join-Path $script:SandboxHome '.claude'
+            $trailing = $default + [System.IO.Path]::DirectorySeparatorChar
+            New-SlotPair -CredDir $default -Name 'would-be-misreported' -Content 'A' | Out-Null
+
+            Get-ConfigDirAdvisory -ConfigDir $trailing `
+                                  -HomeDir   $script:SandboxHome `
+                                  -ActiveDir $trailing | Should -BeNullOrEmpty
+        }
+
+        It 'returns null when the value differs only by separator style' -Skip:(-not $IsWindows) {
+            $default = Join-Path $script:SandboxHome '.claude'
+            $slashed = $default -replace '\\', '/'
+            New-SlotPair -CredDir $default -Name 'would-be-misreported' -Content 'A' | Out-Null
+
+            Get-ConfigDirAdvisory -ConfigDir $slashed `
+                                  -HomeDir   $script:SandboxHome `
+                                  -ActiveDir $slashed | Should -BeNullOrEmpty
+        }
+
+        # Resolve-ScaConfigDir has always guarded this; Get-ConfigDirAdvisory
+        # did not, and GetFullPath validates its base BEFORE the path, so an
+        # Env:\ location threw on two absolute arguments. The catch failed open
+        # into the orphan check, producing the same self-contradicting line.
+        It 'compares correctly from a non-filesystem provider location' {
+            $default = Join-Path $script:SandboxHome '.claude'
+            New-SlotPair -CredDir $default -Name 'would-be-misreported' -Content 'A' | Out-Null
+
+            Push-Location Env:\
+            try {
+                Get-ConfigDirAdvisory -ConfigDir $default `
+                                      -HomeDir   $script:SandboxHome `
+                                      -ActiveDir $default | Should -BeNullOrEmpty
+            }
+            finally { Pop-Location }
+        }
+
+        It 'names the directory in use when relocated and slots are stranded' {
+            $defaultDir = Join-Path $script:SandboxHome '.claude'
+            New-SlotPair -CredDir $defaultDir -Name 'left-behind' -Content 'A' | Out-Null
+
+            $relocated = Join-Path $TestDrive 'relocated'
+
+            $advisory = Get-ConfigDirAdvisory -ConfigDir $relocated `
+                                              -HomeDir   $script:SandboxHome `
+                                              -ActiveDir $relocated
+
+            $advisory | Should -Match 'CLAUDE_CONFIG_DIR is set'
+            $advisory | Should -BeLike "*$relocated*"
+        }
+
+        It 'counts the slots left behind in the default directory' {
+            $defaultDir = Join-Path $script:SandboxHome '.claude'
+            New-SlotPair -CredDir $defaultDir -Name 'left-a' -Content 'A' | Out-Null
+            New-SlotPair -CredDir $defaultDir -Name 'left-b' -Content 'B' | Out-Null
+
+            $relocated = Join-Path $TestDrive 'relocated-count'
+
+            Get-ConfigDirAdvisory -ConfigDir $relocated `
+                                  -HomeDir   $script:SandboxHome `
+                                  -ActiveDir $relocated | Should -Match '2 slot\(s\)'
+        }
+
+        It 'stays silent when the default directory holds no slots' {
+            # Setting the variable is a permanent configuration, so an
+            # unconditional line would print on every invocation forever. With
+            # nothing stranded there is nothing being hidden from the user.
+            $relocated = Join-Path $TestDrive 'relocated-empty'
+
+            Get-ConfigDirAdvisory -ConfigDir $relocated `
+                                  -HomeDir   $script:SandboxHome `
+                                  -ActiveDir $relocated | Should -BeNullOrEmpty
+        }
+
+        It 'fails open and still advises when the path cannot be normalized' {
+            # An embedded NUL makes GetFullPath throw. The advisory is the
+            # safe outcome: better a redundant line than a silent relocation.
+            # Needs a stranded slot, since that is what the advisory reports.
+            $defaultDir = Join-Path $script:SandboxHome '.claude'
+            New-SlotPair -CredDir $defaultDir -Name 'stranded' -Content 'A' | Out-Null
+
+            Get-ConfigDirAdvisory -ConfigDir "bad`0path" `
+                                  -HomeDir   $script:SandboxHome `
+                                  -ActiveDir "bad`0path" | Should -Match 'CLAUDE_CONFIG_DIR is set'
+        }
+
+        It 'resolves a relative value against $PWD, not the process start directory' {
+            # [IO.Path]::GetFullPath(path) resolves against
+            # [Environment]::CurrentDirectory, which PowerShell never syncs to
+            # Set-Location. Every other consumer of $CredDir goes through the
+            # provider and lands on $PWD, so a relative CLAUDE_CONFIG_DIR must
+            # be compared the same way or the "already the default" arm
+            # misfires against a directory sca never reads.
+            $defaultDir = Join-Path $script:SandboxHome '.claude'
+            New-SlotPair -CredDir $defaultDir -Name 'stranded' -Content 'A' | Out-Null
+
+            Push-Location -LiteralPath $script:SandboxHome
+            try {
+                # '.claude' relative to $PWD IS the default directory, so the
+                # advisory must be silent. Resolved against the process start
+                # directory it would not be, and the advisory would fire.
+                Get-ConfigDirAdvisory -ConfigDir '.claude' `
+                                      -HomeDir   $script:SandboxHome `
+                                      -ActiveDir '.claude' | Should -BeNullOrEmpty
+            }
+            finally { Pop-Location }
+        }
+
+        # An unresolvable home on Unix (a container, a systemd unit) leaves
+        # $ScaHomeDir null, which a [String] parameter binds as ''. Join-Path
+        # rejects that, and the throw would abort the whole invocation over an
+        # advisory line even though $CredDir came from CLAUDE_CONFIG_DIR and
+        # never needed the home directory. With no default directory there is
+        # also nowhere for a slot to be stranded, so the answer is silence.
+        It 'returns null without a resolvable home directory: <Case>' -ForEach @(
+            @{ Case = 'empty string'; HomeDir = '' }
+            @{ Case = 'null';         HomeDir = $null }
+            @{ Case = 'whitespace';   HomeDir = '   ' }
+        ) {
+            $relocated = Join-Path $TestDrive 'relocated-no-home'
+
+            # A throw here IS the regression: Join-Path rejects the empty
+            # string, and the call site in Invoke-Main is not wrapped.
+            { Get-ConfigDirAdvisory -ConfigDir $relocated `
+                                    -HomeDir   $HomeDir `
+                                    -ActiveDir $relocated } | Should -Not -Throw
+
+            Get-ConfigDirAdvisory -ConfigDir $relocated `
+                                  -HomeDir   $HomeDir `
+                                  -ActiveDir $relocated | Should -BeNullOrEmpty
+        }
+
+        It 'reads the script-scope values when called without arguments' {
+            # Common.ps1 clears CLAUDE_CONFIG_DIR, so the default-bound call
+            # must be silent. Covers the production call site in Invoke-Main.
+            Get-ConfigDirAdvisory | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Test-SamePath / Get-PathResolutionBase' {
+        It 'ignores a trailing separator' {
+            $sep = [System.IO.Path]::DirectorySeparatorChar
+            Test-SamePath -Left (Join-Path $TestDrive 'a') -Right ((Join-Path $TestDrive 'a') + $sep) |
+                Should -BeTrue
+        }
+
+        It 'still distinguishes genuinely different directories' {
+            Test-SamePath -Left (Join-Path $TestDrive 'a') -Right (Join-Path $TestDrive 'b') |
+                Should -BeFalse
+        }
+
+        It 'normalises relative segments' {
+            Test-SamePath -Left (Join-Path $TestDrive 'a') `
+                          -Right (Join-Path $TestDrive (Join-Path 'sub' (Join-Path '..' 'a'))) |
+                Should -BeTrue
+        }
+
+        It 'is case-insensitive on Windows and case-sensitive elsewhere' {
+            $expected = [bool]$IsWindows
+            Test-SamePath -Left (Join-Path $TestDrive 'Case') -Right (Join-Path $TestDrive 'case') |
+                Should -Be $expected
+        }
+
+        It 'falls back off a non-filesystem location instead of throwing' {
+            Push-Location Env:\
+            try {
+                $PWD.ProviderPath | Should -Not -Be ([Environment]::CurrentDirectory)
+                Get-PathResolutionBase | Should -Be ([Environment]::CurrentDirectory)
+                { Test-SamePath -Left 'rel-a' -Right 'rel-a' } | Should -Not -Throw
+                Test-SamePath -Left 'rel-a' -Right 'rel-a' | Should -BeTrue
+            }
+            finally { Pop-Location }
+        }
+    }
+
+    Context 'Assert-CredentialDir' {
+        # $CredDir is blank only when neither the platform's home variable nor
+        # CLAUDE_CONFIG_DIR is set. The directory arrives as a parameter
+        # because it binds once at load time, so the suite drives the branches
+        # by argument.
+
+        It 'throws naming both variables when no directory resolved: <Case>' -ForEach @(
+            @{ Case = 'null';       Directory = $null }
+            @{ Case = 'empty';      Directory = '' }
+            @{ Case = 'whitespace'; Directory = '   ' }
+        ) {
+            { Assert-CredentialDir -Directory $Directory } |
+                Should -Throw -ExpectedMessage '*CLAUDE_CONFIG_DIR*'
+        }
+
+        It 'names the home variable the running platform actually reads' {
+            $expected = if ($IsWindows) { 'USERPROFILE' } else { 'HOME' }
+            { Assert-CredentialDir -Directory '' } |
+                Should -Throw -ExpectedMessage "*`$env:$expected*"
+        }
+
+        It 'does not throw for a resolved directory' {
+            { Assert-CredentialDir -Directory $TestDrive } | Should -Not -Throw
+        }
+
+        It 'defaults to the script-scope directory, which the sandbox always resolves' {
+            { Assert-CredentialDir } | Should -Not -Throw
+        }
+    }
+
+    Context 'Show-Help FILES block' {
+        It 'prints the paths this invocation actually uses' {
+            $out = Show-Help 6>&1 | Out-String
+            $out | Should -Match ([regex]::Escape($CredFile))
+            $out | Should -Match ([regex]::Escape($StateFile))
+        }
+
+        # The home ENVIRONMENT VARIABLE is not the only source of a home
+        # directory: .NET falls back to the passwd entry on Unix and to the
+        # shell folder API on Windows, and PowerShell binds $HOME from that.
+        # Node's os.homedir() does the same, so `claude` keeps working with
+        # HOME unset; consulting only $env:HOME would have made `sca` refuse
+        # in an environment where the process it mirrors is running fine.
+        #
+        # Out of process because $ScaHomeDir binds when the script is
+        # dot-sourced, and dot-sourced (not invoked) so no action runs and
+        # nothing is created in the tester's real home.
+        It 'falls back to the session home when the home variable is unset' {
+            $homeVar = if ($IsWindows) { 'USERPROFILE' } else { 'HOME' }
+            $out = pwsh -NoProfile -Command "
+                Remove-Item -Path Env:$homeVar -ErrorAction SilentlyContinue
+                Remove-Item -Path Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
+                . '$script:ScriptPath'
+                `$CredDir
+            " 2>&1 | Out-String
+
+            $out | Should -Not -Match 'Cannot bind argument'
+            $out.Trim() | Should -Not -BeNullOrEmpty
+            $out.Trim() | Should -BeLike "*$([System.IO.Path]::DirectorySeparatorChar).claude"
+        }
+
+        # Help is where the user finds out which variable to set, so it has to
+        # render in the environment that cannot resolve one. With the $HOME
+        # fallback in place that environment is no longer reachable by removing
+        # an environment variable (a healthy machine always answers), so the
+        # unresolved rendering is driven directly instead. `sca help` used to
+        # die on Join-Path's binder before printing a line.
+        It 'renders the FILES block with no resolvable home directory' {
+            $CredDir   = $null
+            $CredFile  = $null
+            $StateFile = $null
+
+            $out = Show-Help 6>&1 | Out-String
+
+            $out | Should -Match 'Switch Claude Account - manage multiple Claude Code logins'
+            @([regex]::Matches($out, 'unresolved: set HOME or CLAUDE_CONFIG_DIR')).Count |
+                Should -Be 3
+        }
+
+        # The counterpart: every other action has to refuse, and name both
+        # variables rather than surfacing a parameter-binder error.
+        It 'refuses an action with no resolvable credentials directory, naming both variables' {
+            $homeVar = if ($IsWindows) { 'USERPROFILE' } else { 'HOME' }
+
+            { Assert-CredentialDir -Directory '' } |
+                Should -Throw -ExpectedMessage "*No credentials directory*"
+            { Assert-CredentialDir -Directory '' } |
+                Should -Throw -ExpectedMessage "*$homeVar*"
+            { Assert-CredentialDir -Directory '' } |
+                Should -Throw -ExpectedMessage '*CLAUDE_CONFIG_DIR*'
+        }
+    }
+
+    Context 'Test-ClaudeNodeProcess' {
+        # The npm package runs as 'node', so Test-ClaudeRunning's name probe
+        # misses it entirely and the ~/.claude.json write would go ahead
+        # against a live in-memory cache. Mocking Get-Process does not reach a
+        # dot-sourced function, which is why the pattern lives here instead.
+
+        It 'matches the npm package entry point behind the claude shim' {
+            $procs = @(
+                [pscustomobject]@{ ProcessName = 'bash'; CommandLine = '-bash' },
+                [pscustomobject]@{ ProcessName = 'node'; CommandLine = 'node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js' }
+            )
+            Test-ClaudeNodeProcess -Processes $procs | Should -BeTrue
+        }
+
+        # Over-matching only refuses a safe action; under-matching races
+        # Claude Code. But a directory name is not a running Claude Code, and
+        # this repo's own checkout would otherwise lock out `sca save`.
+        It 'ignores a command line that merely mentions claude: <Case>' -ForEach @(
+            @{ Case = 'repo path';   CommandLine = 'code /home/ada/switch_claude_account' }
+            @{ Case = 'bare word';   CommandLine = 'less /home/ada/notes-about-claude.md' }
+            @{ Case = 'no cli.js';   CommandLine = 'node /home/ada/claude-code/index.js' }
+            @{ Case = 'null';        CommandLine = $null }
+        ) {
+            $procs = @([pscustomobject]@{ ProcessName = 'x'; CommandLine = $CommandLine })
+            Test-ClaudeNodeProcess -Processes $procs | Should -BeFalse
+        }
+
+        It 'reports nothing for an empty or null process list: <Case>' -ForEach @(
+            @{ Case = 'null';  Processes = $null }
+            @{ Case = 'empty'; Processes = @() }
+        ) {
+            Test-ClaudeNodeProcess -Processes $Processes | Should -BeFalse
+        }
+    }
+
     AfterAll {
         # Restore the two globals BeforeEach mutated so this suite leaves
         # the caller's session clean. Pester runs AfterAll even if tests
         # throw, so this covers the mid-suite-failure case too.
-        $env:USERPROFILE = $script:OriginalUserProfile
-        $global:PROFILE  = $script:OriginalProfile
+        $env:USERPROFILE       = $script:OriginalUserProfile
+        $global:PROFILE        = $script:OriginalProfile
+        $env:HOME              = $script:OriginalHome
+        $env:CLAUDE_CONFIG_DIR = $script:OriginalConfigDir
     }
 }

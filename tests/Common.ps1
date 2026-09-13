@@ -9,9 +9,10 @@
 # block instead places every assignment and function into the BeforeEach's
 # test scope, which is exactly what Pester 5 expects.
 #
-# Each test file additionally captures $env:USERPROFILE and $global:PROFILE
-# in its own BeforeAll and restores them in its own AfterAll. Those captures
-# must run exactly once per file, so they live there rather than here.
+# Each test file additionally captures $env:USERPROFILE, $env:HOME,
+# $env:CLAUDE_CONFIG_DIR and $global:PROFILE in its own BeforeAll and restores
+# them in its own AfterAll. Those captures must run exactly once per file, so
+# they live there rather than here.
 
 $script:ScriptPath = (Resolve-Path (Join-Path $PSScriptRoot '..\switch_claude_account.ps1')).Path
 
@@ -23,7 +24,18 @@ if (Test-Path -LiteralPath $script:SandboxHome) {
     Remove-Item -LiteralPath $script:SandboxHome -Recurse -Force
 }
 New-Item -ItemType Directory -Path $script:SandboxHome -Force | Out-Null
+
+# Both home variables, because the script reads whichever its platform uses:
+# $env:USERPROFILE on Windows, $env:HOME elsewhere. Setting only one would
+# leave the suite testing the developer's real ~/.claude on the other
+# platform, which is exactly how the missing Unix support went unnoticed.
 $env:USERPROFILE = $script:SandboxHome
+$env:HOME        = $script:SandboxHome
+
+# Cleared so a developer (or CI job) that legitimately sets CLAUDE_CONFIG_DIR
+# does not silently redirect $CredDir out of the sandbox and onto their real
+# credentials. Individual tests that exercise the variable set it themselves.
+$env:CLAUDE_CONFIG_DIR = $null
 
 $script:FakeProfilePath = Join-Path $TestDrive 'profile.ps1'
 if (Test-Path -LiteralPath $script:FakeProfilePath) {

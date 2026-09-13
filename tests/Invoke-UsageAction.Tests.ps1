@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
 # Pester 5 tests for the `usage` action and its supporting helpers in
@@ -9,6 +9,8 @@
 BeforeAll {
     $script:OriginalUserProfile = $env:USERPROFILE
     $script:OriginalProfile     = $global:PROFILE
+    $script:OriginalHome        = $env:HOME
+    $script:OriginalConfigDir   = $env:CLAUDE_CONFIG_DIR
 }
 
 Describe 'switch_claude_account' {
@@ -194,8 +196,9 @@ Describe 'switch_claude_account' {
 
             { Invoke-UsageAction 6>$null } | Should -Not -Throw
             $out = Invoke-UsageAction 6>&1 | Out-String
-            $out | Should -Match 'error:'
-            $out | Should -Match 'timed out'
+            # Bare label in the cell; the reason on the advisory line below.
+            $out | Should -Match '(?m)^\s+offline\b.*\berror\s*$'
+            $out | Should -Match '\[Usage\] offline: The operation has timed out\.'
         }
 
         It 'slot with no claudeAiOauth section: status is no-oauth; no HTTP call made' {
@@ -342,29 +345,31 @@ Describe 'switch_claude_account' {
             $out | Should -Match '\b73%'
             # Cache-fallback advisory fires, naming the slot and noting the
             # last-known data is being shown.
-            $out | Should -Match 'currently rate-limited by Anthropic; showing last known usage'
+            $out | Should -Match 'currently rate-limited or at a plan limit; showing last known usage'
             # Old advisory wording must not leak through.
             $out | Should -Not -Match '/api/oauth/usage rate limited'
             $out | Should -Not -Match 'showing cached data'
         }
 
-        It 'refresh failure with non-429 long message: expired tail is truncated' {
+        It 'refresh failure with non-429 long message: reason line is truncated, row label is not widened' {
             New-Slot -Name 'slot-long' -ExpiresAt $script:PastMs | Out-Null
 
-            $longMessage = 'X' * 200
+            $longMessage = 'X' * ($Script:AdvisoryReasonMaxWidth * 2)
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
                 throw [System.Exception]::new($longMessage)
             }
 
             $out = Invoke-UsageAction 6>&1 | Out-String
 
-            # Still classified as 'expired' (no Response.StatusCode = 429).
-            $out | Should -Match '(?m)^\s+slot-long\b.*\bexpired:'
-            # Truncation marker present (the helper appends '...').
-            $out | Should -Match 'expired: X+\.\.\.'
-            # The full 200-char tail must NOT appear verbatim; defense-in-depth
-            # against the original wrapping bug for non-429 long messages.
-            $out | Should -Not -Match ('X' * 100)
+            # Still classified as 'expired' (no Response.StatusCode = 429), and
+            # the message never reaches the Status cell: the cell is the last
+            # column and its width also sizes the aggregate bars.
+            $out | Should -Match '(?m)^\s+slot-long\b.*\bexpired\s*$'
+            # The message lands on the advisory reason line, truncated there
+            # (the helper appends '...').
+            $out | Should -Match "\[Usage\] slot-long: X+\.\.\."
+            # Bounded: the full 400-char message must NOT appear verbatim.
+            $out | Should -Not -Match ('X' * ($Script:AdvisoryReasonMaxWidth + 1))
         }
 
         It '-Json emits is_cached_fallback when cache served the row' {
@@ -387,6 +392,28 @@ Describe 'switch_claude_account' {
             $parsed.'slot-1'.status              | Should -Be 'ok'
             $parsed.'slot-1'.is_cached_fallback  | Should -Be $true
             $parsed.'slot-1'.data.five_hour.utilization | Should -Be 1
+        }
+
+        # A cached row keeps its live-quality 'ok' for every consumer that gates
+        # on status, and still reports what the failed live read said, so a
+        # script can tell a cached reading from a live one and say why.
+        It '-Json reports the failure reason on a cached ok row' {
+            $slotPath = New-Slot -Name 'blip' -ExpiresAt $script:PastMs
+
+            $Script:SlotUsageCache[$slotPath] = @{
+                Data      = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 3.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) }
+                }
+                Timestamp = [DateTime]::UtcNow
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                throw [System.Net.Http.HttpRequestException]::new('No such host is known.')
+            }
+
+            $parsed = Invoke-UsageAction -Json | ConvertFrom-Json
+            $parsed.blip.status             | Should -Be 'ok'
+            $parsed.blip.is_cached_fallback | Should -Be $true
+            $parsed.blip.error              | Should -Match 'No such host'
         }
 
         It '-Json omits is_cached_fallback for fresh live responses' {
@@ -952,9 +979,69 @@ Describe 'switch_claude_account' {
             }
 
             $snap = Get-UsageSnapshot
-            $snap.HasRateLimited   | Should -BeTrue
-            # Stale data was served, so HasCacheFallback is also true.
-            $snap.HasCacheFallback | Should -BeTrue
+            $snap.HasRateLimited | Should -BeTrue
+            # Stale data was served, which the row itself records; the
+            # snapshot carries no parallel flag for it.
+            @($snap.Results)[0].IsCachedFallback | Should -BeTrue
+        }
+
+        # HasRateLimited is the only per-row condition the snapshot summarises,
+        # because Invoke-UsageWatch's early-repoll decision is the only caller
+        # that wants a boolean. Every other consumer needs the affected slot
+        # names and partitions Results itself.
+        It 'Get-UsageSnapshot summarises only HasRateLimited' {
+            New-Slot -Name 'beta' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Threading.Tasks.TaskCanceledException]::new('The request was canceled due to the configured HttpClient.Timeout of 12 seconds elapsing.')
+            }
+
+            $snap = Get-UsageSnapshot
+            @($snap.Results)[0].Status           | Should -Be 'error'
+            @($snap.Results)[0].IsCachedFallback | Should -BeFalse
+            $snap.HasRateLimited                 | Should -BeFalse
+
+            $snap.PSObject.Properties.Name | Should -Not -Contain 'HasError'
+            $snap.PSObject.Properties.Name | Should -Not -Contain 'HasCacheFallback'
+        }
+
+        # Regression guard for the blind spot that hid this for two releases:
+        # Format-UsageTable's 'error <code>' arm reads $Row.HttpStatus, but
+        # Get-UsageSnapshot did not project it, so the arm was unreachable in
+        # every real code path while its unit test passed against a hand-built
+        # row that already carried the field.
+        It 'Get-UsageSnapshot projects HttpStatus onto the row' {
+            New-Slot -Name 'beta' | Out-Null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 529 }
+                $inner = [System.Exception]::new('Response status code does not indicate success: 529.')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            $snap = Get-UsageSnapshot
+            $row  = @($snap.Results)[0]
+            $row.Status     | Should -Be 'error'
+            $row.HttpStatus | Should -Be 529
+
+            # And the label the projection exists to enable actually renders.
+            $out = Format-UsageTable -Results @($row) 6>&1 | Out-String
+            $out | Should -Match 'error 529'
+            $out | Should -Not -Match 'does not indicate success'
+        }
+
+        It 'Get-UsageSnapshot projects FallbackReason onto the row' {
+            $slotPath = New-Slot -Name 'beta'
+            $Script:SlotUsageCache[$slotPath] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 4.0; resets_at = $null } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Threading.Tasks.TaskCanceledException]::new('timeout')
+            }
+
+            $row = @((Get-UsageSnapshot).Results)[0]
+            $row.Status         | Should -Be 'ok'
+            $row.FallbackReason | Should -Be 'network'
         }
 
         It 'Format-UsageFrame prints the footer under the table when -Footer is provided' {
@@ -963,7 +1050,6 @@ Describe 'switch_claude_account' {
                     Data = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 1.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) } }
                     Error = $null; Email = $null })
                 NoSlots          = $false
-                HasCacheFallback = $false
             }
 
             $out = Format-UsageFrame -Snapshot $snap -Footer 'HELLO-FROM-FOOTER' 6>&1 | Out-String
@@ -997,7 +1083,6 @@ Describe 'switch_claude_account' {
                 Results = @([pscustomobject]@{ Name = 'throttled'; IsActive = $true; Status = 'rate-limited';
                     Data = $null; Error = $null; Email = $null; IsCachedFallback = $false })
                 NoSlots          = $false
-                HasCacheFallback = $false
                 HasRateLimited   = $true
             }
 
@@ -1006,7 +1091,7 @@ Describe 'switch_claude_account' {
             # The em-dash data cells stay (no data to show), but the advisory
             # names the throttled slot and states the condition without
             # promising recovery (the renderer is shared with one-shot).
-            $out | Should -Match "'throttled' is currently rate-limited by Anthropic\."
+            $out | Should -Match "'throttled' is currently rate-limited or at a plan limit\."
             # The cached-data wording must NOT fire (no cache here).
             $out | Should -Not -Match 'last known usage'
         }
@@ -1017,13 +1102,12 @@ Describe 'switch_claude_account' {
                     Data = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 5.0; resets_at = $null } }
                     Error = $null; Email = $null; IsCachedFallback = $true })
                 NoSlots          = $false
-                HasCacheFallback = $true
                 HasRateLimited   = $true
             }
 
             $out = Format-UsageFrame -Snapshot $snap 6>&1 | Out-String
 
-            $out | Should -Match "'cached' is currently rate-limited by Anthropic; showing last known usage\."
+            $out | Should -Match "'cached' is currently rate-limited or at a plan limit; showing last known usage\."
         }
 
         It 'Format-UsageFrame renders the advisory in the footer block, leading the [Monitor]/[Watch] lines' {
@@ -1031,7 +1115,6 @@ Describe 'switch_claude_account' {
                 Results = @([pscustomobject]@{ Name = 'throttled'; IsActive = $true; Status = 'rate-limited';
                     Data = $null; Error = $null; Email = $null; IsCachedFallback = $false })
                 NoSlots          = $false
-                HasCacheFallback = $false
                 HasRateLimited   = $true
             }
 
@@ -1134,6 +1217,16 @@ Describe 'switch_claude_account' {
         It 'returns empty string for null / empty input (no exception)' {
             Format-StatusErrorTail $null | Should -Be ''
             Format-StatusErrorTail ''    | Should -Be ''
+        }
+
+        It 'defaults -Max to the full-line width, not the mid-sentence width' {
+            # Renderers that own a whole line call this without -Max; only
+            # Invoke-SaveAction's parenthesised reason narrows it.
+            $msg = 'B' * ($Script:AdvisoryReasonMaxWidth - 1)
+            Format-StatusErrorTail -Message $msg | Should -Be $msg
+
+            $out = Format-StatusErrorTail -Message ('B' * ($Script:AdvisoryReasonMaxWidth + 50))
+            $out.Length | Should -Be ($Script:AdvisoryReasonMaxWidth + 3)
         }
     }
 
@@ -1384,6 +1477,54 @@ Describe 'switch_claude_account' {
             )
             Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 20
         }
+
+        # A cached row can sit on screen long enough for its 5h window to roll.
+        # Select-LiveBuckets drops such a bucket at New-UsageResult, so it
+        # reaches the bars as missing and counts 0, the same as it counts for
+        # rotation and keep-warm. The row is built through New-UsageResult
+        # rather than by hand precisely because that is where the rule runs:
+        # a hand-built row with a rolled bucket is not one production can emit.
+        It 'counts a bucket whose window has already reset as 0' {
+            $past   = [DateTimeOffset]::UtcNow.AddHours(-1)
+            $future = [DateTimeOffset]::UtcNow.AddHours(2)
+            $rolled = New-UsageResult -Status 'error' -CachedReason 'network' -Data ([pscustomobject]@{
+                five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $past.ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                seven_day = $null
+            })
+            $rows = @(
+                [pscustomobject]@{
+                    Name = 'rolled'; IsActive = $false; Status = 'error'; Error = $null; Email = $null
+                    IsCachedFallback = $true
+                    Data = $rolled.Data
+                }
+                [pscustomobject]@{
+                    Name = 'live'; IsActive = $true; Status = 'ok'; Error = $null; Email = $null
+                    IsCachedFallback = $false
+                    Data = [pscustomobject]@{
+                        five_hour = [pscustomobject]@{ utilization = 40.0; resets_at = $future.ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                        seven_day = $null
+                    }
+                }
+            )
+
+            # (0 + 40) / 2 = 20, not (100 + 40) / 2 = 70.
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 20
+        }
+
+        It 'still counts a bucket whose window has not reset yet' {
+            $future = [DateTimeOffset]::UtcNow.AddHours(2)
+            $rows = @(
+                [pscustomobject]@{
+                    Name = 'hot'; IsActive = $true; Status = 'ok'; Error = $null; Email = $null
+                    IsCachedFallback = $false
+                    Data = [pscustomobject]@{
+                        five_hour = [pscustomobject]@{ utilization = 90.0; resets_at = $future.ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                        seven_day = $null
+                    }
+                }
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 90
+        }
     }
 
     Context 'Get-AggregateBarColor' {
@@ -1431,6 +1572,18 @@ Describe 'switch_claude_account' {
                     Email    = $null
                 }
             }
+
+            # 60 chars, enough to push the table past 80 columns on its own.
+            $script:WideName = 'slot-' + ('x' * 55)
+
+            # The column-header line is the width yardstick for the bar-clamp
+            # tests below: its Status field is exactly the 6-char header
+            # literal, so its length equals the $totalLineWidth the bars are
+            # derived from.
+            function Get-HeaderLineLength {
+                Param ([string[]] $Lines)
+                return @($Lines | Where-Object { $_ -match '^\s+Slot\s+Account\s+Session\s+Week\s+Status\s*$' })[0].Length
+            }
         }
 
         It 'renders bar lines between [Usage] header and column header when -IncludeAggregateBars is set' {
@@ -1468,6 +1621,37 @@ Describe 'switch_claude_account' {
             # New literals present; old literals absent in header line.
             $out | Should -Match '(?m)^\s+Slot\s+Account\s+Session\s+Week\s+Status\s*$'
             $out | Should -Not -Match '(?m)^\s+Slot\s+Account\s+5h\s+7d\s+Status\s*$'
+        }
+
+        # The bars fit to the table, and the table is content-sized, so it can
+        # be wider than the terminal. An unclamped bar then wraps, which reads
+        # as a rendering bug rather than as an overflowing table.
+        It 'clamps the bar lines to the terminal width when the table is wider' {
+            Mock Get-ConsoleWidth -MockWith { 80 }
+            $out   = Format-UsageTable -Results @((New-OkRow -Name $script:WideName)) -IncludeAggregateBars 6>&1 | Out-String
+            $lines = @($out -split "`r?`n")
+
+            # Guard: the table really is wider than the terminal here.
+            (Get-HeaderLineLength -Lines $lines) | Should -BeGreaterThan 80
+
+            $barLines = @($lines | Where-Object { $_ -match '^\s+(Session|Week)\s*\[' })
+            $barLines.Count | Should -Be 2
+            foreach ($line in $barLines) { $line.Length | Should -Be 79 }
+
+            # The table itself stays content-sized; only the derived bar width
+            # is clamped.
+            @($lines | Where-Object { $_ -match [regex]::Escape($script:WideName) }).Count | Should -BeGreaterThan 0
+        }
+
+        It 'leaves the fit-to-table bar width alone when the terminal width is unknown' {
+            Mock Get-ConsoleWidth -MockWith { 0 }
+            $out   = Format-UsageTable -Results @((New-OkRow -Name $script:WideName)) -IncludeAggregateBars 6>&1 | Out-String
+            $lines = @($out -split "`r?`n")
+
+            $headerLen = Get-HeaderLineLength -Lines $lines
+            $headerLen | Should -BeGreaterThan 80
+            $barLines  = @($lines | Where-Object { $_ -match '^\s+(Session|Week)\s*\[' })
+            foreach ($line in $barLines) { $line.Length | Should -Be $headerLen }
         }
     }
 
@@ -1779,9 +1963,11 @@ Describe 'switch_claude_account' {
             }
             $out = Format-UsageVerbose -Result $row 6>&1 | Out-String
             $out | Should -Match "Slot 'dead'"
-            # The fallback render uses Format-UsageTable, which renders
-            # the "expired:" status text.
-            $out | Should -Match 'expired:'
+            # The fallback render uses Format-UsageTable, which renders the
+            # bare 'expired' label. The reason comes from Format-UsageAdvisory,
+            # which Format-UsageFrame (not this function) renders.
+            $out | Should -Match '(?m)^\s+dead\b.*\bexpired\s*$'
+            $out | Should -Not -Match 'refresh_token invalid'
             # No Session/Week bucket rows in the fallback path.
             $out | Should -Not -Match '^\s+Session\s'
         }
@@ -1896,6 +2082,54 @@ Describe 'switch_claude_account' {
             $r.Status | Should -Be 'rate-limited'
         }
 
+        # The retry is a second, independent request. Labelling whatever it
+        # returns 'rate-limited' hid the failure class that matters most here:
+        # a 4xx from a drifted endpoint after a Claude Code upgrade came out
+        # wearing the label of the one failure that clears on its own, with no
+        # status and no message for the advisory to print.
+        It '429 then 404-on-retry: Status=error carrying the real code' {
+            $slot = Join-Path $script:CredDirPath '.credentials.retrydrift.json'
+            $payload = @{ claudeAiOauth = @{
+                accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
+            } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            $script:usageCall = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $script:usageCall++
+                $code  = if ($script:usageCall -eq 1) { 429 } else { 404 }
+                $resp  = [pscustomobject]@{ StatusCode = $code }
+                $inner = [System.Exception]::new("HTTP $code from the usage endpoint")
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status     | Should -Be 'error'
+            $r.HttpStatus | Should -Be 404
+            $r.Error      | Should -Match '404'
+        }
+
+        It '429 then 401-on-retry: Status=unauthorized' {
+            $slot = Join-Path $script:CredDirPath '.credentials.retryauth.json'
+            $payload = @{ claudeAiOauth = @{
+                accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
+            } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            $script:usageCall = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $script:usageCall++
+                $code  = if ($script:usageCall -eq 1) { 429 } else { 401 }
+                $resp  = [pscustomobject]@{ StatusCode = $code }
+                $inner = [System.Exception]::new("HTTP $code")
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            (Get-SlotUsage -SlotPath $slot).Status | Should -Be 'unauthorized'
+        }
+
         It '429 with a STALE cache entry: Status=rate-limited; last-known data kept; no retry sleep' {
             $slot = Join-Path $script:CredDirPath '.credentials.staleC.json'
             $payload = @{ claudeAiOauth = @{
@@ -1925,6 +2159,241 @@ Describe 'switch_claude_account' {
             $r.Data.five_hour.utilization | Should -Be 1
             # No 5s retry sleep because the slot was already seen.
             Should -Invoke Start-Sleep -Times 0 -Exactly
+        }
+    }
+
+    Context 'Get-SlotUsage (network / timeout resilience)' {
+        # A codeless transport failure (the HttpClient.Timeout case)
+        # used to return Status='error' immediately, discarding a perfectly
+        # good cached reading and wiping the row's numbers for a whole poll
+        # interval. It now runs the same fallback ladder as the 429 arm.
+        BeforeEach {
+            $script:CredDirPath = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
+            $script:FutureMs = [DateTimeOffset]::UtcNow.AddHours(6).ToUnixTimeMilliseconds()
+            Mock Start-Sleep -MockWith { }
+
+            function New-TimeoutSlot {
+                Param ([string] $Name)
+                $slot = Join-Path $script:CredDirPath ".credentials.$Name.json"
+                $payload = @{ claudeAiOauth = @{
+                    accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
+                } } | ConvertTo-Json -Compress
+                Set-Content -LiteralPath $slot -Value $payload -NoNewline
+                return $slot
+            }
+
+            # The real message PS7 raises for -TimeoutSec: a TaskCanceledException
+            # carrying NO .Response, which is what made $status $null and sent the
+            # row down the generic arm.
+            $script:TimeoutMessage = 'The request was canceled due to the configured HttpClient.Timeout of 12 seconds elapsing.'
+
+            # A coded failure carrying a .Response, for the arms that branch on
+            # the status rather than on the exception type.
+            function New-CodedWebException {
+                Param ([int] $StatusCode)
+                $resp = [pscustomobject]@{ StatusCode = $StatusCode }
+                $ex   = [System.Exception]::new("Response status code does not indicate success: $StatusCode.")
+                $ex | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                return $ex
+            }
+        }
+
+        It 'serves a FRESH cache as ok, tagged as a network fallback' {
+            $slot = New-TimeoutSlot 'netfresh'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 22.0; resets_at = $null } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Threading.Tasks.TaskCanceledException]::new($script:TimeoutMessage)
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status                     | Should -Be 'ok'
+            $r.IsCachedFallback           | Should -BeTrue
+            $r.FallbackReason             | Should -Be 'network'
+            $r.Data.five_hour.utilization | Should -Be 22.0
+        }
+
+        It 'serves a STALE cache as error but keeps the numbers and the message' {
+            $slot = New-TimeoutSlot 'netstale'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 49.0; resets_at = $null } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Threading.Tasks.TaskCanceledException]::new($script:TimeoutMessage)
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status                     | Should -Be 'error'
+            $r.IsCachedFallback           | Should -BeTrue
+            $r.FallbackReason             | Should -Be 'network'
+            $r.Data.five_hour.utilization | Should -Be 49.0
+            $r.Error                      | Should -Match 'HttpClient.Timeout'
+        }
+
+        It 'retries once with NO sleep when nothing is cached, and succeeds' {
+            $slot = New-TimeoutSlot 'netretry'
+            $script:usageCall = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $script:usageCall++
+                if ($script:usageCall -eq 1) { throw (New-CodedWebException -StatusCode 529) }
+                return [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 7.0; resets_at = $null } }
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status                     | Should -Be 'ok'
+            $r.Data.five_hour.utilization | Should -Be 7.0
+            $script:usageCall             | Should -Be 2
+            # The first attempt already waited; an extra sleep would only
+            # freeze the frame.
+            Should -Invoke Start-Sleep -Times 0 -Exactly
+        }
+
+        It 'caches the successful retry so the next failure can fall back' {
+            $slot = New-TimeoutSlot 'netretrycache'
+            $script:usageCall = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $script:usageCall++
+                if ($script:usageCall -eq 1) { throw (New-CodedWebException -StatusCode 529) }
+                return [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 8.0; resets_at = $null } }
+            }
+
+            Get-SlotUsage -SlotPath $slot | Out-Null
+            $Script:SlotUsageCache.ContainsKey($slot)          | Should -BeTrue
+            $Script:SlotUsageCache[$slot].Data.five_hour.utilization | Should -Be 8.0
+        }
+
+        It 'returns error with the message when the retry also fails and nothing is cached' {
+            $slot = New-TimeoutSlot 'netdead'
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Net.Http.HttpRequestException]::new('No such host is known.')
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status     | Should -Be 'error'
+            $r.Error      | Should -Match 'No such host'
+            $r.HttpStatus | Should -BeNullOrEmpty
+            $r.Data       | Should -BeNullOrEmpty
+            Should -Invoke Invoke-RestMethod -Times 2 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
+        }
+
+        # Get-UsageSnapshot walks slots serially and nothing is cached on the
+        # first poll of a watch, so this arm sets that poll's wall clock. A
+        # timeout has already burned the full UsageTimeoutSec, making it both
+        # the most expensive class to repeat and the least likely to differ:
+        # retrying it doubled every slot's contribution to the first frame.
+        It 'does NOT retry a timeout, and still reports it' {
+            $slot = New-TimeoutSlot 'noretrytimeout'
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Threading.Tasks.TaskCanceledException]::new($script:TimeoutMessage)
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status     | Should -Be 'error'
+            $r.Error      | Should -Match 'HttpClient.Timeout'
+            $r.HttpStatus | Should -BeNullOrEmpty
+            $r.Data       | Should -BeNullOrEmpty
+            Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
+        }
+
+        # 401 / 403 / 429 have their own arms; any other 4xx describes the
+        # request, so the server rejects it identically the second time.
+        It 'does NOT retry a non-retriable 4xx, and still reports its code' {
+            $slot = New-TimeoutSlot 'noretry404'
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw (New-CodedWebException -StatusCode 404)
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status     | Should -Be 'error'
+            $r.HttpStatus | Should -Be 404
+            $r.Error      | Should -Match '404'
+            Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
+        }
+
+        # The failure AGENTS.md names as the one thing only a live `sca usage`
+        # can catch: the endpoint drifts after a Claude Code upgrade and starts
+        # answering 4xx. Served from cache it renders as 'ok' with
+        # fresh-looking numbers for the whole TTL, under -Watch and monitor
+        # alike, which is exactly the report that would not reach the user.
+        It 'does NOT serve a fresh cache after a non-retriable 4xx' {
+            $slot = New-TimeoutSlot 'drift404'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 21.0; resets_at = $null } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw (New-CodedWebException -StatusCode 404)
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+
+            $r.Status           | Should -Be 'error'
+            $r.HttpStatus       | Should -Be 404
+            $r.IsCachedFallback | Should -BeFalse
+            $r.Data             | Should -BeNullOrEmpty
+        }
+
+        # The other side of the same gate: a 5xx says nothing about the request,
+        # so the cached reading is still the best answer available.
+        It 'still serves a fresh cache after a 5xx' {
+            $slot = New-TimeoutSlot 'overloaded529'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 21.0; resets_at = $null } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw (New-CodedWebException -StatusCode 529)
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+
+            $r.Status                     | Should -Be 'ok'
+            $r.IsCachedFallback           | Should -BeTrue
+            $r.Data.five_hour.utilization | Should -Be 21.0
+            # The reason survives onto the fresh row so the advisory can say
+            # why the numbers are not live.
+            $r.Error                      | Should -Match '529'
+            $r.HttpStatus                 | Should -Be 529
+        }
+
+        # A timeout is not a throttle. Stamping RateLimitedUntil would make the
+        # next poll short-circuit to 'rate-limited' for RateLimitBackoffSec and
+        # stop probing live for a fault that may already be gone.
+        It 'does NOT stamp a rate-limit backoff' {
+            $slot = New-TimeoutSlot 'nobackoff'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 10.0; resets_at = $null } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw [System.Threading.Tasks.TaskCanceledException]::new($script:TimeoutMessage)
+            }
+
+            Get-SlotUsage -SlotPath $slot | Out-Null
+            $Script:SlotUsageCache[$slot].RateLimitedUntil | Should -BeNullOrEmpty
+        }
+
+        It 'carries HttpStatus through the stale fallback for a coded 5xx' {
+            $slot = New-TimeoutSlot 'net529'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 33.0; resets_at = $null } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $resp  = [pscustomobject]@{ StatusCode = 529 }
+                $inner = [System.Exception]::new('Response status code does not indicate success: 529.')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status     | Should -Be 'error'
+            $r.HttpStatus | Should -Be 529
+            $r.Data.five_hour.utilization | Should -Be 33.0
         }
     }
 
@@ -2057,10 +2526,10 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Format-UsageTable (error-status label)' {
-        # The 'error' arm prefers a short 'error <code>' label when the row
-        # carries a numeric HttpStatus so a verbose .NET exception cannot
-        # widen the Status column and wrap the row; it falls back to the
-        # truncated message tail for codeless network errors.
+        # The 'error' arm appends the numeric HttpStatus when the row carries
+        # one and renders the bare label otherwise. No arm renders the
+        # exception message: the Status cell is the last column and its width
+        # also sizes the aggregate bars, so one long cell wraps both.
         It 'renders "error <code>" when the row carries an HttpStatus' {
             $row = [pscustomobject]@{
                 Name       = 'slot-1'
@@ -2077,7 +2546,7 @@ Describe 'switch_claude_account' {
             $out | Should -Not -Match 'does not indicate success'
         }
 
-        It 'falls back to "error: <tail>" when the row has no HttpStatus' {
+        It 'falls back to the bare "error" label when the row has no HttpStatus' {
             $row = [pscustomobject]@{
                 Name     = 'slot-1'
                 IsActive = $false
@@ -2087,7 +2556,29 @@ Describe 'switch_claude_account' {
                 Email    = $null
             }
             $out = Format-UsageTable -Results @($row) 6>&1 | Out-String
-            $out | Should -Match 'error: The operation has timed out\.'
+            $out | Should -Match '(?m)^\s+slot-1\b.*\berror\s*$'
+            $out | Should -Not -Match 'timed out'
+        }
+
+        # Every hard-failure label is a short fixed string. The parenthetical
+        # remedies these used to carry ('no-oauth (api key or non-claude.ai
+        # slot)' and friends) moved to Format-UsageAdvisory's reason lines.
+        It 'renders hard-failure statuses as bare labels' -ForEach @(
+            @{ Status = 'no-oauth';     Hint = 'api key' }
+            @{ Status = 'expired';      Hint = 'sca switch' }
+            @{ Status = 'unauthorized'; Hint = 'revoked'    }
+        ) {
+            $row = [pscustomobject]@{
+                Name     = 'slot-1'
+                IsActive = $false
+                Status   = $Status
+                Data     = $null
+                Error    = $null
+                Email    = $null
+            }
+            $out = Format-UsageTable -Results @($row) 6>&1 | Out-String
+            $out | Should -Match "(?m)^\s+slot-1\b.*\b$([regex]::Escape($Status))\s*`$"
+            $out | Should -Not -Match ([regex]::Escape($Hint))
         }
     }
 
@@ -2140,8 +2631,322 @@ Describe 'switch_claude_account' {
             $r.Data.five_hour.utilization | Should -Be 88
         }
 
+        # -AllowStale exists so a row survives a BRIEF outage with its numbers
+        # intact. Without a ceiling that argument kept applying at any age, and
+        # the cost was not cosmetic: Get-AutoRotationDecision only reports
+        # 'active-unknown' for an active row with NO Data, so an unbounded
+        # entry left a permanently unreadable active slot being judged on a
+        # days-old reading while the monitor reported itself armed.
+        It '-AllowStale refuses an entry past UsageCacheMaxAgeMin' {
+            $slot = 'D:/ancient/path.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 88.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheMaxAgeMin + 1))
+            }
+            (Get-CachedUsageOrNull -SlotPath $slot -AllowStale) | Should -BeNullOrEmpty
+        }
+
+        It '-AllowStale still serves an entry just inside the ceiling' {
+            $slot = 'D:/elderly/path.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 88.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheMaxAgeMin - 1))
+            }
+            (Get-CachedUsageOrNull -SlotPath $slot -AllowStale).Data.five_hour.utilization | Should -Be 88
+        }
+
+        It 'an ancient entry leaves the active row reporting active-unknown' {
+            # The end-to-end consequence of the ceiling: with no Data the
+            # rotation engine says so instead of judging on an obsolete number.
+            $row = [pscustomobject]@{ Name = 'a'; IsActive = $true; Status = 'error'; Data = $null }
+            $decision = Get-AutoRotationDecision -Threshold 95 `
+                -Snapshot ([pscustomobject]@{ Results = @($row); NoSlots = $false })
+            $decision.Action       | Should -Be 'active-unknown'
+            $decision.ActiveStatus | Should -Be 'error'
+        }
+
         It '-AllowStale still returns $null on a true cache miss' {
             (Get-CachedUsageOrNull -SlotPath 'missing/path.json' -AllowStale) | Should -BeNullOrEmpty
+        }
+
+        It 'stamps FallbackReason on a fresh hit, defaulting to rate-limit' {
+            $slot = 'reason/fresh.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 5.0 } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            (Get-CachedUsageOrNull -SlotPath $slot).FallbackReason                    | Should -Be 'rate-limit'
+            (Get-CachedUsageOrNull -SlotPath $slot -Reason 'network').FallbackReason   | Should -Be 'network'
+            # Freshness beats reason: a recent reading is served as live-quality.
+            (Get-CachedUsageOrNull -SlotPath $slot -Reason 'network').Status           | Should -Be 'ok'
+        }
+
+        It '-Reason picks the stale status label' {
+            $slot = 'reason/stale.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 5.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            (Get-CachedUsageOrNull -SlotPath $slot -AllowStale).Status                     | Should -Be 'rate-limited'
+            (Get-CachedUsageOrNull -SlotPath $slot -AllowStale -Reason 'network').Status   | Should -Be 'error'
+        }
+
+        It 'stamps ErrorMessage / HttpStatus on both the stale and the fresh result' {
+            $slot = 'reason/stamp.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 5.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            $r = Get-CachedUsageOrNull -SlotPath $slot -AllowStale -Reason 'network' -ErrorMessage 'boom' -HttpStatus 503
+            $r.Error      | Should -Be 'boom'
+            $r.HttpStatus | Should -Be 503
+
+            # A fresh row keeps its live-quality 'ok', but the reason the live
+            # read failed survives: without it, the commonest transient failure
+            # of all (a cache under the TTL) produced "showing last known
+            # usage" with nothing anywhere saying why.
+            $Script:SlotUsageCache[$slot].Timestamp = [DateTime]::UtcNow
+            $fresh = Get-CachedUsageOrNull -SlotPath $slot -Reason 'network' -ErrorMessage 'boom' -HttpStatus 503
+            $fresh.Status     | Should -Be 'ok'
+            $fresh.Error      | Should -Be 'boom'
+            $fresh.HttpStatus | Should -Be 503
+        }
+
+        It 'rejects an unknown -Reason at bind time' {
+            { Get-CachedUsageOrNull -SlotPath 'x' -Reason 'nonsense' } | Should -Throw
+        }
+    }
+
+    Context 'Resolve-UsageFailureFallback' {
+        # The shared ladder both catch arms of Get-SlotUsage run before
+        # deciding whether to retry.
+        It 'returns $null when nothing is cached, so the caller retries' {
+            Resolve-UsageFailureFallback -SlotPath 'ladder/miss.json' -Reason 'network' |
+                Should -BeNullOrEmpty
+        }
+
+        It 'prefers a fresh entry over the stale path' {
+            $slot = 'ladder/fresh.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 12.0 } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            $r = Resolve-UsageFailureFallback -SlotPath $slot -Reason 'network' -ErrorMessage 'boom'
+            $r.Status | Should -Be 'ok'
+            # 'ok' for every consumer that gates on Status, but the reason
+            # rides along for the advisory and the -Json row.
+            $r.Error  | Should -Be 'boom'
+        }
+
+        It 'falls through to the stale entry, carrying the reason and message' {
+            $slot = 'ladder/stale.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 12.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            }
+            $r = Resolve-UsageFailureFallback -SlotPath $slot -Reason 'network' -ErrorMessage 'boom' -HttpStatus 500
+            $r.Status                     | Should -Be 'error'
+            $r.FallbackReason             | Should -Be 'network'
+            $r.Error                      | Should -Be 'boom'
+            $r.HttpStatus                 | Should -Be 500
+            $r.Data.five_hour.utilization | Should -Be 12.0
+        }
+    }
+
+    Context 'Test-IsRetriableUsageFailure' {
+        # The retry doubles a slot's contribution to a poll's wall clock and
+        # Get-UsageSnapshot walks slots serially, so each failure class has to
+        # earn the second attempt.
+
+        It 'refuses a timeout by exception type, not by message text' {
+            # -TimeoutSec surfaces as TaskCanceledException : OperationCanceledException.
+            # Type-based so the check survives a localized message.
+            $ex = [System.Threading.Tasks.TaskCanceledException]::new('any wording at all')
+            Test-IsRetriableUsageFailure -Exception $ex -HttpStatus $null | Should -BeFalse
+            # A timeout still has no status even when one is somehow present.
+            Test-IsRetriableUsageFailure -Exception $ex -HttpStatus 503   | Should -BeFalse
+        }
+
+        It 'accepts a codeless transport failure' {
+            # DNS / socket errors fail fast, so a second attempt is cheap and
+            # does clear transient blips.
+            $ex = [System.Net.Http.HttpRequestException]::new('No such host is known.')
+            Test-IsRetriableUsageFailure -Exception $ex -HttpStatus $null | Should -BeTrue
+        }
+
+        It 'accepts a 5xx: <Case>' -ForEach @(
+            @{ Case = '500'; Status = 500 }
+            @{ Case = '529 Overloaded'; Status = 529 }
+            @{ Case = '503'; Status = 503 }
+        ) {
+            $ex = [System.Exception]::new('server side')
+            Test-IsRetriableUsageFailure -Exception $ex -HttpStatus $Status | Should -BeTrue
+        }
+
+        It 'refuses a 4xx the server will reject identically: <Case>' -ForEach @(
+            @{ Case = '400'; Status = 400 }
+            @{ Case = '404'; Status = 404 }
+            @{ Case = '422'; Status = 422 }
+        ) {
+            $ex = [System.Exception]::new('request side')
+            Test-IsRetriableUsageFailure -Exception $ex -HttpStatus $Status | Should -BeFalse
+        }
+    }
+
+    Context 'Test-IsTransportFailure' {
+        # Shared by the usage-endpoint retry gate and the token-endpoint cache
+        # gate, so "the server rejected this request" has one definition.
+        It 'treats a codeless HTTP failure as transport' {
+            $ex = [System.Net.Http.HttpRequestException]::new('No such host is known.')
+            Test-IsTransportFailure -HttpStatus $null -Exception $ex | Should -BeTrue
+        }
+
+        It 'treats a timeout cancellation as transport' {
+            $ex = [System.Threading.Tasks.TaskCanceledException]::new('timeout')
+            Test-IsTransportFailure -HttpStatus $null -Exception $ex | Should -BeTrue
+        }
+
+        # The missing status is what made this necessary: Update-SlotTokens
+        # throws plain PowerShell errors for a refresh response missing
+        # access_token / expires_in and for a failed credential write, and none
+        # of them carry one. Read as transport, those served a dead slot from
+        # cache under a healthy 'ok'; the write failure is the worst of the
+        # three, because the server has already rotated the refresh token away.
+        It 'treats a non-HTTP exception with no status as a hard failure' {
+            $ex = [System.Management.Automation.RuntimeException]::new('OAuth refresh succeeded but response missing access_token.')
+            Test-IsTransportFailure -HttpStatus $null -Exception $ex | Should -BeFalse
+        }
+
+        It 'treats an IO failure with no status as a hard failure' {
+            $ex = [System.IO.IOException]::new('The process cannot access the file.')
+            Test-IsTransportFailure -HttpStatus $null -Exception $ex | Should -BeFalse
+        }
+
+        It 'treats a 5xx as transport whatever the exception type: <Case>' -ForEach @(
+            @{ Case = '500'; Status = 500 }
+            @{ Case = '529'; Status = 529 }
+        ) {
+            $ex = [System.Exception]::new('server side')
+            Test-IsTransportFailure -HttpStatus $Status -Exception $ex | Should -BeTrue
+        }
+
+        It 'treats a 4xx as a rejection, not transport: <Case>' -ForEach @(
+            @{ Case = '400'; Status = 400 }
+            @{ Case = '401'; Status = 401 }
+            @{ Case = '429'; Status = 429 }
+        ) {
+            $ex = [System.Net.Http.HttpRequestException]::new('request side')
+            Test-IsTransportFailure -HttpStatus $Status -Exception $ex | Should -BeFalse
+        }
+    }
+
+    Context 'Get-SlotUsage token-refresh failure fallback' {
+        # The token POST carries the largest budget of the three calls
+        # ($Script:TokenTimeoutSec), so a transport blip is likeliest to land
+        # there. Without the cache ladder one slow hourly refresh wiped the row
+        # to em-dashes, printed the 'run sca switch' remedy for something
+        # sca switch cannot fix, and turned the monitor's active row into
+        # 'active-unknown', pausing rotation.
+
+        BeforeEach {
+            $script:TokSlot = Join-Path $script:SandboxHome '.claude/.credentials.tok(t@x.io).json'
+            New-Item -ItemType Directory -Path (Split-Path -Parent $script:TokSlot) -Force | Out-Null
+
+            # An already-expired access token forces the refresh path.
+            $expired = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+            Set-Content -LiteralPath $script:TokSlot -NoNewline -Encoding utf8NoBOM -Value (
+                [pscustomobject]@{
+                    claudeAiOauth = [pscustomobject]@{
+                        accessToken = 'stale'; refreshToken = 'r'; expiresAt = $expired
+                    }
+                } | ConvertTo-Json -Depth 5)
+
+            $Script:SlotUsageCache[$script:TokSlot] = @{
+                Data      = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 42.0; resets_at = $null }
+                    seven_day = [pscustomobject]@{ utilization = 7.0;  resets_at = $null }
+                }
+                Timestamp = [DateTime]::UtcNow
+            }
+        }
+
+        It 'serves cached percentages when the refresh dies in transport' {
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                throw [System.Net.Http.HttpRequestException]::new('No such host is known.')
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:TokSlot 6>$null
+
+            $r.Status                     | Should -Be 'ok'
+            $r.IsCachedFallback           | Should -BeTrue
+            $r.Data.five_hour.utilization | Should -Be 42.0
+        }
+
+        It 'keeps the last-known percentages on a stale entry, labelled non-ok' {
+            $Script:SlotUsageCache[$script:TokSlot].Timestamp =
+                [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                throw [System.Net.Http.HttpRequestException]::new('connection reset')
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:TokSlot 6>$null
+
+            $r.Status                     | Should -Be 'error'
+            $r.FallbackReason             | Should -Be 'network'
+            $r.Data.five_hour.utilization | Should -Be 42.0
+        }
+
+        It 'still reports expired when the grant itself is rejected' {
+            # invalid_grant means the refresh token is dead for good. Serving a
+            # fresh cache as 'ok' would hide a slot that needs re-authentication.
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $resp = [pscustomobject]@{ StatusCode = 400 }
+                $ex   = [System.Exception]::new('invalid_grant')
+                $ex | Add-Member -NotePropertyName Response -NotePropertyValue $resp -PassThru | Out-Null
+                throw $ex
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:TokSlot 6>$null
+
+            $r.Status           | Should -Be 'expired'
+            $r.IsCachedFallback | Should -BeFalse
+            $r.Data             | Should -BeNullOrEmpty
+        }
+
+        # Update-SlotTokens also throws for a refresh response it cannot use and
+        # for a slot-file write that fails after the server rotated the token.
+        # Neither carries an HTTP status, and both used to be read as a
+        # transport blip and served from a fresh cache as a healthy 'ok'.
+        It 'reports expired when the refresh response is unusable: <Case>' -ForEach @(
+            @{ Case = 'no access_token'; Body = @{ expires_in = 3600 } }
+            @{ Case = 'no expires_in';   Body = @{ access_token = 'AT' } }
+        ) {
+            $payload = $Body
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]$payload
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:TokSlot 6>$null
+
+            $r.Status           | Should -Be 'expired'
+            $r.IsCachedFallback | Should -BeFalse
+            $r.Data             | Should -BeNullOrEmpty
+        }
+
+        It 'reports expired when the rotated tokens cannot be written back to the slot' {
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]@{ access_token = 'AT'; refresh_token = 'RT'; expires_in = 3600 }
+            }
+            Mock Set-CredentialFileAtomic -MockWith { throw 'disk full' }
+
+            $r = Get-SlotUsage -SlotPath $script:TokSlot 6>$null
+
+            # The refresh token the server rotated to is gone, so this slot is
+            # dead until the user re-authenticates. Reporting 'ok' off the cache
+            # would also keep it a valid auto-rotation destination.
+            $r.Status           | Should -Be 'expired'
+            $r.IsCachedFallback | Should -BeFalse
+            $r.Data             | Should -BeNullOrEmpty
         }
     }
 
@@ -2844,33 +3649,35 @@ Describe 'switch_claude_account' {
 
     Context 'Test-WarmEligible' {
         # Pure predicate behind Invoke-KeepWarmStep's cold-slot selection.
+        # -Threshold 95 matches `sca monitor`'s default; the rows below sit
+        # well under it unless a test says otherwise.
         BeforeEach { $script:Now = [DateTimeOffset]::UtcNow }
 
         It 'rate-limited is eligible regardless of data (recovery path)' {
             $row = [pscustomobject]@{ Status = 'rate-limited'; Data = $null }
-            Test-WarmEligible -Row $row -Now $script:Now | Should -BeTrue
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeTrue
         }
 
         It 'ok with a FUTURE five_hour reset is not eligible (window open)' {
             $row = [pscustomobject]@{ Status = 'ok'; Data = [pscustomobject]@{
                 five_hour = [pscustomobject]@{ resets_at = $script:Now.AddHours(2).ToString('o', [Globalization.CultureInfo]::InvariantCulture) } } }
-            Test-WarmEligible -Row $row -Now $script:Now | Should -BeFalse
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeFalse
         }
 
         It 'ok with a PAST five_hour reset is eligible (window closed)' {
             $row = [pscustomobject]@{ Status = 'ok'; Data = [pscustomobject]@{
                 five_hour = [pscustomobject]@{ resets_at = $script:Now.AddMinutes(-5).ToString('o', [Globalization.CultureInfo]::InvariantCulture) } } }
-            Test-WarmEligible -Row $row -Now $script:Now | Should -BeTrue
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeTrue
         }
 
         It 'ok with a null five_hour reset is eligible' {
             $row = [pscustomobject]@{ Status = 'ok'; Data = [pscustomobject]@{ five_hour = [pscustomobject]@{ resets_at = $null } } }
-            Test-WarmEligible -Row $row -Now $script:Now | Should -BeTrue
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeTrue
         }
 
         It 'ok with no Data is eligible' {
             $row = [pscustomobject]@{ Status = 'ok'; Data = $null }
-            Test-WarmEligible -Row $row -Now $script:Now | Should -BeTrue
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeTrue
         }
 
         It 'hard-fail statuses are not eligible' -TestCases @(
@@ -2878,7 +3685,44 @@ Describe 'switch_claude_account' {
         ) {
             Param ($S)
             $row = [pscustomobject]@{ Status = $S; Data = $null }
-            Test-WarmEligible -Row $row -Now $script:Now | Should -BeFalse
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeFalse
+        }
+
+        # Warming opens the 5h window, so a slot whose window is already
+        # open and full has nothing to gain from a billable `claude -p`. The
+        # at-limit check runs first so it also gates the rate-limited branch,
+        # which is where an exhausted slot usually surfaces.
+        It 'a rate-limited slot at or above threshold is NOT eligible' {
+            $row = [pscustomobject]@{ Status = 'rate-limited'; Data = [pscustomobject]@{
+                five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $script:Now.AddMinutes(12).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                seven_day = $null } }
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeFalse
+        }
+
+        It 'an ok slot with a closed 5h window but an exhausted 7d cap is NOT eligible' {
+            $row = [pscustomobject]@{ Status = 'ok'; Data = [pscustomobject]@{
+                five_hour = [pscustomobject]@{ utilization = 0.0;  resets_at = $null }
+                seven_day = [pscustomobject]@{ utilization = 98.0; resets_at = $script:Now.AddDays(3).ToString('o', [Globalization.CultureInfo]::InvariantCulture) } } }
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeFalse
+        }
+
+        # Built through New-UsageResult so the row is what production emits:
+        # Select-LiveBuckets has already dropped the rolled 5h bucket, which is
+        # what takes the slot back under the at-limit gate.
+        It 'a rate-limited slot becomes eligible again once its window has reset' {
+            $result = New-UsageResult -Status 'rate-limited' -CachedReason 'rate-limit' -Now $script:Now -Data ([pscustomobject]@{
+                five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $script:Now.AddMinutes(-5).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                seven_day = $null })
+            $row = [pscustomobject]@{ Status = 'rate-limited'; Data = $result.Data }
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeTrue
+        }
+
+        It 'honours a lowered threshold' {
+            $row = [pscustomobject]@{ Status = 'rate-limited'; Data = [pscustomobject]@{
+                five_hour = [pscustomobject]@{ utilization = 60.0; resets_at = $script:Now.AddMinutes(12).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                seven_day = $null } }
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeTrue
+            Test-WarmEligible -Row $row -Now $script:Now -Threshold 50 | Should -BeFalse
         }
     }
 
@@ -2919,7 +3763,6 @@ Describe 'switch_claude_account' {
                 return [pscustomobject]@{
                     Results          = @($Rows)
                     NoSlots          = (@($Rows).Count -eq 0)
-                    HasCacheFallback = $false
                 }
             }
 
@@ -2935,21 +3778,21 @@ Describe 'switch_claude_account' {
 
         It 'returns the current latch and does NOT warm when every window is open' {
             $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $script:Future) )
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
 
             $out | Should -Be '[Warmup] Keeping all slots warm.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
 
         It 'returns the current latch when the snapshot has no slots' {
-            $out = Invoke-KeepWarmStep -Snapshot (New-KwSnapshot @()) -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out = Invoke-KeepWarmStep -Snapshot (New-KwSnapshot @()) -WarmupTimes @{} -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
             $out | Should -Be '[Warmup] Keeping all slots warm.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
 
         It 'returns the current latch when Results is empty but NoSlots is false' {
-            $snap = [pscustomobject]@{ Results = @(); NoSlots = $false; HasCacheFallback = $false }
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $snap = [pscustomobject]@{ Results = @(); NoSlots = $false }
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
             $out | Should -Be '[Warmup] Keeping all slots warm.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
@@ -2958,7 +3801,7 @@ Describe 'switch_claude_account' {
             $times = @{}
             $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
 
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
 
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter { @($Names) -contains 'a' -and @($Names).Count -eq 1 }
             $out | Should -Match "^\[Warmup\] Re-warmed 'a' at \d{2}:\d{2}:\d{2}$"
@@ -2967,20 +3810,20 @@ Describe 'switch_claude_account' {
 
         It 're-warms a slot whose five_hour.resets_at is in the past' {
             $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $script:Past) )
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x'
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
             $out | Should -Match "^\[Warmup\] Re-warmed 'a' at"
         }
 
         It 're-warms an ok row whose Data is null (no plan data)' {
             $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -NoData) )
-            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x' | Out-Null
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x' | Out-Null
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter { @($Names) -contains 'a' }
         }
 
         It 're-warms an ok row whose five_hour bucket is missing' {
             $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -NoFiveBucket) )
-            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x' | Out-Null
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x' | Out-Null
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter { @($Names) -contains 'a' }
         }
 
@@ -2992,7 +3835,7 @@ Describe 'switch_claude_account' {
                 (New-KwRow -Name 'c' -Status 'no-oauth'),
                 (New-KwRow -Name 'd' -Status 'error')
             )
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
             $out | Should -Be '[Warmup] Keeping all slots warm.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
@@ -3002,7 +3845,7 @@ Describe 'switch_claude_account' {
             # restart" state: a real `claude -p` refreshes tokens through
             # Claude Code's own OAuth flow and reopens the 5h window.
             $snap = New-KwSnapshot @( (New-KwRow -Name 'b' -Status 'rate-limited') )
-            $out  = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out  = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter { @($Names) -contains 'b' -and @($Names).Count -eq 1 }
             $out | Should -Match "^\[Warmup\] Re-warmed 'b' at"
         }
@@ -3010,8 +3853,28 @@ Describe 'switch_claude_account' {
         It 'reports a throttled-but-cooling latch when rate-limited slots are all within cooldown' {
             $times = @{ 'b' = [DateTime]::Now }   # just attempted
             $snap  = New-KwSnapshot @( (New-KwRow -Name 'b' -Status 'rate-limited') )
-            $out   = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CooldownMin 5 -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out   = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 -CooldownMin 5 -CurrentLatch '[Warmup] Keeping all slots warm.'
             $out | Should -Be '[Warmup] Rate-limited; will re-warm when cooldown clears.'
+            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+        }
+
+        It 'distinguishes an at-limit throttle from a cooldown, which it cannot clear' {
+            # A throttled slot whose cached numbers are at or above -Threshold
+            # is held off by Test-WarmEligible's at-limit gate, not by the
+            # cooldown: warming re-opens a window that is already full. The
+            # cooldown wording would promise a recovery that never arrives.
+            $row = [pscustomobject]@{
+                Name = 'burned'; Status = 'rate-limited'; IsActive = $false
+                Error = $null;   Email  = 'burned@test.local'
+                Data = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $script:Future }
+                    seven_day = $null
+                }
+            }
+            $out = Invoke-KeepWarmStep -Snapshot (New-KwSnapshot @($row)) -WarmupTimes @{} `
+                                       -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
+
+            $out | Should -Be '[Warmup] Rate-limited at the rotation threshold; will re-warm after the next window reset.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
 
@@ -3019,7 +3882,7 @@ Describe 'switch_claude_account' {
             $times = @{ 'a' = [DateTime]::Now }   # just re-warmed
             $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
 
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CooldownMin 5 -CurrentLatch '[Warmup] Keeping all slots warm.'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 -CooldownMin 5 -CurrentLatch '[Warmup] Keeping all slots warm.'
 
             $out | Should -Be '[Warmup] Keeping all slots warm.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
@@ -3029,7 +3892,7 @@ Describe 'switch_claude_account' {
             $times = @{ 'a' = [DateTime]::Now.AddMinutes(-10) }
             $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
 
-            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CooldownMin 5 -CurrentLatch 'x' | Out-Null
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 -CooldownMin 5 -CurrentLatch 'x' | Out-Null
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
         }
 
@@ -3037,7 +3900,7 @@ Describe 'switch_claude_account' {
             Mock Test-ClaudeRunning { $true }
             $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
 
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x'
 
             $out | Should -Be '[Warmup] Re-warm refused! Claude Code is running.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
@@ -3048,10 +3911,23 @@ Describe 'switch_claude_account' {
             $times = @{}
             $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
 
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -CurrentLatch 'x'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 -CurrentLatch 'x'
 
             $out | Should -Match '^\[Warmup\] Re-warm failed! .*locked slot file'
             $times.ContainsKey('a') | Should -BeTrue
+        }
+
+        # One footer entry, and Format-UsageFooter splits the footer on
+        # newlines to colour each line, so a multi-line exception would fork
+        # this into several unprefixed ones.
+        It 'collapses a multi-line warm-path exception onto one latch line' {
+            Mock Invoke-WarmAllSlots { throw [System.IO.IOException]::new("first line`r`nsecond line") }
+            $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x'
+
+            @($out -split "`r?`n").Count | Should -Be 1
+            $out | Should -Be '[Warmup] Re-warm failed! first line second line'
         }
 
         It 'lists multiple cold slots sorted and quoted, warming only the cold subset' {
@@ -3061,7 +3937,7 @@ Describe 'switch_claude_account' {
                 (New-KwRow -Name 'c' -FiveResetsAt $script:Past)
             )
 
-            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -CurrentLatch 'x'
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x'
 
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly -ParameterFilter {
                 @($Names).Count -eq 2 -and (@($Names) -contains 'b') -and (@($Names) -contains 'c')
@@ -3159,6 +4035,58 @@ Describe 'switch_claude_account' {
             }
 
             (Invoke-SlotActivator -SlotPath $path).Status | Should -Be 'rate-limited'
+        }
+
+        # Claude Code's own plan-limit sentences say neither 'rate limit' nor
+        # '429', so they used to fall into the default arm and surface as a
+        # hard 'error' on a plainly throttled slot.
+        It 'plan-limit text returns Status=rate-limited with the reset time kept: <Case>' -ForEach @(
+            @{ Case = 'session limit'; Message = "You've hit your session limit `u{00B7} resets 6:10pm (Europe/Berlin)" }
+            @{ Case = 'weekly limit';  Message = "You've hit your weekly limit `u{00B7} resets Nov 4 at 9am"            }
+            @{ Case = 'limit reached'; Message = 'Claude usage limit reached. Your limit will reset at 6pm.'             }
+        ) {
+            $path = New-ActivatorSlot -Name 'capped'
+            Mock Invoke-ClaudeActivatorProcess -MockWith {
+                New-ClaudeFailProc -ExitCode 1 -Result $Message
+            }
+
+            $r = Invoke-SlotActivator -SlotPath $path
+            $r.Status | Should -Be 'rate-limited'
+            # Error carries the whole sentence, uncut: Format-UsageAdvisory
+            # renders it as the slot's reason line, and the reset time is the
+            # only part the user can act on.
+            $r.Error  | Should -Be $Message
+        }
+
+        It 'stores the reason raw, leaving the bound to the renderer' {
+            # 3 of the 10 sites that stamp .Error used to truncate and 7 did
+            # not, so a stored bound was never an invariant. Every display path
+            # runs through Format-StatusErrorTail, so the row (and -Json) keeps
+            # the full text.
+            $path = New-ActivatorSlot -Name 'verbose'
+            $long = 'Z' * ($Script:AdvisoryReasonMaxWidth * 3)
+            Mock Invoke-ClaudeActivatorProcess -MockWith {
+                New-ClaudeFailProc -ExitCode 1 -Result $long
+            }
+
+            $r = Invoke-SlotActivator -SlotPath $path
+            $r.Status | Should -Be 'error'
+            $r.Error  | Should -Be $long
+        }
+
+        # A bare 'limit' is not a plan limit. Classifying these as
+        # 'rate-limited' would hide them: a throttled row gets silently
+        # re-probed on the next poll instead of reported to the user.
+        It 'non-plan limit text stays Status=error: <Case>' -ForEach @(
+            @{ Case = 'context window'; Message = 'Prompt is too long: context limit reached for this conversation.' }
+            @{ Case = 'tool output';    Message = 'Tool result exceeds the maximum output limit reached by the tool.' }
+        ) {
+            $path = New-ActivatorSlot -Name 'oversized'
+            Mock Invoke-ClaudeActivatorProcess -MockWith {
+                New-ClaudeFailProc -ExitCode 1 -Result $Message
+            }
+
+            (Invoke-SlotActivator -SlotPath $path).Status | Should -Be 'error'
         }
 
         It 'auth/permission text returns Status=unauthorized' {
@@ -3283,7 +4211,9 @@ Describe 'switch_claude_account' {
     }
 
     AfterAll {
-        $env:USERPROFILE = $script:OriginalUserProfile
-        $global:PROFILE  = $script:OriginalProfile
+        $env:USERPROFILE       = $script:OriginalUserProfile
+        $global:PROFILE        = $script:OriginalProfile
+        $env:HOME              = $script:OriginalHome
+        $env:CLAUDE_CONFIG_DIR = $script:OriginalConfigDir
     }
 }

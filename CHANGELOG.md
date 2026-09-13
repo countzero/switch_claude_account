@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.0] - 2026-09-13
+
+### Changed
+- **BREAKING**: `#Requires -Version` raised from 7.2 to 7.4, the lowest LTS carrying `FileStreamOptions.UnixCreateMode`. 7.2 and 7.3 are past end of life.
+- **BREAKING**: `CLAUDE_CONFIG_DIR` is honoured on every platform, so a session with it set is no longer billing an account `sca` cannot see. Anyone who has it set reads a different directory than before and no longer lists slots left in the default `~/.claude`; one line names both when that happens. No `~` expansion, matching Claude Code; a relative value binds once at startup to the launch directory.
+- `sca install` and `sca uninstall` run on every platform, including one with no resolvable home directory. Neither creates the credentials directory any more.
+- `sca help` prints the paths the invocation actually uses instead of hardcoded `%USERPROFILE%` literals.
+- The `Status` column renders short fixed labels only; why a slot failed prints below the table as `[Usage] <slot>: <reason>`. Status sizes the aggregate bars, so one long cell wrapped its own row and both bars.
+- The usage advisory prints one line per condition instead of letting the cache-fallback line suppress the rest, and distinguishes a failed live read from a limit. It is bounded at eight lines, reserving the ones that name every affected slot, so it cannot push the table out of a watch frame.
+- Per-endpoint HTTP budgets replace the shared 5 s one: 12 s for usage, 15 s for the token refresh. Measured round-trips span 46-2108 ms, so 5 s left no headroom.
+- A failed usage read falls back to the last known percentages instead of blanking the row, but only for a failure that says nothing about the request: a `5xx`, or no status from the HTTP stack itself. Any `4xx`, an unusable refresh response, and a slot-file write that fails after the server rotated the token are reported instead.
+- A cached reading is refused past six hours. Without an upper age bound, a permanently unreadable active slot was judged on days-old numbers while `sca monitor` reported itself armed.
+- A failed usage read retries once only when a second attempt can plausibly differ: a `5xx`, or a codeless transport failure. A timeout has already spent its budget; a `4xx` is rejected identically. The retry's own failure is classified on its merits rather than inheriting the first one's label.
+- Auto-rotation reads cached percentages when a live read fails, so a throttled active slot at 100% rotates instead of freezing. It still refuses to move *into* a slot it could not verify, though a destination may be entered on a reading up to the cache TTL old.
+- A usage bucket whose window has rolled is dropped as the reading is built, so the table cell, the plan status, the bars, the title and the rotation decision cannot disagree about it.
+- `sca monitor -KeepWarm` no longer spends a billable `claude -p` on a slot already at the rotation threshold, and says the window reset is what will release it rather than the cooldown.
+- `sca usage -Json`: a row may carry `data` with `status: "error"` and `error` with `status: "ok"`, `is_cached_fallback` remains the only freshness marker, and a `data` block may omit a bucket whose window has rolled.
+
+### Added
+- Linux and macOS support. `~` resolves via `$env:HOME` off Windows, falling back to the account database when unset; slot enumeration sees dotfiles; `sca install` writes the platform's own line ending. Claude Code keeps the same plaintext `.credentials.json` on all three, the macOS Keychain holding only a device key.
+- A test workflow running the suite on `windows-latest`, `ubuntu-latest` and `macos-latest`. Coverage and its 90% gate run on Windows only, because the gate counts one run.
+- A `workflow_dispatch` step that re-checks Claude Code's credential backends against the darwin build and fails if the plaintext backend disappears.
+
+### Fixed
+- Credential files are no longer written world-readable on Linux and macOS. The atomic rename handed the destination the temp file's mode, so a `0022` umask downgraded Claude Code's `0600` to `0644` and left live refresh tokens readable by every user on the machine. The temp file is now `0600` from `open(2)` itself.
+- Credential files left readable by other users are tightened to `0600` on the first run of any action, and the count is reported. Covers only the files `sca` creates: `~/.claude.json` is Claude Code's and symlinks are skipped, since `chmod` would follow them.
+- A credentials directory `sca` creates is `0700`, because slot filenames carry account email addresses. One that already exists keeps its mode, so where Claude Code ran first the exposure stays open and `chmod 700 ~/.claude` is the user's to run.
+- A credential write that fails mid-stream no longer leaves a partial temp file behind.
+- `sca` no longer aborts with a parameter-binder error when neither the home variable nor `CLAUDE_CONFIG_DIR` is set, which is reachable in a container or systemd unit. `sca help` and `sca -Version` work there; every other action refuses with a message naming both variables.
+- `sca` resolves the home directory from the account database when `$env:HOME` / `%USERPROFILE%` is unset, matching what `claude` itself does rather than refusing where it works.
+- `sca save` / `switch` / `monitor` detect an npm-installed Claude Code on Linux, which runs as `node` and so slipped past a guard matching only a process named `claude`. Still undetected on Windows, where reading command lines costs ~53 s, and on macOS, where PowerShell does not expose them.
+- `sca monitor -KeepWarm` no longer reports a slot at its Claude.ai session or weekly limit as a hard `error`. Claude Code phrases those as "You've hit your session limit", which says neither "rate limit" nor "429".
+- `sca monitor` no longer goes silently inert when the active slot cannot be read: it reports `[Monitor] Active slot usage unknown (<status>); rotation paused.` and clears that only on a poll that actually judged the slot.
+- Whether `CLAUDE_CONFIG_DIR` already points at the default directory is decided as a path question, not a string one. A trailing separator, a different separator style, or a session parked on `Env:\` each produced a permanent advisory naming one directory as both in use and skipped.
+- The aggregate bars no longer overflow the terminal, and no longer present one account's numbers as the whole pool when another slot's read fails transiently.
+- The aggregate bars and the terminal title count a slot whose percentages came from the cache, as the table and rotation already did.
+- `[Watch] Last poll failed:`, `[Monitor] Rotation failed!` and `[Warmup] Re-warm failed!` no longer break the footer layout on a multi-line exception.
+- A poll that outran `-Interval` no longer re-polls with no delay; the interval is measured from when the poll finished.
+- A network timeout no longer stamps a rate-limit backoff, which had suppressed live probing for two minutes and mislabelled the slot as throttled.
+- Three `sca save` tests asserted a file count using an enumeration blind to dotfiles on Unix, so they would have passed whether or not the files existed.
+
 ## [3.0.1] - 2026-06-23
 
 ### Fixed

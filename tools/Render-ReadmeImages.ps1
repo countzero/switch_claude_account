@@ -1,4 +1,4 @@
-#Requires -Version 7.2
+#Requires -Version 7.4
 
 <#
 .SYNOPSIS
@@ -97,16 +97,21 @@ $freezeCmd = Get-Command freeze -ErrorAction SilentlyContinue
 if (-not $freezeCmd) {
     # Fall back to the well-known winget install location since the PATH
     # update from `winget install charmbracelet.freeze` requires a shell
-    # restart on Windows.
-    $wingetGlob = Join-Path $env:LOCALAPPDATA `
-        'Microsoft\WinGet\Packages\charmbracelet.freeze_Microsoft.Winget.Source_*\freeze_*_Windows_x86_64\freeze.exe'
-    $found = Get-ChildItem -Path $wingetGlob -ErrorAction SilentlyContinue | Select-Object -First 1
+    # restart on Windows. Guarded on $IsWindows because $env:LOCALAPPDATA is
+    # null elsewhere, and Join-Path would fail the binder under
+    # ErrorActionPreference = 'Stop' before reaching the useful error below.
+    $found = if ($IsWindows) {
+        $wingetGlob = Join-Path $env:LOCALAPPDATA `
+            'Microsoft\WinGet\Packages\charmbracelet.freeze_Microsoft.Winget.Source_*\freeze_*_Windows_x86_64\freeze.exe'
+        Get-ChildItem -Path $wingetGlob -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
     if ($found) {
         $freezeExe = $found.FullName
     } else {
         throw @"
 freeze not found on PATH.
 Install with:  winget install charmbracelet.freeze
+            or brew install charmbracelet/tap/freeze
             or scoop install freeze
 "@
     }

@@ -1,4 +1,4 @@
-#Requires -Version 7.2
+#Requires -Version 7.4
 <#
 .SYNOPSIS
     Per-function complexity diagnostic for switch_claude_account.ps1.

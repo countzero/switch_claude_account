@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
 # Pester 5 tests for Invoke-SwitchAction in switch_claude_account.ps1.
@@ -15,6 +15,8 @@
 BeforeAll {
     $script:OriginalUserProfile = $env:USERPROFILE
     $script:OriginalProfile     = $global:PROFILE
+    $script:OriginalHome        = $env:HOME
+    $script:OriginalConfigDir   = $env:CLAUDE_CONFIG_DIR
 }
 
 Describe 'switch_claude_account' {
@@ -152,7 +154,7 @@ Describe 'switch_claude_account' {
             $out | Should -Match '\[Sync\] Auto-saved unknown active credentials'
 
             # Auto slot exists with the unknown bytes preserved.
-            $autoFiles = @(Get-ChildItem -LiteralPath $script:CredDirPath -Filter '.credentials.auto-*.json' |
+            $autoFiles = @(Get-ChildItem -LiteralPath $script:CredDirPath -Filter '.credentials.auto-*.json' -Force |
                 Where-Object { $_.Name -notlike '*.account.json' })
             $autoFiles.Count | Should -Be 1
             Get-Content -LiteralPath $autoFiles[0].FullName -Raw | Should -Be 'UNKNOWN'
@@ -579,7 +581,9 @@ Describe 'switch_claude_account' {
     }
 
     AfterAll {
-        $env:USERPROFILE = $script:OriginalUserProfile
-        $global:PROFILE  = $script:OriginalProfile
+        $env:USERPROFILE       = $script:OriginalUserProfile
+        $global:PROFILE        = $script:OriginalProfile
+        $env:HOME              = $script:OriginalHome
+        $env:CLAUDE_CONFIG_DIR = $script:OriginalConfigDir
     }
 }

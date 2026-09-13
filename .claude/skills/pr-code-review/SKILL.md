@@ -58,8 +58,8 @@ overall design of the change:
      with a one-line dispatch in `Invoke-Main`.
    - `tests/`: Pester 5 test suite, one file per action. Shared setup in
      `tests/Common.ps1`.
-   - `.claude/rules/script-internals.md` and `.claude/rules/tests.md`:
-     deeper conventions for the script and tests respectively.
+   - `AGENTS.md`: repo-global rules and orientation. Per-function rationale
+     lives in a comment on that function, not in a separate document.
    - `README.md`: usage documentation.
    Flag changes that mix concerns inappropriately (e.g., credential logic
    embedded in profile management, or profile logic in credential actions),
