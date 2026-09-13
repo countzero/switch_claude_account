@@ -3185,7 +3185,19 @@ function Get-SlotUsage {
             # pass after startup.
             Start-Sleep -Seconds 5
             try   { return Invoke-UsageRequest -SlotPath $SlotPath -Headers $headers }
-            catch { return New-UsageResult -Status 'rate-limited' }
+            catch {
+                # The retry is a second, independent request and can fail for a
+                # reason the first one did not. Reporting whatever comes back as
+                # 'rate-limited' discarded both the message and the status, so a
+                # 4xx from a drifted endpoint after a Claude Code upgrade came
+                # out as "currently rate-limited or at a plan limit" with no
+                # reason line: the one failure class the unofficial-constants
+                # comment says only a live read can catch, wearing the label of
+                # the one that clears on its own. This arm is reached whenever
+                # the slot has no cache entry, which is every slot on a watch's
+                # first poll.
+                return Resolve-UsageErrorResult -Exception $_.Exception
+            }
         }
 
         # Transport failure (no status, or a 5xx). Deliberately does NOT call
@@ -3213,15 +3225,34 @@ function Get-SlotUsage {
             try {
                 return Invoke-UsageRequest -SlotPath $SlotPath -Headers $headers
             }
-            catch {
-                return New-UsageResult -Status 'error' `
-                                       -HttpStatus (Get-ExceptionHttpStatus $_.Exception) `
-                                       -ErrorMessage $_.Exception.Message
-            }
+            catch { return Resolve-UsageErrorResult -Exception $_.Exception }
         }
 
         return New-UsageResult -Status 'error' -HttpStatus $status -ErrorMessage $message
     }
+}
+
+# Classify a failed /api/oauth/usage attempt into a row.
+#
+# Used by both retry arms in Get-SlotUsage. A retry is an independent request
+# and can fail for a reason the first attempt did not, so the label has to come
+# from the exception in hand rather than from whichever arm happened to
+# schedule the retry. The primary attempt does its own classification inline
+# because it additionally decides whether to consult the cache and whether to
+# retry at all, neither of which applies once a retry has already been spent.
+#
+# 'unauthorized' carries no message for the same reason the primary arm gives
+# it none: Format-UsageAdvisory prints the per-status remedy for a row without
+# one, and "re-authenticate this account" beats the raw 401 sentence.
+function Resolve-UsageErrorResult {
+    Param ([Parameter(Mandatory)] $Exception)
+
+    $status = Get-ExceptionHttpStatus $Exception
+
+    if ($status -eq 401 -or $status -eq 403) { return New-UsageResult -Status 'unauthorized' }
+
+    $label = if ($status -eq 429) { 'rate-limited' } else { 'error' }
+    return New-UsageResult -Status $label -HttpStatus $status -ErrorMessage $Exception.Message
 }
 
 # True when a failed /api/oauth/usage read is worth one more immediate attempt.

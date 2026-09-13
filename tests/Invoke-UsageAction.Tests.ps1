@@ -2082,6 +2082,54 @@ Describe 'switch_claude_account' {
             $r.Status | Should -Be 'rate-limited'
         }
 
+        # The retry is a second, independent request. Labelling whatever it
+        # returns 'rate-limited' hid the failure class that matters most here:
+        # a 4xx from a drifted endpoint after a Claude Code upgrade came out
+        # wearing the label of the one failure that clears on its own, with no
+        # status and no message for the advisory to print.
+        It '429 then 404-on-retry: Status=error carrying the real code' {
+            $slot = Join-Path $script:CredDirPath '.credentials.retrydrift.json'
+            $payload = @{ claudeAiOauth = @{
+                accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
+            } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            $script:usageCall = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $script:usageCall++
+                $code  = if ($script:usageCall -eq 1) { 429 } else { 404 }
+                $resp  = [pscustomobject]@{ StatusCode = $code }
+                $inner = [System.Exception]::new("HTTP $code from the usage endpoint")
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+            $r.Status     | Should -Be 'error'
+            $r.HttpStatus | Should -Be 404
+            $r.Error      | Should -Match '404'
+        }
+
+        It '429 then 401-on-retry: Status=unauthorized' {
+            $slot = Join-Path $script:CredDirPath '.credentials.retryauth.json'
+            $payload = @{ claudeAiOauth = @{
+                accessToken = 'AT'; refreshToken = 'RT'; expiresAt = $script:FutureMs
+            } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            $script:usageCall = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                $script:usageCall++
+                $code  = if ($script:usageCall -eq 1) { 429 } else { 401 }
+                $resp  = [pscustomobject]@{ StatusCode = $code }
+                $inner = [System.Exception]::new("HTTP $code")
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            (Get-SlotUsage -SlotPath $slot).Status | Should -Be 'unauthorized'
+        }
+
         It '429 with a STALE cache entry: Status=rate-limited; last-known data kept; no retry sleep' {
             $slot = Join-Path $script:CredDirPath '.credentials.staleC.json'
             $payload = @{ claudeAiOauth = @{
