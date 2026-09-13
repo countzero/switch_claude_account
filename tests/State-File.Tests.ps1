@@ -293,7 +293,7 @@ Describe 'switch_claude_account' {
             Set-Content -LiteralPath $cred -Value 'C' -NoNewline
             Set-Content -LiteralPath (Join-Path $script:SandboxCredDir '.sca-state.json') -Value '{}' -NoNewline
 
-            $paths = @(Get-CredentialFilePaths -Directory $script:SandboxCredDir -ClaudeJson $null)
+            $paths = @(Get-CredentialFilePaths -Directory $script:SandboxCredDir)
 
             $paths.Count | Should -Be 4
             $paths       | Should -Contain $slot
@@ -301,22 +301,29 @@ Describe 'switch_claude_account' {
             $paths       | Should -Contain $cred
         }
 
-        It 'includes ~/.claude.json when it exists' {
+        # sca writes this file's oauthAccount block, but the file is Claude
+        # Code's and lives outside the credentials directory. Choosing the mode
+        # of a file we create and re-permissioning one another tool owns are
+        # different acts; New-CredentialDirectory draws the same line for a
+        # directory that already exists.
+        It 'excludes ~/.claude.json' {
             $claudeJson = Join-Path $script:SandboxHome '.claude.json'
             Set-Content -LiteralPath $claudeJson -Value '{}' -NoNewline
 
-            Get-CredentialFilePaths -Directory $script:SandboxCredDir -ClaudeJson $claudeJson |
-                Should -Contain $claudeJson
+            Get-CredentialFilePaths -Directory $script:SandboxCredDir |
+                Should -Not -Contain $claudeJson
         }
 
-        It 'skips paths that do not exist' {
-            Get-CredentialFilePaths -Directory $script:SandboxCredDir -ClaudeJson (Join-Path $TestDrive 'absent.json') |
-                Should -BeNullOrEmpty
+        It 'skips the state file when it does not exist' {
+            New-SlotPair -CredDir $script:SandboxCredDir -Name 'one' -Content 'S' | Out-Null
+
+            Get-CredentialFilePaths -Directory $script:SandboxCredDir |
+                Should -Not -Contain (Join-Path $script:SandboxCredDir '.sca-state.json')
         }
 
         It 'returns nothing for a missing or blank directory' {
-            @(Get-CredentialFilePaths -Directory (Join-Path $TestDrive 'gone') -ClaudeJson $null).Count | Should -Be 0
-            @(Get-CredentialFilePaths -Directory '' -ClaudeJson $null).Count | Should -Be 0
+            @(Get-CredentialFilePaths -Directory (Join-Path $TestDrive 'gone')).Count | Should -Be 0
+            @(Get-CredentialFilePaths -Directory '').Count | Should -Be 0
         }
     }
 
@@ -360,7 +367,7 @@ Describe 'switch_claude_account' {
             Set-Content -LiteralPath $state -Value '{}' -NoNewline
             foreach ($p in @($slot, $side, $cred, $state)) { [System.IO.File]::SetUnixFileMode($p, $loose) }
 
-            Repair-CredentialFileModes -Directory $script:SandboxCredDir -ClaudeJson $null | Should -Be 4
+            Repair-CredentialFileModes -Directory $script:SandboxCredDir | Should -Be 4
 
             foreach ($p in @($slot, $side, $cred, $state)) {
                 [System.IO.File]::GetUnixFileMode($p) |
@@ -373,22 +380,44 @@ Describe 'switch_claude_account' {
             Get-ChildItem -LiteralPath $script:SandboxCredDir -Force |
                 ForEach-Object { [System.IO.File]::SetUnixFileMode($_.FullName, 'UserRead, UserWrite') }
 
-            Repair-CredentialFileModes -Directory $script:SandboxCredDir -ClaudeJson $null | Should -Be 0
+            Repair-CredentialFileModes -Directory $script:SandboxCredDir | Should -Be 0
         }
 
-        It 'tightens ~/.claude.json, which sca also writes' -Skip:$IsWindows {
+        # Claude Code owns that file and rewrites it through its own atomic
+        # rename, so repairing it would re-fire and re-announce after every
+        # session rather than once. sca still writes its own bytes there at
+        # 0600; choosing the mode of a write is not the same act as
+        # re-permissioning another tool's file.
+        It 'leaves ~/.claude.json alone' -Skip:$IsWindows {
             $claudeJson = Join-Path $script:SandboxHome '.claude.json'
+            $loose      = [System.IO.UnixFileMode]'UserRead, UserWrite, GroupRead, OtherRead'
             Set-Content -LiteralPath $claudeJson -Value '{}' -NoNewline
-            [System.IO.File]::SetUnixFileMode($claudeJson, 'UserRead, UserWrite, GroupRead, OtherRead')
+            [System.IO.File]::SetUnixFileMode($claudeJson, $loose)
 
-            Repair-CredentialFileModes -Directory $script:SandboxCredDir -ClaudeJson $claudeJson | Should -Be 1
+            Repair-CredentialFileModes -Directory $script:SandboxCredDir | Should -Be 0
 
-            [System.IO.File]::GetUnixFileMode($claudeJson) |
-                Should -Be ([System.IO.UnixFileMode]'UserRead, UserWrite')
+            [System.IO.File]::GetUnixFileMode($claudeJson) | Should -Be $loose
+        }
+
+        # SetUnixFileMode is chmod(2), which follows the link and changes the
+        # TARGET. Following one would have sca silently re-permission a file
+        # outside the directory it believes it is repairing.
+        It 'skips a symlink rather than chmod-ing its target' -Skip:$IsWindows {
+            $target = Join-Path $TestDrive 'outside-target.json'
+            $loose  = [System.IO.UnixFileMode]'UserRead, UserWrite, GroupRead, OtherRead'
+            Set-Content -LiteralPath $target -Value 'T' -NoNewline
+            [System.IO.File]::SetUnixFileMode($target, $loose)
+
+            $link = Join-Path $script:SandboxCredDir '.credentials.linked(o@x.io).json'
+            New-Item -ItemType SymbolicLink -Path $link -Target $target | Out-Null
+
+            Repair-CredentialFileModes -Directory $script:SandboxCredDir | Should -Be 0
+
+            [System.IO.File]::GetUnixFileMode($target) | Should -Be $loose
         }
 
         It 'returns 0 for a directory that does not exist' -Skip:$IsWindows {
-            Repair-CredentialFileModes -Directory (Join-Path $TestDrive 'nope') -ClaudeJson $null | Should -Be 0
+            Repair-CredentialFileModes -Directory (Join-Path $TestDrive 'nope') | Should -Be 0
         }
     }
 

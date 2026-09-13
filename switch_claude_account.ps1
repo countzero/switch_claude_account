@@ -741,22 +741,25 @@ function New-CredentialDirectory {
         [System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute') | Out-Null
 }
 
-# Every file sca owns under $Directory, plus Claude Code's config when one is
-# given: slot files, their .account.json sidecars, .credentials.json and the
-# state file. The wildcard is wider than Get-CredentialSlotFiles' on purpose,
-# because this answers "what did sca write here", not "what is a slot".
+# Every credential-shaped file under $Directory: slot files, their
+# .account.json sidecars, .credentials.json and the state file. The wildcard is
+# wider than Get-CredentialSlotFiles' on purpose, because this answers "what
+# did sca write here", not "what is a slot".
+#
+# ~/.claude.json is NOT included, even though sca writes its oauthAccount
+# block. It is Claude Code's config file, sitting outside this directory, and
+# the only consumer here is the mode repair; see Repair-CredentialFileModes for
+# why repairing another tool's file is not the same act as writing our own
+# bytes into it carefully.
 function Get-CredentialFilePaths {
-    Param (
-        [String] $Directory = $CredDir,
-        [AllowNull()] [AllowEmptyString()] [String] $ClaudeJson = $ClaudeJsonPath
-    )
+    Param ([String] $Directory = $CredDir)
 
     if ([string]::IsNullOrWhiteSpace($Directory) -or -not (Test-Path -LiteralPath $Directory)) { return @() }
 
     $paths = @(Get-ChildItem -LiteralPath $Directory -Filter '.credentials*.json' -Force -ErrorAction SilentlyContinue |
                    ForEach-Object { $_.FullName })
-    $paths += @((Join-Path $Directory '.sca-state.json'), $ClaudeJson) |
-                  Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+    $state = Join-Path $Directory '.sca-state.json'
+    if (Test-Path -LiteralPath $state) { $paths += $state }
     return @($paths)
 }
 
@@ -781,21 +784,31 @@ function Test-UnixModeIsShared {
 # while the release notes said the hole was closed. `sca switch` only rewrites
 # .credentials.json, so upgrading heals exactly one file without this.
 #
+# Scoped to files sca creates. ~/.claude.json is excluded even though sca
+# writes its oauthAccount block, for the reason New-CredentialDirectory gives
+# about an existing directory: choosing the mode of a file we create is ours to
+# do, re-permissioning one another tool owns and continually rewrites is not.
+# Claude Code re-creates that file through its own atomic rename, so including
+# it would also mean re-tightening and re-announcing it after every session,
+# which is the opposite of a one-time repair.
+#
+# Symlinks are skipped. SetUnixFileMode is chmod(2), which follows the link and
+# changes the TARGET, so a symlinked slot file would have sca silently
+# re-permission something outside the directory it believes it is repairing.
+#
 # Best-effort per file (a file owned by another user, or on a filesystem that
 # reports no mode, must not abort the action the user actually asked for), and
 # a no-op on Windows, which has no mode bits; see Write-PrivateFileBytes for
 # what stands in for them there.
 function Repair-CredentialFileModes {
-    Param (
-        [String] $Directory   = $CredDir,
-        [AllowNull()] [AllowEmptyString()] [String] $ClaudeJson = $ClaudeJsonPath
-    )
+    Param ([String] $Directory = $CredDir)
 
     if ($IsWindows) { return 0 }
 
     $fixed = 0
-    foreach ($path in (Get-CredentialFilePaths -Directory $Directory -ClaudeJson $ClaudeJson)) {
+    foreach ($path in (Get-CredentialFilePaths -Directory $Directory)) {
         try {
+            if ((Get-Item -LiteralPath $path -Force).LinkTarget) { continue }
             $mode = [System.IO.File]::GetUnixFileMode($path)
             if (-not (Test-UnixModeIsShared -Mode $mode)) { continue }
             [System.IO.File]::SetUnixFileMode($path, [System.IO.UnixFileMode]'UserRead, UserWrite')
@@ -6248,14 +6261,21 @@ function Invoke-Main {
             if ($configAdvisory) { Write-Color $configAdvisory 'Yellow' }
         }
 
-        # Heals files written by a pre-4.0.0 sca before any action reads or
-        # rewrites them. Runs regardless of -Json (the repair is the point, the
-        # line is not) and reports only when it actually changed something, so
-        # it stays silent forever after the first run.
+        # Heals files a pre-4.0.0 sca wrote at the temp file's umask-default
+        # mode, before any action reads or rewrites them. Runs regardless of
+        # -Json (the repair is the point, the line is not) and reports only when
+        # it actually changed something, so in practice it speaks once.
+        #
+        # The line states what was done, not who did it. An older sca is the
+        # expected cause but not the only one: a restore, a sync tool, or a
+        # hand-run chmod produces the same finding, and sca cannot tell them
+        # apart. Naming a cause it cannot establish would make the one
+        # security-prefixed line in the tool the least trustworthy sentence in
+        # it.
         if (-not $profileOnly) {
             $tightened = Repair-CredentialFileModes
             if ($tightened -gt 0 -and -not $Json) {
-                Write-Color "[Security] Tightened permissions to 0600 on $tightened credential file(s) written by an older version." 'Yellow'
+                Write-Color "[Security] Tightened $tightened credential file(s) to 0600; they were readable by other users on this machine." 'Yellow'
             }
         }
 
