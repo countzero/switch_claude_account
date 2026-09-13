@@ -140,13 +140,48 @@ $ScaHomeDir     = if ($IsWindows) {
 }
 
 # CLAUDE_CONFIG_DIR relocates Claude Code's whole config tree, .credentials.json
-# and .claude.json included (verified against Claude Code 2.1.263). Taken
-# verbatim: no ~ expansion and no resolution of a relative path, because
-# Claude Code does neither (anthropics/claude-code#78988 treats a leading ~ as
-# a literal cwd-relative directory). Normalizing here would point sca at a
-# different directory than the claude process it is meant to mirror, which is
-# the exact divergence this tool exists to prevent.
-$ScaConfigDir   = if (-not [string]::IsNullOrWhiteSpace($env:CLAUDE_CONFIG_DIR)) { $env:CLAUDE_CONFIG_DIR } else { $null }
+# and .claude.json included (verified against Claude Code 2.1.263). The value is
+# used as given, with no ~ expansion, because Claude Code does none
+# (anthropics/claude-code#78988 treats a leading ~ as a literal cwd-relative
+# directory) and GetFullPath leaves such a segment alone.
+#
+# A relative value is bound to the current directory once, here, rather than
+# carried relative: PowerShell's provider cmdlets resolve a relative path
+# against $PWD while every .NET call in this script ([IO.File]::ReadAllBytes,
+# the FileStream in Write-PrivateFileBytes, ::Replace / ::Move) resolves
+# against [Environment]::CurrentDirectory, which PowerShell never syncs to
+# Set-Location. Measured on Windows: after `Set-Location C:\`,
+# [IO.Path]::GetFullPath('x') still returns the process start directory. Left
+# relative, one `sca save` after a `cd` enumerates slots under $PWD while
+# writing the credential bytes under the launch directory. Binding here keeps
+# the parity that matters (a `claude` started in this directory resolves the
+# same value against the same base) and removes the split.
+#
+# Defined above the assignment below because that assignment calls it at load
+# time; the rest of the credentials-directory helpers live together further
+# down.
+function Resolve-ScaConfigDir {
+    Param (
+        [AllowNull()] [AllowEmptyString()] [String] $Value,
+        [String] $BaseDir
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+
+    if ([string]::IsNullOrWhiteSpace($BaseDir)) {
+        # $PWD can sit on a non-filesystem provider (HKCU:\ and friends), whose
+        # ProviderPath is no base for a file path.
+        $BaseDir = if ($PWD.Provider.Name -eq 'FileSystem') { $PWD.ProviderPath } else { [Environment]::CurrentDirectory }
+    }
+
+    # An unusable value (invalid characters, a base that is not rooted) is
+    # handed on verbatim so the failure surfaces as the action's own error
+    # naming the directory, not as a load-time throw before `sca help` runs.
+    try   { return [System.IO.Path]::GetFullPath($Value, $BaseDir) }
+    catch { return $Value }
+}
+
+$ScaConfigDir   = Resolve-ScaConfigDir -Value $env:CLAUDE_CONFIG_DIR
 
 # Every path below stays $null when neither CLAUDE_CONFIG_DIR nor the
 # platform's home variable is set, rather than calling Join-Path on a blank
@@ -379,20 +414,12 @@ $Script:AccountColumnMaxWidth  = 32
 # frame.
 $Script:AdvisoryReasonMaxWidth = 200
 
-# --- State file + atomic credential-file write primitives -----------------
+# --- Atomic credential-file write primitives ------------------------------
 #
-# `sca` tracks the currently-active slot in $StateFile (a small JSON
-# document) rather than relying on inode equality between .credentials.json
-# and a saved slot file. Inode equality cannot survive Claude Code's
-# atomic-rename token-refresh writes, which replace the destination inode.
-#
-# Schema v1:
-#   { "schema": 1, "active_slot": "<name>"|null, "last_sync_hash": "<sha256>"|null }
-#
-# Concurrent writes: every write goes through Set-CredentialFileAtomic,
-# which is atomic on NTFS. Two concurrent updates -> last writer wins;
-# the loser's changes are silently dropped. Acceptable for an interactive
-# tool that is rarely (and never deliberately) invoked in parallel.
+# Every credential-shaped file this tool writes (.credentials.json, slot
+# files, identity sidecars, .sca-state.json, ~/.claude.json) goes through
+# Set-CredentialFileAtomic, which creates it via Write-PrivateFileBytes and
+# renames it into place.
 
 # Atomic temp-file-plus-rename write of $Bytes to $Path. The single write
 # primitive used by every credential-shaped file (.credentials.json, slot
@@ -456,13 +483,15 @@ function Set-CredentialFileAtomic {
         throw $lastErr
     }
     finally {
-        # Cleanup on failure path. Success path leaves $tmp consumed by
-        # Replace/Move so Test-Path is already false here.
+        # Cleanup on the rename-failure path. The success path leaves $tmp
+        # consumed by Replace/Move so Test-Path is already false here.
         #
-        # Gated on $wrote so this cannot delete a file we did not create.
+        # Gated on $wrote so this cannot delete a file we did not create:
         # Write-PrivateFileBytes opens CreateNew precisely so a pre-existing
-        # temp path is refused rather than overwritten; deleting it here would
-        # undo that refusal and destroy whatever planted it.
+        # temp path is refused rather than overwritten, and deleting it here
+        # would undo that refusal and destroy whatever planted it. A write that
+        # fails after that open leaves nothing behind either, because
+        # Write-PrivateFileBytes removes its own partial file.
         if ($wrote -and (Test-Path -LiteralPath $tmp)) {
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         }
@@ -489,9 +518,13 @@ function Set-CredentialFileAtomic {
 # .credentials.json.
 #
 # Windows sets no mode because it has no Unix mode bits (assigning
-# UnixCreateMode there throws PlatformNotSupportedException); the file
-# inherits the profile directory's ACL, which already restricts it to the
-# owning user.
+# UnixCreateMode there throws PlatformNotSupportedException). The file inherits
+# the ACL of the directory it is created in, and sca writes no explicit DACL.
+# That is the user's profile by default, which restricts it to the owning user,
+# but CLAUDE_CONFIG_DIR makes the directory user-chosen: pointed at, say,
+# C:\ProgramData\claude, the tokens land under whatever that location inherits.
+# Unix is protected unconditionally by the line below; Windows is protected by
+# where it is pointed.
 #
 # CreateNew rather than Create on BOTH platforms: the caller always passes a
 # fresh GUID-suffixed path, so an existing file means something else planted
@@ -511,9 +544,27 @@ function Write-PrivateFileBytes {
     }
 
     $stream = [System.IO.FileStream]::new($Path, $options)
-    try     { $stream.Write($Bytes, 0, $Bytes.Length) }
-    finally { $stream.Dispose() }
+    $written = $false
+    try {
+        $stream.Write($Bytes, 0, $Bytes.Length)
+        # Disposed inside the try, not only in the finally, so a flush failure
+        # (the buffered half of an ENOSPC) still counts as a failed write.
+        $stream.Dispose()
+        $written = $true
+    }
+    finally {
+        if (-not $written) {
+            # The open succeeded, so CreateNew proves we created this file, and
+            # deleting it cannot destroy anything another process planted. The
+            # caller's cleanup only runs when this function returns, so without
+            # this a half-written credential would sit in $CredDir forever.
+            try { $stream.Dispose() } catch { Write-Verbose "Temp stream dispose failed: $_" }
+            Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
+
+# --- Credentials directory ------------------------------------------------
 
 # Every slot-credential file in $Directory (default $CredDir), unsorted, as
 # FileInfo. Get-ConfigDirAdvisory is the only caller that passes a directory,
@@ -553,12 +604,11 @@ function Get-CredentialSlotFiles {
 # GetFullPath normalises separators and relative segments without requiring
 # either path to exist, so the "already the default" case stays quiet instead
 # of emitting a permanent noise line for anyone who sets the variable
-# explicitly to ~/.claude. The base path is passed explicitly because the
-# one-argument overload resolves against [Environment]::CurrentDirectory, which
-# PowerShell never syncs to Set-Location: with a relative CLAUDE_CONFIG_DIR
-# (which this tool takes verbatim, so relative values are supported) the
-# comparison and the orphan count would target the process start directory
-# while every other read went through the provider and hit $PWD. A malformed
+# explicitly to ~/.claude. The base is passed explicitly for the same reason
+# Resolve-ScaConfigDir binds one: the one-argument overload would resolve
+# against [Environment]::CurrentDirectory. Production values arrive absolute
+# from Resolve-ScaConfigDir; the parameter keeps a relative one (a caller's,
+# a test's) comparing against the same base every other read uses. A malformed
 # value fails open into the orphan check rather than being treated as "already
 # the default".
 # The three inputs arrive as parameters defaulting to the script-scope values
@@ -622,6 +672,108 @@ function Assert-CredentialDir {
         throw "No credentials directory: `$env:$homeVar is not set, so '<home>/.claude' cannot be resolved. Set `$env:$homeVar, or set `$env:CLAUDE_CONFIG_DIR to the directory Claude Code uses."
     }
 }
+
+# Create $Directory when it is missing, owner-only on Unix.
+#
+# 0700 rather than the 0755 a umask-default mkdir produces: slot FILENAMES
+# embed the account's email address, so a world-readable directory leaks the
+# account list even though Write-PrivateFileBytes keeps the bytes to 0600. An
+# existing directory is left exactly as it is, including its mode: it is
+# usually Claude Code's own ~/.claude, and silently re-permissioning another
+# tool's directory is not this tool's call to make.
+function New-CredentialDirectory {
+    Param ([Parameter(Mandatory)] [String] $Directory)
+
+    if (Test-Path -LiteralPath $Directory) { return }
+
+    if ($IsWindows) {
+        New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+        return
+    }
+    [System.IO.Directory]::CreateDirectory(
+        $Directory,
+        [System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute') | Out-Null
+}
+
+# Every file sca owns under $Directory, plus Claude Code's config when one is
+# given: slot files, their .account.json sidecars, .credentials.json and the
+# state file. The wildcard is wider than Get-CredentialSlotFiles' on purpose,
+# because this answers "what did sca write here", not "what is a slot".
+function Get-CredentialFilePaths {
+    Param (
+        [String] $Directory = $CredDir,
+        [AllowNull()] [AllowEmptyString()] [String] $ClaudeJson = $ClaudeJsonPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Directory) -or -not (Test-Path -LiteralPath $Directory)) { return @() }
+
+    $paths = @(Get-ChildItem -LiteralPath $Directory -Filter '.credentials*.json' -Force -ErrorAction SilentlyContinue |
+                   ForEach-Object { $_.FullName })
+    $paths += @((Join-Path $Directory '.sca-state.json'), $ClaudeJson) |
+                  Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+    return @($paths)
+}
+
+# True when a mode grants any group or other bit. [UnixFileMode] is a flags
+# enum, so this reads as one test rather than six comparisons; kept separate
+# from the repair loop below so the rule is checkable on a platform that has no
+# modes to read.
+function Test-UnixModeIsShared {
+    Param ([Parameter(Mandatory)] [System.IO.UnixFileMode] $Mode)
+
+    $shared = [System.IO.UnixFileMode]'GroupRead, GroupWrite, GroupExecute, OtherRead, OtherWrite, OtherExecute'
+    return (($Mode -band $shared) -ne [System.IO.UnixFileMode]::None)
+}
+
+# Tighten any credential-shaped file in $Directory that is readable by someone
+# other than its owner back to 0600, and return how many were changed.
+#
+# Write-PrivateFileBytes fixes the mode of files this version writes. It cannot
+# fix the installed base: before 4.0.0 every atomic write handed the destination
+# the temp file's umask-default 0644, so a slot that is not re-saved, and whose
+# token is never refreshed, would keep a world-readable refresh token forever
+# while the release notes said the hole was closed. `sca switch` only rewrites
+# .credentials.json, so upgrading heals exactly one file without this.
+#
+# Best-effort per file (a file owned by another user, or on a filesystem that
+# reports no mode, must not abort the action the user actually asked for), and
+# a no-op on Windows, which has no mode bits; see Write-PrivateFileBytes for
+# what stands in for them there.
+function Repair-CredentialFileModes {
+    Param (
+        [String] $Directory   = $CredDir,
+        [AllowNull()] [AllowEmptyString()] [String] $ClaudeJson = $ClaudeJsonPath
+    )
+
+    if ($IsWindows) { return 0 }
+
+    $fixed = 0
+    foreach ($path in (Get-CredentialFilePaths -Directory $Directory -ClaudeJson $ClaudeJson)) {
+        try {
+            $mode = [System.IO.File]::GetUnixFileMode($path)
+            if (-not (Test-UnixModeIsShared -Mode $mode)) { continue }
+            [System.IO.File]::SetUnixFileMode($path, [System.IO.UnixFileMode]'UserRead, UserWrite')
+            $fixed++
+        }
+        catch { Write-Verbose "Could not tighten '$path': $_" }
+    }
+    return $fixed
+}
+
+# --- State file -----------------------------------------------------------
+#
+# `sca` tracks the currently-active slot in $StateFile (a small JSON
+# document) rather than relying on inode equality between .credentials.json
+# and a saved slot file. Inode equality cannot survive Claude Code's
+# atomic-rename token-refresh writes, which replace the destination inode.
+#
+# Schema v1:
+#   { "schema": 1, "active_slot": "<name>"|null, "last_sync_hash": "<sha256>"|null }
+#
+# Concurrent writes: every write goes through Set-CredentialFileAtomic,
+# which is atomic on NTFS. Two concurrent updates -> last writer wins;
+# the loser's changes are silently dropped. Acceptable for an interactive
+# tool that is rarely (and never deliberately) invoked in parallel.
 
 # Persist $State to $StateFile via atomic rename. The schema field is
 # enforced to 1 here so callers cannot accidentally write a stale or
@@ -2307,6 +2459,51 @@ function Invoke-RemoveAction {
 
 # --- usage action internals ---
 
+# The one shape every usage read returns, whatever happened. Get-SlotUsage,
+# Get-CachedUsageOrNull and Get-UsageSnapshot all build through this, so a
+# consumer can read any field on any result without an existence check and
+# without knowing which of the ladder's arms produced it.
+#
+# Six fields, always present:
+#   Status           'ok' | 'no-oauth' | 'expired' | 'rate-limited' |
+#                    'unauthorized' | 'error'. Answers "may I switch INTO this
+#                    slot", which is why Get-AutoRotationDecision gates peers
+#                    on it.
+#   Data             the parsed /api/oauth/usage body, or $null. Answers "are
+#                    there numbers to show or judge", which is a different
+#                    question: a non-ok row served from cache carries Data, and
+#                    Test-RowHasUsableData is the predicate for that question.
+#   Error            human-readable failure detail, or $null.
+#   HttpStatus       numeric status when the failure carried one, else $null.
+#   IsCachedFallback $true when Data came from $Script:SlotUsageCache.
+#   FallbackReason   'rate-limit' | 'network' for a cached result, else $null.
+#
+# Four consumers used to re-derive "is this row trustworthy" from different
+# subsets of those fields and disagreed with each other; the union of return
+# shapes this replaces is what made that easy to do by accident.
+function New-UsageResult {
+    Param (
+        [Parameter(Mandatory)]
+        [ValidateSet('ok', 'no-oauth', 'expired', 'rate-limited', 'unauthorized', 'error')]
+        [String] $Status,
+        [AllowNull()] $Data = $null,
+        # Named ErrorMessage rather than Error: a parameter named $Error would
+        # shadow PowerShell's automatic error variable inside this function.
+        [AllowNull()] [AllowEmptyString()] [String] $ErrorMessage,
+        [AllowNull()] $HttpStatus,
+        [AllowNull()] [ValidateSet('rate-limit', 'network')] [String] $CachedReason
+    )
+
+    return [pscustomobject]@{
+        Status           = $Status
+        Data             = $Data
+        Error            = if ([string]::IsNullOrEmpty($ErrorMessage)) { $null } else { $ErrorMessage }
+        HttpStatus       = $HttpStatus
+        IsCachedFallback = [bool]$CachedReason
+        FallbackReason   = if ($CachedReason) { $CachedReason } else { $null }
+    }
+}
+
 # True if $Exception came from an Invoke-RestMethod call that hit HTTP 429.
 # Reads the status through Get-ExceptionHttpStatus so the two exception shapes
 # our codebase encounters (a real HttpResponseException whose .Response
@@ -2568,9 +2765,8 @@ function Update-SlotTokens {
 # per-process cache and return it wrapped as an IsCachedFallback result.
 # Returns $null on cache miss (or on a stale entry unless -AllowStale).
 #
-# Sole construction site for cache-fallback results, so every caller agrees
-# on the shape (Status / Data / IsCachedFallback / FallbackReason / Error /
-# HttpStatus).
+# Sole construction site for cache-fallback results; builds through
+# New-UsageResult like every other producer.
 #
 # Freshness policy:
 #   * Fresh entry (within $Script:UsageCacheTTL minutes) -> served as
@@ -2588,10 +2784,12 @@ function Update-SlotTokens {
 # stamped on the row so Format-UsageAdvisory can word the advisory
 # accurately instead of calling every fallback a rate limit.
 #
-# -ErrorMessage / -HttpStatus are stamped on the stale (non-ok) result only;
-# a fresh 'ok' row has nothing to report. They let the table render
-# 'error 529' or 'error: <tail>' on a stale network row that still shows
-# numbers.
+# -ErrorMessage / -HttpStatus are stamped on BOTH results. The fresh one keeps
+# its 'ok' status, so the table and the bars are unaffected, but the reason the
+# live read failed survives into Format-UsageAdvisory's per-slot line and the
+# -Json row. Dropping it on the fresh path left the most common transient
+# failure of all (a blip with a cache under $Script:UsageCacheTTL minutes old)
+# reported as "showing last known usage" with nothing saying why.
 function Get-CachedUsageOrNull {
     Param (
         [String] $SlotPath,
@@ -2607,27 +2805,18 @@ function Get-CachedUsageOrNull {
     if ($isStale) {
         if (-not $AllowStale) { return $null }
         $staleStatus = if ($Reason -eq 'network') { 'error' } else { 'rate-limited' }
-        return [pscustomobject]@{
-            Status           = $staleStatus
-            Data             = $entry.Data
-            IsCachedFallback = $true
-            FallbackReason   = $Reason
-            Error            = $ErrorMessage
-            HttpStatus       = $HttpStatus
-        }
+        return New-UsageResult -Status $staleStatus -Data $entry.Data -CachedReason $Reason `
+                               -ErrorMessage $ErrorMessage -HttpStatus $HttpStatus
     }
-    return [pscustomobject]@{
-        Status           = 'ok'
-        Data             = $entry.Data
-        IsCachedFallback = $true
-        FallbackReason   = $Reason
-    }
+    return New-UsageResult -Status 'ok' -Data $entry.Data -CachedReason $Reason `
+                           -ErrorMessage $ErrorMessage -HttpStatus $HttpStatus
 }
 
 # Shared resilience ladder for a failed /api/oauth/usage read. Both arms of
 # Get-SlotUsage's catch need the same decision and differ only in -Reason:
 #
-#   1. Fresh cache -> serve it as 'ok'.
+#   1. Fresh cache -> serve it as 'ok', carrying the failure's message and
+#                     status so the row can still say what went wrong.
 #   2. Stale cache -> serve the last-known percentages under a non-ok label.
 #                     No retry: a stale entry means we have been failing long
 #                     enough that another attempt in the same poll will not
@@ -2644,7 +2833,8 @@ function Resolve-UsageFailureFallback {
         [AllowNull()] $HttpStatus
     )
 
-    $fresh = Get-CachedUsageOrNull -SlotPath $SlotPath -Reason $Reason
+    $fresh = Get-CachedUsageOrNull -SlotPath $SlotPath -Reason $Reason `
+                                   -ErrorMessage $ErrorMessage -HttpStatus $HttpStatus
     if ($fresh) { return $fresh }
 
     return Get-CachedUsageOrNull -SlotPath $SlotPath -AllowStale -Reason $Reason `
@@ -2686,14 +2876,13 @@ function Clear-SlotRateLimitBackoff {
 #   @{ Status = 'ok'; AccessToken = <string> }     # caller proceeds with HTTP
 #   @{ Status = 'no-oauth' }                       # slot has no claudeAiOauth
 #   @{ Status = 'rate-limited' }                   # 429 from /v1/oauth/token
-#   @{ Status = 'expired'; Error = <msg> }         # token expired + refresh failed (non-429)
+#   @{ Status = 'expired'; Error; HttpStatus; Transport }  # refresh failed (non-429)
 #   @{ Status = 'error';   Error = <msg> }         # Get-SlotOAuth threw (corrupt slot file etc.)
 #
-# Callers translate the non-ok statuses straight into their own return
-# values. Get-SlotUsage additionally checks $Script:SlotUsageCache for a
-# fresh entry before returning 'rate-limited' (the cache-fallback path);
-# the other two callers have no cache and return the helper's result
-# verbatim.
+# This is the token-resolution shape, not New-UsageResult's row shape; callers
+# translate. Get-SlotUsage additionally checks $Script:SlotUsageCache for a
+# fresh entry before returning 'rate-limited' (the cache-fallback path); the
+# other two callers have no cache and read Status / Error only.
 #
 # Does NOT set $ProgressPreference: Get-SlotOAuth performs no HTTP, and
 # Update-SlotTokens sets it inside its own scope.
@@ -2733,15 +2922,25 @@ function Resolve-SlotAccessToken {
             # malformed JSON, ...): the token IS expired and we couldn't
             # refresh it, so 'expired' remains the accurate label.
             #
-            # HttpStatus is carried so the caller can tell a rejected grant
-            # (4xx: the slot is genuinely dead, its numbers are gone) from a
-            # transport failure (no status / 5xx: the slot is probably fine and
-            # a cached reading is still worth showing). Get-SlotUsage gates its
-            # cache fallback on exactly that distinction.
+            # Transport is decided HERE, where the exception still exists, and
+            # carried as a verdict rather than re-derived from HttpStatus by the
+            # caller. Update-SlotTokens also throws for a response missing
+            # access_token or expires_in, and for a failed slot-file write after
+            # the server already rotated the refresh token: all three arrive
+            # with no HTTP status, so a caller reading "no status" as "transport
+            # blip" served those dead slots from cache as a healthy 'ok'. The
+            # last one is the worst, because the rotated token is gone from the
+            # slot file for good.
+            #
+            # HttpStatus stays on the result for the table's 'error <code>' cell
+            # and for the advisory.
+            $ex = $_.Exception
+            $status = Get-ExceptionHttpStatus $ex
             return [pscustomobject]@{
                 Status     = 'expired'
-                Error      = $_.Exception.Message
-                HttpStatus = (Get-ExceptionHttpStatus $_.Exception)
+                Error      = $ex.Message
+                HttpStatus = $status
+                Transport  = (Test-IsTransportFailure -HttpStatus $status -Exception $ex)
             }
         }
     }
@@ -2749,24 +2948,21 @@ function Resolve-SlotAccessToken {
     return [pscustomobject]@{ Status = 'ok'; AccessToken = $accessToken }
 }
 
-# Call /api/oauth/usage for one slot. Auto-refreshes a token that is
-# expired or within 60s of expiry via Resolve-SlotAccessToken. Returns:
-#   @{ Status = 'ok';           Data = <parsed response> }
-#   @{ Status = 'ok'; Data; IsCachedFallback; FallbackReason }  # fresh cache after any failure
-#   @{ Status = 'no-oauth' }                                # slot has no claudeAiOauth
-#   @{ Status = 'expired'; Error = <msg> }                  # token expired AND refresh failed (non-429)
-#   @{ Status = 'rate-limited' }                            # 429 from refresh OR usage endpoint, no cache
-#   @{ Status = 'rate-limited'; Data; IsCachedFallback; FallbackReason }  # stale cache after a 429
-#   @{ Status = 'unauthorized' }                            # 401/403 from usage endpoint
-#   @{ Status = 'error'; HttpStatus; Error }                # network / shape / other, no cache
-#   @{ Status = 'error'; HttpStatus; Error; Data; IsCachedFallback; FallbackReason }  # stale cache
-# Never throws to callers; surfaces every failure mode as a Status value
-# so Invoke-UsageAction can render mixed-health tables without aborting.
+# Call /api/oauth/usage for one slot. Auto-refreshes a token that is expired or
+# within 60s of expiry via Resolve-SlotAccessToken. Always returns
+# New-UsageResult's single shape; never throws, so Invoke-UsageAction can
+# render mixed-health tables without aborting.
 #
-# A failed read never discards known-good data: the two catch arms run the
-# Resolve-UsageFailureFallback ladder first, so a single transport blip
-# degrades the row to "last known percentages, labelled" instead of wiping
-# it to em-dashes for a whole poll interval.
+# A failure that the slot can recover from never discards known-good data: both
+# catch arms run the Resolve-UsageFailureFallback ladder, so a transport blip
+# degrades the row to "last known percentages, labelled" instead of wiping it
+# to em-dashes for a whole poll interval.
+#
+# A failure that describes the slot or the request does NOT reach the cache:
+# a 4xx from either endpoint (invalid_grant, and the endpoint drift that a
+# Claude Code upgrade can cause) means the reading we hold is not evidence the
+# slot is fine, and serving it as 'ok' would hide the one failure only a live
+# `sca usage` can catch. Test-IsTransportFailure draws that line once.
 #
 # Parse the RAW body shape documented at $Script:UsageEndpoint. Claude Code
 # re-shapes it into { rate_limits: { five_hour: { used_percentage, resets_at } } }
@@ -2792,12 +2988,7 @@ function Get-SlotUsage {
     # keep-warm step can still recover the slot.
     $entry = $Script:SlotUsageCache[$SlotPath]
     if ($entry -and $entry.RateLimitedUntil -and [DateTime]::UtcNow -lt $entry.RateLimitedUntil) {
-        return [pscustomobject]@{
-            Status           = 'rate-limited'
-            Data             = $entry.Data
-            IsCachedFallback = $true
-            FallbackReason   = 'rate-limit'
-        }
+        return New-UsageResult -Status 'rate-limited' -Data $entry.Data -CachedReason 'rate-limit'
     }
 
     # Resolve a non-expired access token (refresh if needed). A token-endpoint
@@ -2817,7 +3008,7 @@ function Get-SlotUsage {
             $fallback = Resolve-UsageFailureFallback -SlotPath $SlotPath -Reason 'rate-limit'
             if ($fallback) { return $fallback }
         }
-        elseif ($tok.Status -eq 'expired' -and (Test-IsTransportFailure -HttpStatus $tok.HttpStatus)) {
+        elseif ($tok.Status -eq 'expired' -and $tok.Transport) {
             # The refresh POST died in transport, not on its merits. Its budget
             # is the largest of the three calls ($Script:TokenTimeoutSec), so
             # this is the likeliest place for a blip to land, and without the
@@ -2826,14 +3017,15 @@ function Get-SlotUsage {
             # and (in `sca monitor`) turned the active row into 'active-unknown',
             # pausing rotation until the next poll happened to succeed.
             #
-            # A 4xx is deliberately NOT covered: invalid_grant means the refresh
-            # token is rejected for good, and serving a fresh cache as 'ok'
-            # would hide a slot that needs re-authentication.
+            # The verdict comes from Resolve-SlotAccessToken, which had the
+            # exception; see Test-IsTransportFailure for what it excludes.
             $fallback = Resolve-UsageFailureFallback -SlotPath $SlotPath -Reason 'network' `
                                                      -ErrorMessage $tok.Error -HttpStatus $tok.HttpStatus
             if ($fallback) { return $fallback }
         }
-        return $tok
+        # Token-shaped result, so it is translated rather than returned: the
+        # row shape is New-UsageResult's and carries no AccessToken field.
+        return New-UsageResult -Status $tok.Status -ErrorMessage $tok.Error -HttpStatus $tok.HttpStatus
     }
     $accessToken = $tok.AccessToken
 
@@ -2849,11 +3041,15 @@ function Get-SlotUsage {
         return Invoke-UsageRequest -SlotPath $SlotPath -Headers $headers
     }
     catch {
-        $status  = Get-ExceptionHttpStatus $_.Exception
-        $message = $_.Exception.Message
+        $ex      = $_.Exception
+        $status  = Get-ExceptionHttpStatus $ex
+        $message = $ex.Message
 
         if ($status -eq 401 -or $status -eq 403) {
-            return [pscustomobject]@{ Status = 'unauthorized' }
+            # No message: Format-UsageAdvisory prints the per-status remedy for
+            # a row that carries none, and "re-authenticate this account" is
+            # more use than the raw 401 sentence.
+            return New-UsageResult -Status 'unauthorized'
         }
 
         # Both arms below run the same Resolve-UsageFailureFallback ladder
@@ -2872,40 +3068,42 @@ function Get-SlotUsage {
             # pass after startup.
             Start-Sleep -Seconds 5
             try   { return Invoke-UsageRequest -SlotPath $SlotPath -Headers $headers }
-            catch { return [pscustomobject]@{ Status = 'rate-limited' } }
+            catch { return New-UsageResult -Status 'rate-limited' }
         }
 
-        # Network / timeout / 5xx / shape failure. Deliberately does NOT call
+        # Transport failure (no status, or a 5xx). Deliberately does NOT call
         # Set-SlotRateLimitBackoff: a timeout is not a throttle, and stamping
         # RateLimitedUntil here would make the next poll short-circuit to
         # 'rate-limited' for $Script:RateLimitBackoffSec and stop probing live
         # for a fault that may already be gone.
-        $fallback = Resolve-UsageFailureFallback -SlotPath $SlotPath -Reason 'network' `
-                                                -ErrorMessage $message -HttpStatus $status
-        if ($fallback) { return $fallback }
+        #
+        # Gated, unlike before: any other 4xx (the endpoint drift a Claude Code
+        # upgrade can cause) used to reach the cache and paint fresh-looking
+        # numbers under an 'ok' status for the whole TTL, which is the one
+        # failure the unofficial-constants comment says only a live read can
+        # catch.
+        if (Test-IsTransportFailure -HttpStatus $status -Exception $ex) {
+            $fallback = Resolve-UsageFailureFallback -SlotPath $SlotPath -Reason 'network' `
+                                                    -ErrorMessage $message -HttpStatus $status
+            if ($fallback) { return $fallback }
+        }
 
         # Nothing cached, which is the state of every slot on the first poll of
         # a watch, so this arm sets that poll's wall clock. Retry only when a
         # second immediate attempt can plausibly answer differently; no sleep,
         # because the first attempt already waited.
-        if (Test-IsRetriableUsageFailure -Exception $_.Exception -HttpStatus $status) {
+        if (Test-IsRetriableUsageFailure -Exception $ex -HttpStatus $status) {
             try {
                 return Invoke-UsageRequest -SlotPath $SlotPath -Headers $headers
             }
             catch {
-                return [pscustomobject]@{
-                    Status     = 'error'
-                    HttpStatus = Get-ExceptionHttpStatus $_.Exception
-                    Error      = $_.Exception.Message
-                }
+                return New-UsageResult -Status 'error' `
+                                       -HttpStatus (Get-ExceptionHttpStatus $_.Exception) `
+                                       -ErrorMessage $_.Exception.Message
             }
         }
 
-        return [pscustomobject]@{
-            Status     = 'error'
-            HttpStatus = $status
-            Error      = $message
-        }
+        return New-UsageResult -Status 'error' -HttpStatus $status -ErrorMessage $message
     }
 }
 
@@ -2931,27 +3129,42 @@ function Get-SlotUsage {
 #                 identically the second time.
 function Test-IsRetriableUsageFailure {
     Param (
-        $Exception,
+        [Parameter(Mandatory)] $Exception,
         [AllowNull()] $HttpStatus
     )
 
     if ($Exception -is [System.OperationCanceledException]) { return $false }
-    return (Test-IsTransportFailure -HttpStatus $HttpStatus)
+    return (Test-IsTransportFailure -HttpStatus $HttpStatus -Exception $Exception)
 }
 
 # True when a failed HTTP call says nothing about the request's merits: no
 # status at all (DNS, socket, the -TimeoutSec TaskCanceledException) or a 5xx.
 #
 # The distinction this draws is "retry / cached data may still be valid" versus
-# "the server rejected this request and will reject it again": a 4xx describes
-# the credential or the call, so neither a second attempt nor a stale reading
-# is defensible. Shared by the usage-endpoint retry gate and the token-endpoint
-# cache gate in Get-SlotUsage so the two cannot drift apart.
+# "the server rejected this request, or never made it, and the slot is not
+# fine": a 4xx describes the credential or the call, so neither a second
+# attempt nor a stale reading is defensible. Shared by every gate that has to
+# make that call so they cannot drift apart.
+#
+# -Exception is mandatory because a missing status alone does not mean
+# "transport". Update-SlotTokens throws plain PowerShell errors for a malformed
+# refresh response and for a failed credential write, and those carry no status
+# either; reading their absence as a blip served a dead slot from cache as
+# 'ok'. Only an exception the HTTP stack itself raised earns that reading:
+# HttpRequestException (which Microsoft.PowerShell.Commands.HttpResponseException
+# derives from) or the OperationCanceledException a -TimeoutSec cancellation
+# surfaces as.
 function Test-IsTransportFailure {
-    Param ([AllowNull()] $HttpStatus)
+    Param (
+        [AllowNull()] $HttpStatus,
+        [Parameter(Mandatory)] $Exception
+    )
 
-    if ($null -eq $HttpStatus) { return $true }
-    return ([int]$HttpStatus -ge 500)
+    if ($null -ne $HttpStatus) { return ([int]$HttpStatus -ge 500) }
+
+    return ($Exception -is [System.Net.Http.HttpRequestException] -or
+            $Exception -is [System.OperationCanceledException]    -or
+            $Exception -is [System.Net.WebException])
 }
 
 # One live GET against /api/oauth/usage: caches the body on success and returns
@@ -2979,7 +3192,7 @@ function Invoke-UsageRequest {
         Data      = $resp
         Timestamp = [DateTime]::UtcNow
     }
-    return [pscustomobject]@{ Status = 'ok'; Data = $resp }
+    return New-UsageResult -Status 'ok' -Data $resp
 }
 
 # Numeric HTTP status carried by a web exception, or $null when it has none.
@@ -3510,21 +3723,25 @@ function Get-AggregateBarColor {
 # Return:
 #   * Integer in [0, 100], rounded with [math]::Round, when at least one
 #     eligible row exists. Math: sum of per-row utilization (each clamped
-#     to [0,100], null/missing counted as 0) divided by cap = N*100,
-#     scaled to percent. Equivalently the mean utilization across all
-#     eligible rows.
+#     to [0,100]; null, missing, or already-reset counted as 0) divided by
+#     cap = N*100, scaled to percent. Equivalently the mean utilization
+#     across all eligible rows.
 #   * $null when zero eligible rows. Callers decide what to render for
 #     the empty case (Format-AggregateBars emits nothing; Format-WatchTitle
 #     collapses to bare suffix).
 function Get-PoolMeanUtilization {
     Param (
         [object[]] $Results,
-        [string]   $BucketKey
+        [string]   $BucketKey,
+        # Defaulted rather than threaded from the callers: both of them render,
+        # neither has a poll instant to share, and a bar whose reference time
+        # is the moment it is drawn is the honest one. Tests pass it explicitly.
+        [DateTimeOffset] $Now = [DateTimeOffset]::UtcNow
     )
 
     if (-not $Results) { return $null }
 
-    $eligible = @($Results | Where-Object { Test-RowCountsTowardPool -Row $_ })
+    $eligible = @($Results | Where-Object { Test-RowIsMeasurable -Row $_ })
     if ($eligible.Count -eq 0) { return $null }
 
     $n   = $eligible.Count
@@ -3532,13 +3749,15 @@ function Get-PoolMeanUtilization {
 
     $usedSum = 0.0
     foreach ($r in $eligible) {
-        if ($r.Data -and $r.Data.$BucketKey -and $null -ne $r.Data.$BucketKey.utilization) {
-            $u = [double]$r.Data.$BucketKey.utilization
-            if ($u -lt 0)   { $u = 0 }
-            if ($u -gt 100) { $u = 100 }
-            $usedSum += $u
-        }
-        # null / missing utilization -> 0 used.
+        # Same closed-window rule as Get-RowMaxUtilization: a bucket whose
+        # resets_at has passed counts 0. Without it a stale cache entry whose
+        # 5h window has rolled kept inflating the bars while rotation and
+        # keep-warm read the same bucket as free, which is the disagreement
+        # Test-RowIsMeasurable exists to prevent.
+        $u = Get-BucketUtilizationOrZero -Bucket $r.Data.$BucketKey -Now $Now
+        if ($u -lt 0)   { $u = 0 }
+        if ($u -gt 100) { $u = 100 }
+        $usedSum += $u
     }
 
     # usedSum is in [0, cap] by construction (each $u clamped to [0,100],
@@ -3546,23 +3765,32 @@ function Get-PoolMeanUtilization {
     return [int][math]::Round(($usedSum / $cap) * 100)
 }
 
-# Whether a snapshot row belongs in the pool-wide aggregate.
+# Whether a snapshot row carries percentages to render or judge.
 #
-# 'ok' OR any row carrying Data, not 'ok' alone. Since the cache-fallback
-# ladder landed, a non-ok row can carry last-known percentages: Format-UsageTable
-# already prints those numbers and Get-RowMaxUtilization already rotates on
-# them, so excluding the same row from the bars made the two bars disagree with
-# the table directly beneath them, and a pool whose reads had all gone stale
-# lost both bars entirely while every row still showed a percentage.
-#
-# 'ok' is kept as its own arm rather than collapsing to "has Data": an 'ok' row
-# whose response carried no buckets is a real 0%-utilized account and must stay
-# in the denominator, which is the behaviour the bar percentages were tuned
-# against.
-function Test-RowCountsTowardPool {
+# The one definition of "there are numbers here", shared by Format-UsageTable's
+# bucket cells and Get-RowMaxUtilization. Status answers a different question
+# ("may I switch INTO this slot"), which is why Get-AutoRotationDecision gates
+# peers on Status instead: since the cache-fallback ladder landed a non-ok row
+# can carry last-known percentages, and every consumer that re-derived this
+# from Status ended up contradicting the row printed next to it.
+function Test-RowHasUsableData {
     Param ([Parameter(Mandatory)] $Row)
 
-    return ($Row.Status -eq 'ok' -or [bool]$Row.Data)
+    return [bool]$Row.Data
+}
+
+# Whether a percentage can be assigned to the row at all. Used by the aggregate
+# bars and by the watch title, the two renderings that must agree.
+#
+# Usable data, OR 'ok' as its own arm: an 'ok' row whose response carried no
+# buckets is a real 0%-utilized account, not an unknown one. It stays in the
+# bars' denominator (the behaviour those percentages were tuned against) and it
+# keeps the title's '— | —', which says "active slot, cold" as opposed to the
+# bare suffix's "nothing to show".
+function Test-RowIsMeasurable {
+    Param ([Parameter(Mandatory)] $Row)
+
+    return ($Row.Status -eq 'ok' -or (Test-RowHasUsableData -Row $Row))
 }
 
 # Render aggregate progress bars showing pool-wide USAGE above the
@@ -3578,7 +3806,7 @@ function Test-RowCountsTowardPool {
 # 2 (indent) + 8 (label pad) + 1 ('[') + 1 (']') + 1 (space) + 4
 # ("NNN%"). Floor keeps narrow 1-slot tables visually meaningful.
 #
-# Slot inclusion rules (Test-RowCountsTowardPool):
+# Slot inclusion rules (Test-RowIsMeasurable):
 #   * Status='ok', or any row carrying Data from the cache fallback.
 #   * Buckets with null/missing utilization counted as 0% used.
 #
@@ -3607,7 +3835,7 @@ function Format-AggregateBars {
     # returns $null in that case; checking once up front (rather than
     # per-bucket) keeps the per-bucket loop branch-free. Same predicate as
     # that helper, so the skip decision and the math cannot disagree.
-    $eligible = @($Results | Where-Object { Test-RowCountsTowardPool -Row $_ })
+    $eligible = @($Results | Where-Object { Test-RowIsMeasurable -Row $_ })
     if ($eligible.Count -eq 0) { return }
 
     # Width derivation explained above. Floor 8 so 1-slot tables with
@@ -3702,7 +3930,7 @@ function Format-UsageTable {
         # keeps the row from looking like a dead/unused slot during a
         # transient throttle. Rows with no Data (expired / unauthorized /
         # error / no-oauth / no-cache rate-limited) keep the em-dash.
-        if ($r.Data) {
+        if (Test-RowHasUsableData -Row $r) {
             if ($r.Data.five_hour -and $null -ne $r.Data.five_hour.utilization) {
                 $fiveCell = Format-BucketCell $r.Data.five_hour.utilization $r.Data.five_hour.resets_at
             }
@@ -4197,15 +4425,26 @@ function Format-UsageAdvisory {
     # Messages are capped at 3, for the same reason Format-SlotNameList caps
     # names: under -Watch a wide failing pool would push the table off screen.
     # The cap costs detail, not coverage, because the condition lines above
-    # already name every affected slot.
+    # already name every affected slot. Hard failures take the cap first; see
+    # the IsCached sort key below.
     $messages = [System.Collections.Generic.List[pscustomobject]]::new()
     foreach ($row in $rows) {
         if (-not $row.Error) { continue }
         $tail = Format-StatusErrorTail -Message $row.Error
-        if ($tail) { $messages.Add([pscustomobject]@{ Name = $row.Name; Line = "[Usage] $($row.Name): $tail" }) }
+        if ($tail) {
+            $messages.Add([pscustomobject]@{
+                Name     = $row.Name
+                Line     = "[Usage] $($row.Name): $tail"
+                # Sort key, not display: a row still showing numbers is the
+                # least urgent thing here, and since a fresh cache fallback
+                # carries its reason too, unsorted it could take all three
+                # slots from rows that have nothing left to show.
+                IsCached = [bool]$row.IsCachedFallback
+            })
+        }
     }
     $reported = [System.Collections.Generic.HashSet[string]]::new()
-    foreach ($message in @($messages | Select-Object -First 3)) {
+    foreach ($message in @($messages | Sort-Object -Property IsCached -Stable | Select-Object -First 3)) {
         $lines.Add($message.Line)
         [void]$reported.Add($message.Name)
     }
@@ -4404,7 +4643,12 @@ function Format-WatchTitle {
         } else {
             $results | Where-Object { $_.IsActive } | Select-Object -First 1
         }
-        if (-not $row -or $row.Status -ne 'ok') { return $suffix }
+        # Same predicate as the bars above the table, so the two alarm-glance
+        # surfaces cannot disagree. On Status alone this blanked the title for a
+        # stale-cache active row that was still painting numbers one line below
+        # and still counting toward rotation, which removed the signal during
+        # exactly the transient failure the cache fallback exists to survive.
+        if (-not $row -or -not (Test-RowIsMeasurable -Row $row)) { return $suffix }
 
         $five  = if ($row.Data -and $row.Data.five_hour) { $row.Data.five_hour.utilization } else { $null }
         $seven = if ($row.Data -and $row.Data.seven_day) { $row.Data.seven_day.utilization } else { $null }
@@ -4810,7 +5054,7 @@ function Get-RowMaxUtilization {
         [Parameter(Mandatory)] [DateTimeOffset] $Now
     )
 
-    if (-not $Row.Data) { return 0.0 }
+    if (-not (Test-RowHasUsableData -Row $Row)) { return 0.0 }
 
     $five  = Get-BucketUtilizationOrZero -Bucket $Row.Data.five_hour -Now $Now
     $seven = Get-BucketUtilizationOrZero -Bucket $Row.Data.seven_day -Now $Now
@@ -4887,8 +5131,8 @@ function Format-AutoCooldownDelta {
 # -CurrentLatch carries the previous frame's latched string. Used for
 # two distinct cases:
 #   * Decision 'noop' AND no prior rotation event: preserves the
-#     initial '[Monitor] Automatic slot switching is enabled.' line (or
-#     whatever steady-state caller supplied).
+#     initial $Script:MonitorSteadyLatch line (or whatever steady-state
+#     caller supplied).
 #   * Decision 'noop' AFTER a prior rotation: the 'Rotated …' line
 #     stays latched. The user choice (this conversation) was that
 #     transition lines stay visible until the next state change, not
@@ -4896,6 +5140,14 @@ function Format-AutoCooldownDelta {
 #
 # All [Monitor] lines start with a capital letter per the user's locked
 # convention.
+
+# The two latched [Monitor] lines that describe a state rather than an event.
+# Constants because this function has to both write the paused line and
+# recognise it later: a latch is only safe to clear if the code clearing it
+# agrees, character for character, with the code that set it.
+$Script:MonitorSteadyLatch       = '[Monitor] Automatic slot switching is enabled.'
+$Script:MonitorPausedLatchPrefix = '[Monitor] Active slot usage unknown'
+
 function Invoke-AutoRotationStep {
     Param (
         [Parameter(Mandatory)] [pscustomobject] $Snapshot,
@@ -4907,11 +5159,19 @@ function Invoke-AutoRotationStep {
 
     switch ($decision.Action) {
         'noop' {
-            # No state change. Preserve whatever latch the caller had.
-            # On the very first tick that hits 'noop' the caller's
-            # initialiser ('[Monitor] Enabled') is preserved; after a
-            # prior 'rotate' the 'Rotated A -> B at HH:mm:ss' string
-            # stays latched until the next state change.
+            # No state change, so the caller's latch stands: on the first tick
+            # that is the initialiser, after a rotation it is the 'Rotated
+            # A -> B at HH:mm:ss' line, and transition lines stay visible until
+            # the next state change.
+            #
+            # One exception: a paused latch describes a state we are no longer
+            # in. Reaching 'noop' means the active slot was read and judged, so
+            # leaving "rotation paused" on screen would report a blind monitor
+            # that is in fact armed -- the same lie as the stale 'Rotated' line
+            # the paused arm was added to prevent, pointing the other way.
+            if ($CurrentLatch -and $CurrentLatch.StartsWith($Script:MonitorPausedLatchPrefix)) {
+                return $Script:MonitorSteadyLatch
+            }
             return $CurrentLatch
         }
 
@@ -4921,7 +5181,7 @@ function Invoke-AutoRotationStep {
             # healthy account). Must NOT fall through to $CurrentLatch: a
             # latched 'Rotated ...' line would leave a blind, inert monitor
             # looking like a working one.
-            return ('[Monitor] Active slot usage unknown ({0}); rotation paused.' -f $decision.ActiveStatus)
+            return ('{0} ({1}); rotation paused.' -f $Script:MonitorPausedLatchPrefix, $decision.ActiveStatus)
         }
 
         'rotate' {
@@ -5506,7 +5766,7 @@ function Invoke-UsageWatch {
         # appended (in DarkGray, like the [Watch] lines) to every frame
         # until the next state change. Initial value 'Enabled' shows the
         # mode is engaged before the first rotation event.
-        $lastAutoFooter = if ($Auto) { '[Monitor] Automatic slot switching is enabled.' } else { $null }
+        $lastAutoFooter = if ($Auto) { $Script:MonitorSteadyLatch } else { $null }
 
         # -Warmup footer-line latch + per-slot last-re-warm map. The latch
         # parallels $lastAutoFooter (steady-state line until a keep-warm
@@ -5827,8 +6087,8 @@ function Invoke-Main {
 
     # We are ensuring the credentials directory exists before
     # attempting any file operations within it.
-    if (-not $profileOnly -and -not (Test-Path -LiteralPath $CredDir)) {
-        New-Item -ItemType Directory -Path $CredDir -Force | Out-Null
+    if (-not $profileOnly) {
+        New-CredentialDirectory -Directory $CredDir
     }
 
     $previousRendering = $PSStyle.OutputRendering
@@ -5846,6 +6106,17 @@ function Invoke-Main {
         if (-not $Json) {
             $configAdvisory = Get-ConfigDirAdvisory
             if ($configAdvisory) { Write-Color $configAdvisory 'Yellow' }
+        }
+
+        # Heals files written by a pre-4.0.0 sca before any action reads or
+        # rewrites them. Runs regardless of -Json (the repair is the point, the
+        # line is not) and reports only when it actually changed something, so
+        # it stays silent forever after the first run.
+        if (-not $profileOnly) {
+            $tightened = Repair-CredentialFileModes
+            if ($tightened -gt 0 -and -not $Json) {
+                Write-Color "[Security] Tightened permissions to 0600 on $tightened credential file(s) written by an older version." 'Yellow'
+            }
         }
 
         switch ($Action) {

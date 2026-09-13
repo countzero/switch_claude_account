@@ -230,6 +230,166 @@ Describe 'switch_claude_account' {
             # removed on our behalf.
             Get-Content -LiteralPath $dest -Raw | Should -Be 'ORIGINAL'
         }
+
+        # The rename can fail on its own (a sharing violation that outlasts the
+        # retries) after the temp file was written. That temp holds a complete
+        # credential, so leaving it behind would be a readable copy nobody ever
+        # deletes. Windows-only for the same reason as the locked-destination
+        # test above: POSIX cannot make the rename fail this way.
+        It 'removes its own temp file when the rename fails' -Skip:(-not $IsWindows) {
+            $dest = Join-Path $script:SandboxCredDir 'rename-fails.json'
+            Set-Content -LiteralPath $dest -Value 'ORIGINAL' -NoNewline
+            Mock Start-Sleep -MockWith { }
+
+            $stream = [System.IO.File]::Open($dest, 'Open', 'Read', 'Read')
+            try {
+                { Set-CredentialFileAtomic -Path $dest -Bytes ([byte[]](78,69,87)) } | Should -Throw
+            }
+            finally { $stream.Dispose() }
+
+            @(Get-ChildItem -LiteralPath $script:SandboxCredDir -Filter 'rename-fails.json.sca-tmp.*' -Force).Count |
+                Should -Be 0
+        }
+    }
+
+    Context 'New-CredentialDirectory' {
+        It 'creates a missing directory' {
+            $dir = Join-Path $TestDrive 'made-here'
+            New-CredentialDirectory -Directory $dir
+            Test-Path -LiteralPath $dir | Should -BeTrue
+        }
+
+        # Slot FILENAMES carry the account's email address, so a 0755 directory
+        # leaks the account list even though every file inside it is 0600.
+        It 'creates it 0700 on Unix' -Skip:$IsWindows {
+            $dir = Join-Path $TestDrive 'made-private'
+            New-CredentialDirectory -Directory $dir
+
+            [System.IO.File]::GetUnixFileMode($dir) |
+                Should -Be ([System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute')
+        }
+
+        # Usually Claude Code's own ~/.claude. Re-permissioning another tool's
+        # directory is not this tool's call to make.
+        It 'leaves an existing directory and its mode alone' -Skip:$IsWindows {
+            $dir = Join-Path $TestDrive 'pre-existing'
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            [System.IO.File]::SetUnixFileMode($dir, 'UserRead, UserWrite, UserExecute, GroupRead, GroupExecute, OtherRead, OtherExecute')
+
+            New-CredentialDirectory -Directory $dir
+
+            [System.IO.File]::GetUnixFileMode($dir) |
+                Should -Be ([System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute, GroupRead, GroupExecute, OtherRead, OtherExecute')
+        }
+    }
+
+    Context 'Get-CredentialFilePaths' {
+        # "What did sca write here", as opposed to Get-CredentialSlotFiles'
+        # "what is a slot": the sidecars, the active credentials file and the
+        # state file all carry the same secrecy requirement as a slot.
+        It 'returns every credential-shaped file, sidecars included' {
+            $slot = New-SlotPair -CredDir $script:SandboxCredDir -Name 'one' -Email 'o@x.io' -Content 'S'
+            $cred = Join-Path $script:SandboxCredDir '.credentials.json'
+            Set-Content -LiteralPath $cred -Value 'C' -NoNewline
+            Set-Content -LiteralPath (Join-Path $script:SandboxCredDir '.sca-state.json') -Value '{}' -NoNewline
+
+            $paths = @(Get-CredentialFilePaths -Directory $script:SandboxCredDir -ClaudeJson $null)
+
+            $paths.Count | Should -Be 4
+            $paths       | Should -Contain $slot
+            $paths       | Should -Contain ($slot -replace '\.json$', '.account.json')
+            $paths       | Should -Contain $cred
+        }
+
+        It 'includes ~/.claude.json when it exists' {
+            $claudeJson = Join-Path $script:SandboxHome '.claude.json'
+            Set-Content -LiteralPath $claudeJson -Value '{}' -NoNewline
+
+            Get-CredentialFilePaths -Directory $script:SandboxCredDir -ClaudeJson $claudeJson |
+                Should -Contain $claudeJson
+        }
+
+        It 'skips paths that do not exist' {
+            Get-CredentialFilePaths -Directory $script:SandboxCredDir -ClaudeJson (Join-Path $TestDrive 'absent.json') |
+                Should -BeNullOrEmpty
+        }
+
+        It 'returns nothing for a missing or blank directory' {
+            @(Get-CredentialFilePaths -Directory (Join-Path $TestDrive 'gone') -ClaudeJson $null).Count | Should -Be 0
+            @(Get-CredentialFilePaths -Directory '' -ClaudeJson $null).Count | Should -Be 0
+        }
+    }
+
+    Context 'Test-UnixModeIsShared' {
+        It 'is false for an owner-only mode' {
+            Test-UnixModeIsShared -Mode ([System.IO.UnixFileMode]'UserRead, UserWrite') | Should -BeFalse
+        }
+
+        It 'is false for no mode at all' {
+            Test-UnixModeIsShared -Mode ([System.IO.UnixFileMode]::None) | Should -BeFalse
+        }
+
+        It 'is true for <Case>' -ForEach @(
+            @{ Case = '0644'; Mode = 'UserRead, UserWrite, GroupRead, OtherRead' }
+            @{ Case = '0640'; Mode = 'UserRead, UserWrite, GroupRead' }
+            @{ Case = '0604'; Mode = 'UserRead, UserWrite, OtherRead' }
+            @{ Case = '0660'; Mode = 'UserRead, UserWrite, GroupRead, GroupWrite' }
+        ) {
+            Test-UnixModeIsShared -Mode ([System.IO.UnixFileMode]$Mode) | Should -BeTrue
+        }
+    }
+
+    Context 'Repair-CredentialFileModes' {
+        # Write-PrivateFileBytes fixes what this version writes. It cannot fix
+        # the installed base: before 4.0.0 every atomic write handed the
+        # destination the temp file's umask-default 0644, and `sca switch`
+        # rewrites only .credentials.json, so upgrading healed exactly one file
+        # while the release notes said the hole was closed.
+
+        It 'is a no-op on Windows' -Skip:(-not $IsWindows) {
+            Repair-CredentialFileModes -Directory $script:SandboxCredDir | Should -Be 0
+        }
+
+        It 'tightens every credential-shaped file an older version left readable' -Skip:$IsWindows {
+            $loose = 'UserRead, UserWrite, GroupRead, OtherRead'
+            $slot  = New-SlotPair -CredDir $script:SandboxCredDir -Name 'old' -Email 'o@x.io' -Content 'S'
+            $side  = $slot -replace '\.json$', '.account.json'
+            $cred  = Join-Path $script:SandboxCredDir '.credentials.json'
+            $state = Join-Path $script:SandboxCredDir '.sca-state.json'
+            Set-Content -LiteralPath $cred  -Value 'C' -NoNewline
+            Set-Content -LiteralPath $state -Value '{}' -NoNewline
+            foreach ($p in @($slot, $side, $cred, $state)) { [System.IO.File]::SetUnixFileMode($p, $loose) }
+
+            Repair-CredentialFileModes -Directory $script:SandboxCredDir -ClaudeJson $null | Should -Be 4
+
+            foreach ($p in @($slot, $side, $cred, $state)) {
+                [System.IO.File]::GetUnixFileMode($p) |
+                    Should -Be ([System.IO.UnixFileMode]'UserRead, UserWrite')
+            }
+        }
+
+        It 'reports nothing to do when every file is already owner-only' -Skip:$IsWindows {
+            New-SlotPair -CredDir $script:SandboxCredDir -Name 'tight' -Content 'S' | Out-Null
+            Get-ChildItem -LiteralPath $script:SandboxCredDir -Force |
+                ForEach-Object { [System.IO.File]::SetUnixFileMode($_.FullName, 'UserRead, UserWrite') }
+
+            Repair-CredentialFileModes -Directory $script:SandboxCredDir -ClaudeJson $null | Should -Be 0
+        }
+
+        It 'tightens ~/.claude.json, which sca also writes' -Skip:$IsWindows {
+            $claudeJson = Join-Path $script:SandboxHome '.claude.json'
+            Set-Content -LiteralPath $claudeJson -Value '{}' -NoNewline
+            [System.IO.File]::SetUnixFileMode($claudeJson, 'UserRead, UserWrite, GroupRead, OtherRead')
+
+            Repair-CredentialFileModes -Directory $script:SandboxCredDir -ClaudeJson $claudeJson | Should -Be 1
+
+            [System.IO.File]::GetUnixFileMode($claudeJson) |
+                Should -Be ([System.IO.UnixFileMode]'UserRead, UserWrite')
+        }
+
+        It 'returns 0 for a directory that does not exist' -Skip:$IsWindows {
+            Repair-CredentialFileModes -Directory (Join-Path $TestDrive 'nope') -ClaudeJson $null | Should -Be 0
+        }
     }
 
     Context 'Write-ScaState' {

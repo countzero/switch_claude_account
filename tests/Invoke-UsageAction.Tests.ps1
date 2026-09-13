@@ -394,6 +394,28 @@ Describe 'switch_claude_account' {
             $parsed.'slot-1'.data.five_hour.utilization | Should -Be 1
         }
 
+        # A cached row keeps its live-quality 'ok' for every consumer that gates
+        # on status, and still reports what the failed live read said, so a
+        # script can tell a cached reading from a live one and say why.
+        It '-Json reports the failure reason on a cached ok row' {
+            $slotPath = New-Slot -Name 'blip' -ExpiresAt $script:PastMs
+
+            $Script:SlotUsageCache[$slotPath] = @{
+                Data      = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 3.0; resets_at = (Format-IsoReset ([TimeSpan]::FromHours(1))) }
+                }
+                Timestamp = [DateTime]::UtcNow
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                throw [System.Net.Http.HttpRequestException]::new('No such host is known.')
+            }
+
+            $parsed = Invoke-UsageAction -Json | ConvertFrom-Json
+            $parsed.blip.status             | Should -Be 'ok'
+            $parsed.blip.is_cached_fallback | Should -Be $true
+            $parsed.blip.error              | Should -Match 'No such host'
+        }
+
         It '-Json omits is_cached_fallback for fresh live responses' {
             New-Slot -Name 'fresh' | Out-Null
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
@@ -1455,6 +1477,51 @@ Describe 'switch_claude_account' {
             )
             Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 20
         }
+
+        # A cached row has no upper age bound once it goes stale, so its 5h
+        # window can roll while it is still on screen. Rotation and keep-warm
+        # read such a bucket as 0 via Get-BucketUtilizationOrZero; the bars have
+        # to agree, or they contradict the rotation decision taken beneath them.
+        It 'counts a bucket whose window has already reset as 0' {
+            $past   = [DateTimeOffset]::UtcNow.AddHours(-1)
+            $future = [DateTimeOffset]::UtcNow.AddHours(2)
+            $rows = @(
+                [pscustomobject]@{
+                    Name = 'rolled'; IsActive = $false; Status = 'error'; Error = $null; Email = $null
+                    IsCachedFallback = $true
+                    Data = [pscustomobject]@{
+                        five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $past.ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                        seven_day = $null
+                    }
+                }
+                [pscustomobject]@{
+                    Name = 'live'; IsActive = $true; Status = 'ok'; Error = $null; Email = $null
+                    IsCachedFallback = $false
+                    Data = [pscustomobject]@{
+                        five_hour = [pscustomobject]@{ utilization = 40.0; resets_at = $future.ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                        seven_day = $null
+                    }
+                }
+            )
+
+            # (0 + 40) / 2 = 20, not (100 + 40) / 2 = 70.
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 20
+        }
+
+        It 'still counts a bucket whose window has not reset yet' {
+            $future = [DateTimeOffset]::UtcNow.AddHours(2)
+            $rows = @(
+                [pscustomobject]@{
+                    Name = 'hot'; IsActive = $true; Status = 'ok'; Error = $null; Email = $null
+                    IsCachedFallback = $false
+                    Data = [pscustomobject]@{
+                        five_hour = [pscustomobject]@{ utilization = 90.0; resets_at = $future.ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                        seven_day = $null
+                    }
+                }
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 90
+        }
     }
 
     Context 'Get-AggregateBarColor' {
@@ -2196,6 +2263,52 @@ Describe 'switch_claude_account' {
             Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
         }
 
+        # The failure AGENTS.md names as the one thing only a live `sca usage`
+        # can catch: the endpoint drifts after a Claude Code upgrade and starts
+        # answering 4xx. Served from cache it renders as 'ok' with
+        # fresh-looking numbers for the whole TTL, under -Watch and monitor
+        # alike, which is exactly the report that would not reach the user.
+        It 'does NOT serve a fresh cache after a non-retriable 4xx' {
+            $slot = New-TimeoutSlot 'drift404'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 21.0; resets_at = $null } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw (New-CodedWebException -StatusCode 404)
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+
+            $r.Status           | Should -Be 'error'
+            $r.HttpStatus       | Should -Be 404
+            $r.IsCachedFallback | Should -BeFalse
+            $r.Data             | Should -BeNullOrEmpty
+        }
+
+        # The other side of the same gate: a 5xx says nothing about the request,
+        # so the cached reading is still the best answer available.
+        It 'still serves a fresh cache after a 5xx' {
+            $slot = New-TimeoutSlot 'overloaded529'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 21.0; resets_at = $null } }
+                Timestamp = [DateTime]::UtcNow
+            }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
+                throw (New-CodedWebException -StatusCode 529)
+            }
+
+            $r = Get-SlotUsage -SlotPath $slot
+
+            $r.Status                     | Should -Be 'ok'
+            $r.IsCachedFallback           | Should -BeTrue
+            $r.Data.five_hour.utilization | Should -Be 21.0
+            # The reason survives onto the fresh row so the advisory can say
+            # why the numbers are not live.
+            $r.Error                      | Should -Match '529'
+            $r.HttpStatus                 | Should -Be 529
+        }
+
         # A timeout is not a throttle. Stamping RateLimitedUntil would make the
         # next poll short-circuit to 'rate-limited' for RateLimitBackoffSec and
         # stop probing live for a fault that may already be gone.
@@ -2493,7 +2606,7 @@ Describe 'switch_claude_account' {
             (Get-CachedUsageOrNull -SlotPath $slot -AllowStale -Reason 'network').Status   | Should -Be 'error'
         }
 
-        It 'stamps ErrorMessage / HttpStatus on the stale result only' {
+        It 'stamps ErrorMessage / HttpStatus on both the stale and the fresh result' {
             $slot = 'reason/stamp.json'
             $Script:SlotUsageCache[$slot] = @{
                 Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 5.0 } }
@@ -2503,11 +2616,15 @@ Describe 'switch_claude_account' {
             $r.Error      | Should -Be 'boom'
             $r.HttpStatus | Should -Be 503
 
-            # Fresh rows are live-quality; there is nothing to report on them.
+            # A fresh row keeps its live-quality 'ok', but the reason the live
+            # read failed survives: without it, the commonest transient failure
+            # of all (a cache under the TTL) produced "showing last known
+            # usage" with nothing anywhere saying why.
             $Script:SlotUsageCache[$slot].Timestamp = [DateTime]::UtcNow
             $fresh = Get-CachedUsageOrNull -SlotPath $slot -Reason 'network' -ErrorMessage 'boom' -HttpStatus 503
-            $fresh.Error      | Should -BeNullOrEmpty
-            $fresh.HttpStatus | Should -BeNullOrEmpty
+            $fresh.Status     | Should -Be 'ok'
+            $fresh.Error      | Should -Be 'boom'
+            $fresh.HttpStatus | Should -Be 503
         }
 
         It 'rejects an unknown -Reason at bind time' {
@@ -2531,8 +2648,9 @@ Describe 'switch_claude_account' {
             }
             $r = Resolve-UsageFailureFallback -SlotPath $slot -Reason 'network' -ErrorMessage 'boom'
             $r.Status | Should -Be 'ok'
-            # No error is attached to a live-quality row.
-            $r.Error  | Should -BeNullOrEmpty
+            # 'ok' for every consumer that gates on Status, but the reason
+            # rides along for the advisory and the -Json row.
+            $r.Error  | Should -Be 'boom'
         }
 
         It 'falls through to the stale entry, carrying the reason and message' {
@@ -2593,15 +2711,38 @@ Describe 'switch_claude_account' {
     Context 'Test-IsTransportFailure' {
         # Shared by the usage-endpoint retry gate and the token-endpoint cache
         # gate, so "the server rejected this request" has one definition.
-        It 'treats a codeless failure as transport' {
-            Test-IsTransportFailure -HttpStatus $null | Should -BeTrue
+        It 'treats a codeless HTTP failure as transport' {
+            $ex = [System.Net.Http.HttpRequestException]::new('No such host is known.')
+            Test-IsTransportFailure -HttpStatus $null -Exception $ex | Should -BeTrue
         }
 
-        It 'treats a 5xx as transport: <Case>' -ForEach @(
+        It 'treats a timeout cancellation as transport' {
+            $ex = [System.Threading.Tasks.TaskCanceledException]::new('timeout')
+            Test-IsTransportFailure -HttpStatus $null -Exception $ex | Should -BeTrue
+        }
+
+        # The missing status is what made this necessary: Update-SlotTokens
+        # throws plain PowerShell errors for a refresh response missing
+        # access_token / expires_in and for a failed credential write, and none
+        # of them carry one. Read as transport, those served a dead slot from
+        # cache under a healthy 'ok'; the write failure is the worst of the
+        # three, because the server has already rotated the refresh token away.
+        It 'treats a non-HTTP exception with no status as a hard failure' {
+            $ex = [System.Management.Automation.RuntimeException]::new('OAuth refresh succeeded but response missing access_token.')
+            Test-IsTransportFailure -HttpStatus $null -Exception $ex | Should -BeFalse
+        }
+
+        It 'treats an IO failure with no status as a hard failure' {
+            $ex = [System.IO.IOException]::new('The process cannot access the file.')
+            Test-IsTransportFailure -HttpStatus $null -Exception $ex | Should -BeFalse
+        }
+
+        It 'treats a 5xx as transport whatever the exception type: <Case>' -ForEach @(
             @{ Case = '500'; Status = 500 }
             @{ Case = '529'; Status = 529 }
         ) {
-            Test-IsTransportFailure -HttpStatus $Status | Should -BeTrue
+            $ex = [System.Exception]::new('server side')
+            Test-IsTransportFailure -HttpStatus $Status -Exception $ex | Should -BeTrue
         }
 
         It 'treats a 4xx as a rejection, not transport: <Case>' -ForEach @(
@@ -2609,7 +2750,8 @@ Describe 'switch_claude_account' {
             @{ Case = '401'; Status = 401 }
             @{ Case = '429'; Status = 429 }
         ) {
-            Test-IsTransportFailure -HttpStatus $Status | Should -BeFalse
+            $ex = [System.Net.Http.HttpRequestException]::new('request side')
+            Test-IsTransportFailure -HttpStatus $Status -Exception $ex | Should -BeFalse
         }
     }
 
@@ -2682,7 +2824,43 @@ Describe 'switch_claude_account' {
             $r = Get-SlotUsage -SlotPath $script:TokSlot 6>$null
 
             $r.Status           | Should -Be 'expired'
-            $r.IsCachedFallback | Should -BeNullOrEmpty
+            $r.IsCachedFallback | Should -BeFalse
+            $r.Data             | Should -BeNullOrEmpty
+        }
+
+        # Update-SlotTokens also throws for a refresh response it cannot use and
+        # for a slot-file write that fails after the server rotated the token.
+        # Neither carries an HTTP status, and both used to be read as a
+        # transport blip and served from a fresh cache as a healthy 'ok'.
+        It 'reports expired when the refresh response is unusable: <Case>' -ForEach @(
+            @{ Case = 'no access_token'; Body = @{ expires_in = 3600 } }
+            @{ Case = 'no expires_in';   Body = @{ access_token = 'AT' } }
+        ) {
+            $payload = $Body
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]$payload
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:TokSlot 6>$null
+
+            $r.Status           | Should -Be 'expired'
+            $r.IsCachedFallback | Should -BeFalse
+            $r.Data             | Should -BeNullOrEmpty
+        }
+
+        It 'reports expired when the rotated tokens cannot be written back to the slot' {
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]@{ access_token = 'AT'; refresh_token = 'RT'; expires_in = 3600 }
+            }
+            Mock Set-CredentialFileAtomic -MockWith { throw 'disk full' }
+
+            $r = Get-SlotUsage -SlotPath $script:TokSlot 6>$null
+
+            # The refresh token the server rotated to is gone, so this slot is
+            # dead until the user re-authenticates. Reporting 'ok' off the cache
+            # would also keep it a valid auto-rotation destination.
+            $r.Status           | Should -Be 'expired'
+            $r.IsCachedFallback | Should -BeFalse
             $r.Data             | Should -BeNullOrEmpty
         }
     }

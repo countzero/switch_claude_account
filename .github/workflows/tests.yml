@@ -63,7 +63,11 @@ jobs:
         if: matrix.os == 'macos-latest' && github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: |
+          # The step's only value is that its verdict can be trusted, so every
+          # way of scanning nothing has to fail as itself rather than as
+          # "the marker is missing".
           npm install -g @anthropic-ai/claude-code 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "npm install failed with exit code $LASTEXITCODE; nothing was scanned." }
           $root = Join-Path (npm root -g) '@anthropic-ai/claude-code'
           # Both shapes the package has shipped: a cli.js bundle and a
           # Bun-compiled binary with the JS embedded. Anything over 1 MB is a
@@ -71,6 +75,7 @@ jobs:
           $blobs = @(Get-ChildItem -LiteralPath $root -Recurse -File |
               Where-Object { $_.Length -gt 1MB })
           "Scanning $($blobs.Count) file(s) under $root"
+          if ($blobs.Count -eq 0) { throw "No file over 1MB under $root. The package layout changed, so the marker scan below would prove nothing." }
           $markers = 'name:"plaintext"', 'windows-credman', 'tengu_windows_credman',
                      'find-generic-password', 'Claude Code-device-keys'
           $seen = @{}

@@ -511,6 +511,19 @@ Describe 'switch_claude_account' {
             $out | Should -Not -Be $prev
         }
 
+        # The mirror image, and the reason 'noop' cannot simply pass the latch
+        # through: once the read recovers, a latched "rotation paused" line
+        # reports a blind monitor that is in fact armed, for the rest of the
+        # watch or until an event that may never come.
+        It 'on noop clears a latched rotation-paused line' {
+            Mock Get-AutoRotationDecision { return [pscustomobject]@{ Action = 'noop' } }
+            $paused = '[Monitor] Active slot usage unknown (error); rotation paused.'
+
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 95 -CurrentLatch $paused
+
+            $out | Should -Be '[Monitor] Automatic slot switching is enabled.'
+        }
+
         It 'on active-unknown does not swap' {
             Mock Get-AutoRotationDecision { return [pscustomobject]@{
                 Action       = 'active-unknown'

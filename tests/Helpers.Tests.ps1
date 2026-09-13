@@ -490,16 +490,16 @@ Describe 'switch_claude_account' {
                 Should -Be 'Switch Claude Account'
         }
 
-        It 'returns bare suffix when all rows are HTTP-failure (active row included)' {
+        It 'returns bare suffix when all rows are HTTP-failure with no data (active row included)' {
             $snap = New-FakeSnapshot -Rows @(
-                @{ Name = 'a'; Status = 'expired'; FiveUtil = 10; SevenUtil = 10; IsActive = $true }
-                @{ Name = 'b'; Status = 'error';   FiveUtil = 20; SevenUtil = 20 }
+                @{ Name = 'a'; Status = 'expired'; IsActive = $true }
+                @{ Name = 'b'; Status = 'error'   }
             )
             Format-WatchTitle -Name '' -Snapshot $snap |
                 Should -Be 'Switch Claude Account'
         }
 
-        It 'returns bare suffix when active row Status is <Status>' -ForEach @(
+        It 'returns bare suffix when the active row is <Status> with no data' -ForEach @(
             @{ Status = 'expired'      }
             @{ Status = 'unauthorized' }
             @{ Status = 'error'        }
@@ -507,15 +507,39 @@ Describe 'switch_claude_account' {
             @{ Status = 'rate-limited' }
         ) {
             $snap = New-FakeSnapshot -Rows @(
-                @{ Name = 'a'; Status = $Status; FiveUtil = 50; SevenUtil = 50; IsActive = $true }
+                @{ Name = 'a'; Status = $Status; IsActive = $true }
             )
             Format-WatchTitle -Name '' -Snapshot $snap |
                 Should -Be 'Switch Claude Account'
         }
 
-        It 'returns bare suffix when -Name matches but row is not ok' {
+        # The title is judged on the same predicate as the aggregate bars
+        # (Test-RowIsMeasurable), not on Status: a row served from the cache
+        # fallback paints numbers in the table and still counts toward
+        # rotation, so blanking the title for it dropped the alarm signal
+        # during exactly the failure the fallback exists to survive.
+        It 'renders the numbers of a non-ok active row that carries data: <Status>' -ForEach @(
+            @{ Status = 'rate-limited' }
+            @{ Status = 'error'        }
+        ) {
             $snap = New-FakeSnapshot -Rows @(
-                @{ Name = 'a'; Status = 'expired'; FiveUtil = 50; SevenUtil = 50 }
+                @{ Name = 'a'; Status = $Status; FiveUtil = 50; SevenUtil = 50; IsActive = $true }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '50% | 50% | Switch Claude Account'
+        }
+
+        It 'still fires the alarm prefix for a cached at-limit active row' {
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; Status = 'error'; FiveUtil = 100; SevenUtil = 20; IsActive = $true }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap |
+                Should -Be '[!] 100% | 20% | Switch Claude Account'
+        }
+
+        It 'returns bare suffix when -Name matches a row that is not ok and has no data' {
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; Status = 'expired' }
             )
             Format-WatchTitle -Name 'a' -Snapshot $snap |
                 Should -Be 'Switch Claude Account'
@@ -1723,6 +1747,41 @@ Describe 'switch_claude_account' {
             $lines[0] | Should -Match "and 2 more"
         }
 
+        # The fresh-cache path is the commonest transient failure there is (a
+        # cache under the TTL), and it used to arrive with its message stripped:
+        # the frame said "showing last known usage" and nothing anywhere said
+        # why, on the one row still painting numbers.
+        It 'explains a fresh cache fallback, which keeps its ok status' {
+            $row = New-RlRow -Name 'blip' -Status 'ok' -Cached $true -Reason 'network'
+            $row.Error = 'The operation has timed out.'
+            $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results @($row))) -split "`n")
+
+            $lines.Count | Should -Be 2
+            $lines[0]    | Should -Be "[Usage] 'blip' could not be read live; showing last known usage."
+            $lines[1]    | Should -Be '[Usage] blip: The operation has timed out.'
+        }
+
+        # Cached rows still have their numbers on screen, so they are the least
+        # urgent thing in the block. Unsorted they could take the whole cap from
+        # rows that have nothing left to show.
+        It 'gives the 3-message cap to hard failures before cache fallbacks' {
+            $rows = @()
+            foreach ($n in @('cached-1', 'cached-2', 'cached-3')) {
+                $r = New-RlRow -Name $n -Status 'ok' -Cached $true -Reason 'network'
+                $r.Error = "blip $n"
+                $rows += $r
+            }
+            foreach ($n in @('dead-1', 'dead-2')) {
+                $r = New-RlRow -Name $n -Status 'error'
+                $r.Error = "boom $n"
+                $rows += $r
+            }
+            $lines = @((Format-UsageAdvisory -Snapshot (New-RlSnapshot -Results $rows)) -split "`n")
+
+            @($lines | Where-Object { $_ -match 'boom ' }).Count | Should -Be 2
+            @($lines | Where-Object { $_ -match 'blip ' }).Count | Should -Be 1
+        }
+
         It 'reports both the transport errors and the grouped remedy' {
             # A row-ordered shared cap emitted three 'no-oauth' notices (a
             # permanent config fact) and dropped both transport errors.
@@ -2284,6 +2343,74 @@ Describe 'switch_claude_account' {
         It 'returns nothing for a directory that does not exist' {
             @(Get-CredentialSlotFiles -Directory (Join-Path $TestDrive 'no-such-dir')).Count |
                 Should -Be 0
+        }
+    }
+
+    Context 'Resolve-ScaConfigDir' {
+        # A relative CLAUDE_CONFIG_DIR has to be bound to a base exactly once.
+        # PowerShell's provider cmdlets resolve against $PWD while the script's
+        # .NET calls resolve against [Environment]::CurrentDirectory, which
+        # PowerShell never syncs to Set-Location, so an unbound relative value
+        # made `sca save` enumerate one directory and write into another.
+
+        It 'returns null for an unset value' {
+            Resolve-ScaConfigDir -Value $null | Should -BeNullOrEmpty
+        }
+
+        It 'returns null for a blank value' {
+            Resolve-ScaConfigDir -Value '   ' | Should -BeNullOrEmpty
+        }
+
+        It 'binds a relative value to the base directory' {
+            $base = Join-Path $TestDrive 'base'
+            Resolve-ScaConfigDir -Value 'claude-cfg' -BaseDir $base |
+                Should -Be (Join-Path $base 'claude-cfg')
+        }
+
+        It 'resolves a relative segment against the base' {
+            $base = Join-Path $TestDrive 'base'
+            Resolve-ScaConfigDir -Value (Join-Path 'sub' (Join-Path '..' 'cfg')) -BaseDir $base |
+                Should -Be (Join-Path $base 'cfg')
+        }
+
+        It 'leaves an absolute value rooted where it was' {
+            $abs = Join-Path $TestDrive 'absolute-cfg'
+            Resolve-ScaConfigDir -Value $abs -BaseDir (Join-Path $TestDrive 'elsewhere') |
+                Should -Be $abs
+        }
+
+        # Claude Code treats a leading ~ as a literal cwd-relative directory
+        # (anthropics/claude-code#78988), so expanding it here would aim sca at
+        # a different directory than the process it mirrors.
+        It 'does not expand a leading tilde' {
+            $base = Join-Path $TestDrive 'base'
+            Resolve-ScaConfigDir -Value (Join-Path '~' 'cfg') -BaseDir $base |
+                Should -Be (Join-Path $base (Join-Path '~' 'cfg'))
+        }
+
+        It 'hands an unusable value back verbatim rather than throwing at load time' {
+            # A base that is not rooted makes GetFullPath throw; `sca help` and
+            # `sca -Version` still have to work so they can say what is wrong.
+            Resolve-ScaConfigDir -Value 'cfg' -BaseDir 'not-a-rooted-base' | Should -Be 'cfg'
+        }
+
+        # End to end: the script's own load-time binding, from the environment
+        # variable through to every derived path.
+        It 'leaves no relative path in $CredDir when the variable is relative' {
+            $env:CLAUDE_CONFIG_DIR = 'rel-cfg'
+            Push-Location -LiteralPath $TestDrive
+            try {
+                . $script:ScriptPath
+                $expected = Join-Path $TestDrive 'rel-cfg'
+                $CredDir        | Should -Be $expected
+                $CredFile       | Should -Be (Join-Path $expected '.credentials.json')
+                $StateFile      | Should -Be (Join-Path $expected '.sca-state.json')
+                $ClaudeJsonPath | Should -Be (Join-Path $expected '.claude.json')
+            }
+            finally {
+                Pop-Location
+                $env:CLAUDE_CONFIG_DIR = $null
+            }
         }
     }
 
