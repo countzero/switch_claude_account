@@ -4,8 +4,9 @@ This file is the canonical agent-instructions source for this repository, read n
 
 ## Editing this file
 
-- Hard ceiling: 150 lines. Cut content to stay under it; do not join lines to game the count.
+- Hard ceiling: 18,500 bytes, about 4,600 tokens, measured with `(Get-Item AGENTS.md).Length`. Cut content to stay under it. Bytes rather than lines because the lines here run past 300 characters, so a line count measures nothing and a long paragraph joined onto one line reads as a saving.
 - This file is for **orientation and repo-global rules only**. How a function works belongs in a comment on that function, never here: a second copy in a separate file drifts silently, and this repo has already shipped documentation describing behaviour the code never had.
+- A rule whose full form lives under `docs/` appears here only as a pointer, written `` `docs/<file>.md` → *Section* ``, or as the file alone when the whole document is that rule. A pointed-at heading is an interface: renaming one means re-pointing its callers.
 - Describe the **current** shape only. Rationale, design history, and "why not the alternative" prose belong in commit messages.
 - When you remove a design from the code, remove its references here too.
 
@@ -127,6 +128,7 @@ When your changes overlap foreign WIP in the same file, stop and ask. Do not res
 - Changelog follows [Common Changelog](https://common-changelog.org).
 - LF line endings enforced via `.gitattributes`.
 - No `Co-Authored-By` trailer in commit messages.
+- A pull request body is English and answers **what** changed and **why**, names the **shortcomings** of the approach, says **which feedback** you want, and lists **what is not done**. A link supplements it and never carries it. A release groups its account by version, newest first. `docs/pull_requests.md`.
 
 ## Skills
 
