@@ -1561,7 +1561,7 @@ Describe 'switch_claude_account' {
                 Should -Be "[Usage] 'cached' is currently rate-limited by Anthropic; showing last known usage."
         }
 
-        # 3.1.0: the cache branch used to win outright, so a hard failure could
+        # The cache branch used to win outright, so a hard failure could
         # hide behind a "showing last known usage" note. Both conditions now get
         # their own line and no row is named twice.
         It 'emits one line per condition instead of letting the cache branch win' {

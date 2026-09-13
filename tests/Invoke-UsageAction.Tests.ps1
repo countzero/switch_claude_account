@@ -2045,7 +2045,7 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Get-SlotUsage (network / timeout resilience)' {
-        # 3.1.0. A codeless transport failure (the HttpClient.Timeout case)
+        # A codeless transport failure (the HttpClient.Timeout case)
         # used to return Status='error' immediately, discarding a perfectly
         # good cached reading and wiping the row's numbers for a whole poll
         # interval. It now runs the same fallback ladder as the 429 arm.
@@ -3328,7 +3328,7 @@ Describe 'switch_claude_account' {
             Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeFalse
         }
 
-        # 3.1.0: warming opens the 5h window, so a slot whose window is already
+        # Warming opens the 5h window, so a slot whose window is already
         # open and full has nothing to gain from a billable `claude -p`. The
         # at-limit check runs first so it also gates the rate-limited branch,
         # which is where an exhausted slot usually surfaces.

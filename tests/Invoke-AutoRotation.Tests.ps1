@@ -67,7 +67,7 @@ Describe 'switch_claude_account' {
             Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 0.0
         }
 
-        # Behaviour change in 3.1.0. This used to return 0 for ANY non-ok row
+        # This used to return 0 for ANY non-ok row
         # even when Data was present, which meant a single usage-endpoint
         # timeout on the active slot made it look 0%-utilized and silently
         # disarmed auto-rotation. Format-UsageTable already renders bucket
@@ -409,7 +409,7 @@ Describe 'switch_claude_account' {
             $d.SuggestionName | Should -Be 'only'
         }
 
-        # 3.1.0: a data-less non-ok active row used to fall into the
+        # A data-less non-ok active row used to fall into the
         # below-threshold 'noop' branch, which preserved the previous latch and
         # left the monitor silently unable to rotate for as long as the failure
         # lasted. It now reports instead.
