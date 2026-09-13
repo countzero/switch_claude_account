@@ -54,6 +54,35 @@ Describe 'switch_claude_account' {
             $content | Should -Match "existing'\r?\n\r?\n# === Switch Claude Account ==="
         }
 
+        It 'install terminates the block with the platform newline' {
+            # Add-To-Profile joins on [Environment]::NewLine so it does not
+            # inject CRLF into an otherwise-LF profile. Every other assertion
+            # in this file is terminator-agnostic (Should -Match uses \r?\n,
+            # and the byte round-trips pass under either terminator because
+            # Remove-From-Profile splices on \r?\n), and the coverage gate runs
+            # on Windows only, where the change is indistinguishable from the
+            # hardcoded `r`n it replaced. Pin it explicitly or Unix regresses
+            # silently.
+            Add-To-Profile 6>$null
+
+            $content = Get-Content -LiteralPath $script:FakeProfilePath -Raw
+            $expected = @(
+                '# === Switch Claude Account ===',
+                "function switch_claude_account_caller { & '$($ScriptPath -replace "'", "''")' @args }",
+                'Set-Alias -Name sca -Value switch_claude_account_caller -Option AllScope',
+                'Set-Alias -Name switch-claude-account -Value switch_claude_account_caller -Option AllScope',
+                '# === End Switch Claude Account ==='
+            ) -join [Environment]::NewLine
+
+            $content | Should -BeLike "*$expected*"
+
+            if (-not $IsWindows) {
+                # The regression this guards: a CR anywhere in a profile the
+                # platform writes as LF-only.
+                $content | Should -Not -Match "`r"
+            }
+        }
+
         It 'install is byte-idempotent (two runs produce identical files)' {
             Add-To-Profile 6>$null
             $bytes1 = [System.IO.File]::ReadAllBytes($script:FakeProfilePath)
@@ -166,6 +195,42 @@ Describe 'switch_claude_account' {
 
             $after = [System.IO.File]::ReadAllBytes($script:FakeProfilePath)
             Assert-BytesEqual $before $after
+        }
+
+        # Both profile actions touch $ProfilePath and nothing else, so neither
+        # has any use for the credentials directory and neither should be
+        # blocked on resolving one. Driven out of process because the exemption
+        # lives in Invoke-Main, which the direct-call pattern bypasses, and
+        # CLAUDE_CONFIG_DIR is pointed at a path that does not exist so a
+        # regression shows up as a created directory.
+        #
+        # Keyed 'ProfileAction', not 'Action': dot-sourcing the script binds its
+        # own top-level [string] $Action parameter into the test scope, which
+        # shadows a -ForEach variable of that name and silently feeds every case
+        # an empty action.
+        It 'runs <ProfileAction> without resolving a credentials directory' -ForEach @(
+            @{ ProfileAction = 'install';   Expected = 'Installed!' }
+            @{ ProfileAction = 'uninstall'; Expected = 'Uninstalled.' }
+        ) {
+            $absent      = Join-Path $TestDrive 'never-created'
+            $profilePath = Join-Path $TestDrive "profile-$ProfileAction.ps1"
+
+            # Seed a block so uninstall has something to remove and therefore
+            # something to say; install overwrites its own block regardless.
+            Set-Content -LiteralPath $profilePath -NoNewline -Encoding utf8NoBOM -Value (
+                @($MarkerStart, 'Write-Host seeded', $MarkerEnd) -join [Environment]::NewLine)
+
+            $out = pwsh -NoProfile -Command "
+                `$env:CLAUDE_CONFIG_DIR = '$absent'
+                `$PROFILE = [pscustomobject]@{ CurrentUserAllHosts = '$profilePath' }
+                & '$script:ScriptPath' $ProfileAction
+            " 2>&1 | Out-String
+
+            $out | Should -Not -Match 'No credentials directory'
+            Test-Path -LiteralPath $absent | Should -BeFalse
+            # Pin that the action actually ran, so a failure for an unrelated
+            # reason cannot pass by simply not creating the directory.
+            $out | Should -Match ([regex]::Escape($Expected))
         }
     }
 

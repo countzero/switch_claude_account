@@ -640,15 +640,32 @@ Describe 'switch_claude_account' {
                 Should -Be '[~] 70% | 70% | Switch Claude Account'
         }
 
-        It '-Aggregate excludes HTTP-failure rows from the mean' {
-            # 2 ok rows + 1 expired. Mean = (40+60)/2 = 50.
+        It '-Aggregate excludes HTTP-failure rows with no data from the mean' {
+            # 2 ok rows + 1 expired. Mean = (40+60)/2 = 50. An 'expired' row
+            # never carries Data in production (Get-SlotUsage's expired arm has
+            # nothing to attach), so omitting the utilizations is the shape
+            # that arm actually produces.
             $snap = New-FakeSnapshot -Rows @(
                 @{ Name = 'a'; FiveUtil = 40; SevenUtil = 40 }
                 @{ Name = 'b'; FiveUtil = 60; SevenUtil = 60; IsActive = $true }
-                @{ Name = 'c'; Status = 'expired'; FiveUtil = 100; SevenUtil = 100 }
+                @{ Name = 'c'; Status = 'expired' }
             )
             Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
                 Should -Be '[~] 50% | 50% | Switch Claude Account'
+        }
+
+        It '-Aggregate counts a non-ok row that carries cached data' {
+            # The cache-fallback ladder produces 'error' / 'rate-limited' rows
+            # carrying last-known percentages. Format-UsageTable prints those
+            # numbers and Get-RowMaxUtilization rotates on them, so the pool
+            # mean has to see them too or the bars contradict the table right
+            # beneath them. Mean = (40+100)/2 = 70.
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = 40;  SevenUtil = 40; IsActive = $true }
+                @{ Name = 'b'; Status = 'error'; FiveUtil = 100; SevenUtil = 100 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[~] 70% | 70% | Switch Claude Account'
         }
 
         It '-Aggregate counts null buckets as 0 (denominator stays N)' {
@@ -676,10 +693,10 @@ Describe 'switch_claude_account' {
             $noName   | Should -Be '[~] 50% | 50% | Switch Claude Account'
         }
 
-        It '-Aggregate returns bare suffix when no HTTP-ok rows exist' {
+        It '-Aggregate returns bare suffix when no row carries usable data' {
             $snap = New-FakeSnapshot -Rows @(
-                @{ Name = 'a'; Status = 'expired'; FiveUtil = 50; SevenUtil = 50; IsActive = $true }
-                @{ Name = 'b'; Status = 'error';   FiveUtil = 50; SevenUtil = 50 }
+                @{ Name = 'a'; Status = 'expired'; IsActive = $true }
+                @{ Name = 'b'; Status = 'error' }
             )
             Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
                 Should -Be 'Switch Claude Account'
@@ -1539,26 +1556,26 @@ Describe 'switch_claude_account' {
         It 'no-cache, one slot: names it with "is" and no last-known clause' {
             $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'))
             Format-UsageAdvisory -Snapshot $snap |
-                Should -Be "[Usage] 'slot-1' is currently rate-limited by Anthropic."
+                Should -Be "[Usage] 'slot-1' is currently rate-limited or at a plan limit."
         }
 
         It 'no-cache, multiple slots: names them with "are"' {
             $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'), (New-RlRow -Name 'slot-3'))
             Format-UsageAdvisory -Snapshot $snap |
-                Should -Be "[Usage] 'slot-1', 'slot-3' are currently rate-limited by Anthropic."
+                Should -Be "[Usage] 'slot-1', 'slot-3' are currently rate-limited or at a plan limit."
         }
 
         It 'no-cache, >3 slots: collapses to "and N more" with plural verb' {
             $rows = @('a','b','c','d') | ForEach-Object { New-RlRow -Name $_ }
             $snap = New-RlSnapshot -Results $rows
             Format-UsageAdvisory -Snapshot $snap |
-                Should -Be "[Usage] 'a', 'b', 'c' and 1 more are currently rate-limited by Anthropic."
+                Should -Be "[Usage] 'a', 'b', 'c' and 1 more are currently rate-limited or at a plan limit."
         }
 
         It 'cache branch: names the cached slot and adds the last-known clause' {
             $snap = New-RlSnapshot -Results @((New-RlRow -Name 'cached' -Cached $true))
             Format-UsageAdvisory -Snapshot $snap |
-                Should -Be "[Usage] 'cached' is currently rate-limited by Anthropic; showing last known usage."
+                Should -Be "[Usage] 'cached' is currently rate-limited or at a plan limit; showing last known usage."
         }
 
         # The cache branch used to win outright, so a hard failure could
@@ -1588,7 +1605,7 @@ Describe 'switch_claude_account' {
         It 'names a hard error row with no cached data' {
             $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -Status 'error'))
             Format-UsageAdvisory -Snapshot $snap |
-                Should -Be "[Usage] 'slot-1' could not be read from the usage API; usage unknown."
+                Should -Be "[Usage] 'slot-1' could not be read; usage unknown."
         }
 
         It 'reports a cached row once, under its fallback line only' {
@@ -1617,7 +1634,7 @@ Describe 'switch_claude_account' {
             $row = [pscustomobject]@{ Name = 'slot-1'; Status = 'rate-limited'; IsCachedFallback = $true
                 Data = $null; Error = $null; Email = $null; IsActive = $false }
             $snap = New-RlSnapshot -Results @($row)
-            Format-UsageAdvisory -Snapshot $snap | Should -Match 'rate-limited by Anthropic; showing last known usage'
+            Format-UsageAdvisory -Snapshot $snap | Should -Match 'rate-limited or at a plan limit; showing last known usage'
         }
 
         # --- per-slot reason lines ---
@@ -1632,7 +1649,7 @@ Describe 'switch_claude_account' {
             $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
 
             $lines.Count | Should -Be 2
-            $lines[0]    | Should -Match 'could not be read from the usage API'
+            $lines[0]    | Should -Match 'could not be read'
             $lines[1]    | Should -Be '[Usage] slot-1: The operation has timed out.'
         }
 
@@ -1687,7 +1704,7 @@ Describe 'switch_claude_account' {
             $snap  = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'))
             $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
             $lines.Count | Should -Be 1
-            $lines[0]    | Should -Match 'currently rate-limited by Anthropic'
+            $lines[0]    | Should -Match 'currently rate-limited or at a plan limit'
         }
 
         It 'caps the reason block at 3 lines so a wide failing pool cannot push the table off screen' {
@@ -2300,7 +2317,10 @@ Describe 'switch_claude_account' {
                                   -ActiveDir $roundabout | Should -BeNullOrEmpty
         }
 
-        It 'names the directory in use when relocated' {
+        It 'names the directory in use when relocated and slots are stranded' {
+            $defaultDir = Join-Path $script:SandboxHome '.claude'
+            New-SlotPair -CredDir $defaultDir -Name 'left-behind' -Content 'A' | Out-Null
+
             $relocated = Join-Path $TestDrive 'relocated'
 
             $advisory = Get-ConfigDirAdvisory -ConfigDir $relocated `
@@ -2323,28 +2343,58 @@ Describe 'switch_claude_account' {
                                   -ActiveDir $relocated | Should -Match '2 slot\(s\)'
         }
 
-        It 'omits the count clause when the default directory holds no slots' {
+        It 'stays silent when the default directory holds no slots' {
+            # Setting the variable is a permanent configuration, so an
+            # unconditional line would print on every invocation forever. With
+            # nothing stranded there is nothing being hidden from the user.
             $relocated = Join-Path $TestDrive 'relocated-empty'
 
             Get-ConfigDirAdvisory -ConfigDir $relocated `
                                   -HomeDir   $script:SandboxHome `
-                                  -ActiveDir $relocated | Should -Not -Match 'slot\(s\)'
+                                  -ActiveDir $relocated | Should -BeNullOrEmpty
         }
 
         It 'fails open and still advises when the path cannot be normalized' {
             # An embedded NUL makes GetFullPath throw. The advisory is the
             # safe outcome: better a redundant line than a silent relocation.
+            # Needs a stranded slot, since that is what the advisory reports.
+            $defaultDir = Join-Path $script:SandboxHome '.claude'
+            New-SlotPair -CredDir $defaultDir -Name 'stranded' -Content 'A' | Out-Null
+
             Get-ConfigDirAdvisory -ConfigDir "bad`0path" `
                                   -HomeDir   $script:SandboxHome `
                                   -ActiveDir "bad`0path" | Should -Match 'CLAUDE_CONFIG_DIR is set'
         }
 
-        # $env:HOME unset on Linux (a container, a systemd unit) leaves
+        It 'resolves a relative value against $PWD, not the process start directory' {
+            # [IO.Path]::GetFullPath(path) resolves against
+            # [Environment]::CurrentDirectory, which PowerShell never syncs to
+            # Set-Location. Every other consumer of $CredDir goes through the
+            # provider and lands on $PWD, so a relative CLAUDE_CONFIG_DIR must
+            # be compared the same way or the "already the default" arm
+            # misfires against a directory sca never reads.
+            $defaultDir = Join-Path $script:SandboxHome '.claude'
+            New-SlotPair -CredDir $defaultDir -Name 'stranded' -Content 'A' | Out-Null
+
+            Push-Location -LiteralPath $script:SandboxHome
+            try {
+                # '.claude' relative to $PWD IS the default directory, so the
+                # advisory must be silent. Resolved against the process start
+                # directory it would not be, and the advisory would fire.
+                Get-ConfigDirAdvisory -ConfigDir '.claude' `
+                                      -HomeDir   $script:SandboxHome `
+                                      -ActiveDir '.claude' | Should -BeNullOrEmpty
+            }
+            finally { Pop-Location }
+        }
+
+        # An unresolvable home on Unix (a container, a systemd unit) leaves
         # $ScaHomeDir null, which a [String] parameter binds as ''. Join-Path
         # rejects that, and the throw would abort the whole invocation over an
         # advisory line even though $CredDir came from CLAUDE_CONFIG_DIR and
-        # never needed the home directory.
-        It 'still advises without a resolvable home directory: <Case>' -ForEach @(
+        # never needed the home directory. With no default directory there is
+        # also nowhere for a slot to be stranded, so the answer is silence.
+        It 'returns null without a resolvable home directory: <Case>' -ForEach @(
             @{ Case = 'empty string'; HomeDir = '' }
             @{ Case = 'null';         HomeDir = $null }
             @{ Case = 'whitespace';   HomeDir = '   ' }
@@ -2353,14 +2403,13 @@ Describe 'switch_claude_account' {
 
             # A throw here IS the regression: Join-Path rejects the empty
             # string, and the call site in Invoke-Main is not wrapped.
-            $advisory = Get-ConfigDirAdvisory -ConfigDir $relocated `
-                                              -HomeDir   $HomeDir `
-                                              -ActiveDir $relocated
+            { Get-ConfigDirAdvisory -ConfigDir $relocated `
+                                    -HomeDir   $HomeDir `
+                                    -ActiveDir $relocated } | Should -Not -Throw
 
-            $advisory | Should -Match 'CLAUDE_CONFIG_DIR is set'
-            $advisory | Should -BeLike "*$relocated*"
-            # No default directory exists to count orphans in.
-            $advisory | Should -Not -Match 'slot\(s\)'
+            Get-ConfigDirAdvisory -ConfigDir $relocated `
+                                  -HomeDir   $HomeDir `
+                                  -ActiveDir $relocated | Should -BeNullOrEmpty
         }
 
         It 'reads the script-scope values when called without arguments' {
@@ -2407,22 +2456,43 @@ Describe 'switch_claude_account' {
             $out | Should -Match ([regex]::Escape($StateFile))
         }
 
-        # Help is where the user finds out which variable to set, so it has to
-        # render in the very environment that cannot resolve one. Run out of
-        # process: $CredDir binds when the script is dot-sourced, so nothing
-        # assignable from this scope reaches Show-Help's lookup, and the load
-        # itself is half of what this pins. `sca help` used to die on
-        # Join-Path's binder before printing a line.
-        It 'loads and renders help with no resolvable home directory' {
+        # The home ENVIRONMENT VARIABLE is not the only source of a home
+        # directory: .NET falls back to the passwd entry on Unix and to the
+        # shell folder API on Windows, and PowerShell binds $HOME from that.
+        # Node's os.homedir() does the same, so `claude` keeps working with
+        # HOME unset; consulting only $env:HOME would have made `sca` refuse
+        # in an environment where the process it mirrors is running fine.
+        #
+        # Out of process because $ScaHomeDir binds when the script is
+        # dot-sourced, and dot-sourced (not invoked) so no action runs and
+        # nothing is created in the tester's real home.
+        It 'falls back to the session home when the home variable is unset' {
             $homeVar = if ($IsWindows) { 'USERPROFILE' } else { 'HOME' }
             $out = pwsh -NoProfile -Command "
                 Remove-Item -Path Env:$homeVar -ErrorAction SilentlyContinue
                 Remove-Item -Path Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
-                & '$script:ScriptPath' help
+                . '$script:ScriptPath'
+                `$CredDir
             " 2>&1 | Out-String
 
-            $LASTEXITCODE | Should -Be 0
             $out | Should -Not -Match 'Cannot bind argument'
+            $out.Trim() | Should -Not -BeNullOrEmpty
+            $out.Trim() | Should -BeLike "*$([System.IO.Path]::DirectorySeparatorChar).claude"
+        }
+
+        # Help is where the user finds out which variable to set, so it has to
+        # render in the environment that cannot resolve one. With the $HOME
+        # fallback in place that environment is no longer reachable by removing
+        # an environment variable (a healthy machine always answers), so the
+        # unresolved rendering is driven directly instead. `sca help` used to
+        # die on Join-Path's binder before printing a line.
+        It 'renders the FILES block with no resolvable home directory' {
+            $CredDir   = $null
+            $CredFile  = $null
+            $StateFile = $null
+
+            $out = Show-Help 6>&1 | Out-String
+
             $out | Should -Match 'Switch Claude Account - manage multiple Claude Code logins'
             @([regex]::Matches($out, 'unresolved: set HOME or CLAUDE_CONFIG_DIR')).Count |
                 Should -Be 3
@@ -2430,17 +2500,15 @@ Describe 'switch_claude_account' {
 
         # The counterpart: every other action has to refuse, and name both
         # variables rather than surfacing a parameter-binder error.
-        It 'refuses an action with no resolvable home directory, naming both variables' {
+        It 'refuses an action with no resolvable credentials directory, naming both variables' {
             $homeVar = if ($IsWindows) { 'USERPROFILE' } else { 'HOME' }
-            $out = pwsh -NoProfile -Command "
-                Remove-Item -Path Env:$homeVar -ErrorAction SilentlyContinue
-                Remove-Item -Path Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
-                & '$script:ScriptPath' list
-            " 2>&1 | Out-String
 
-            $out | Should -Match 'No credentials directory'
-            $out | Should -Match "env:$homeVar"
-            $out | Should -Match 'CLAUDE_CONFIG_DIR'
+            { Assert-CredentialDir -Directory '' } |
+                Should -Throw -ExpectedMessage "*No credentials directory*"
+            { Assert-CredentialDir -Directory '' } |
+                Should -Throw -ExpectedMessage "*$homeVar*"
+            { Assert-CredentialDir -Directory '' } |
+                Should -Throw -ExpectedMessage '*CLAUDE_CONFIG_DIR*'
         }
     }
 

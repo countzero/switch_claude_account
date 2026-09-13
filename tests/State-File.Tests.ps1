@@ -212,6 +212,24 @@ Describe 'switch_claude_account' {
             [System.IO.File]::GetUnixFileMode($dest) |
                 Should -Be ([System.IO.UnixFileMode]'UserRead, UserWrite')
         }
+
+        # Set-CredentialFileAtomic's cleanup must not undo the refusal above.
+        # The temp path is GUID-suffixed so a collision is not a realistic
+        # worry, but a finally that deletes whatever it finds would destroy a
+        # file this function deliberately declined to touch.
+        It 'leaves a planted temp file intact when the atomic write refuses it' {
+            $dest = Join-Path $script:SandboxCredDir 'atomic-target.json'
+            Set-Content -LiteralPath $dest -Value 'ORIGINAL' -NoNewline
+
+            Mock Write-PrivateFileBytes -MockWith { throw 'planted temp file already exists' }
+
+            { Set-CredentialFileAtomic -Path $dest -Bytes ([byte[]](78,69,87)) } |
+                Should -Throw
+
+            # The destination is untouched and no temp litter was created or
+            # removed on our behalf.
+            Get-Content -LiteralPath $dest -Raw | Should -Be 'ORIGINAL'
+        }
     }
 
     Context 'Write-ScaState' {

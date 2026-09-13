@@ -345,7 +345,7 @@ Describe 'switch_claude_account' {
             $out | Should -Match '\b73%'
             # Cache-fallback advisory fires, naming the slot and noting the
             # last-known data is being shown.
-            $out | Should -Match 'currently rate-limited by Anthropic; showing last known usage'
+            $out | Should -Match 'currently rate-limited or at a plan limit; showing last known usage'
             # Old advisory wording must not leak through.
             $out | Should -Not -Match '/api/oauth/usage rate limited'
             $out | Should -Not -Match 'showing cached data'
@@ -1069,7 +1069,7 @@ Describe 'switch_claude_account' {
             # The em-dash data cells stay (no data to show), but the advisory
             # names the throttled slot and states the condition without
             # promising recovery (the renderer is shared with one-shot).
-            $out | Should -Match "'throttled' is currently rate-limited by Anthropic\."
+            $out | Should -Match "'throttled' is currently rate-limited or at a plan limit\."
             # The cached-data wording must NOT fire (no cache here).
             $out | Should -Not -Match 'last known usage'
         }
@@ -1085,7 +1085,7 @@ Describe 'switch_claude_account' {
 
             $out = Format-UsageFrame -Snapshot $snap 6>&1 | Out-String
 
-            $out | Should -Match "'cached' is currently rate-limited by Anthropic; showing last known usage\."
+            $out | Should -Match "'cached' is currently rate-limited or at a plan limit; showing last known usage\."
         }
 
         It 'Format-UsageFrame renders the advisory in the footer block, leading the [Monitor]/[Watch] lines' {
@@ -2590,6 +2590,103 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Test-IsTransportFailure' {
+        # Shared by the usage-endpoint retry gate and the token-endpoint cache
+        # gate, so "the server rejected this request" has one definition.
+        It 'treats a codeless failure as transport' {
+            Test-IsTransportFailure -HttpStatus $null | Should -BeTrue
+        }
+
+        It 'treats a 5xx as transport: <Case>' -ForEach @(
+            @{ Case = '500'; Status = 500 }
+            @{ Case = '529'; Status = 529 }
+        ) {
+            Test-IsTransportFailure -HttpStatus $Status | Should -BeTrue
+        }
+
+        It 'treats a 4xx as a rejection, not transport: <Case>' -ForEach @(
+            @{ Case = '400'; Status = 400 }
+            @{ Case = '401'; Status = 401 }
+            @{ Case = '429'; Status = 429 }
+        ) {
+            Test-IsTransportFailure -HttpStatus $Status | Should -BeFalse
+        }
+    }
+
+    Context 'Get-SlotUsage token-refresh failure fallback' {
+        # The token POST carries the largest budget of the three calls
+        # ($Script:TokenTimeoutSec), so a transport blip is likeliest to land
+        # there. Without the cache ladder one slow hourly refresh wiped the row
+        # to em-dashes, printed the 'run sca switch' remedy for something
+        # sca switch cannot fix, and turned the monitor's active row into
+        # 'active-unknown', pausing rotation.
+
+        BeforeEach {
+            $script:TokSlot = Join-Path $script:SandboxHome '.claude/.credentials.tok(t@x.io).json'
+            New-Item -ItemType Directory -Path (Split-Path -Parent $script:TokSlot) -Force | Out-Null
+
+            # An already-expired access token forces the refresh path.
+            $expired = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+            Set-Content -LiteralPath $script:TokSlot -NoNewline -Encoding utf8NoBOM -Value (
+                [pscustomobject]@{
+                    claudeAiOauth = [pscustomobject]@{
+                        accessToken = 'stale'; refreshToken = 'r'; expiresAt = $expired
+                    }
+                } | ConvertTo-Json -Depth 5)
+
+            $Script:SlotUsageCache[$script:TokSlot] = @{
+                Data      = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 42.0; resets_at = $null }
+                    seven_day = [pscustomobject]@{ utilization = 7.0;  resets_at = $null }
+                }
+                Timestamp = [DateTime]::UtcNow
+            }
+        }
+
+        It 'serves cached percentages when the refresh dies in transport' {
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                throw [System.Net.Http.HttpRequestException]::new('No such host is known.')
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:TokSlot 6>$null
+
+            $r.Status                     | Should -Be 'ok'
+            $r.IsCachedFallback           | Should -BeTrue
+            $r.Data.five_hour.utilization | Should -Be 42.0
+        }
+
+        It 'keeps the last-known percentages on a stale entry, labelled non-ok' {
+            $Script:SlotUsageCache[$script:TokSlot].Timestamp =
+                [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheTTL + 5))
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                throw [System.Net.Http.HttpRequestException]::new('connection reset')
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:TokSlot 6>$null
+
+            $r.Status                     | Should -Be 'error'
+            $r.FallbackReason             | Should -Be 'network'
+            $r.Data.five_hour.utilization | Should -Be 42.0
+        }
+
+        It 'still reports expired when the grant itself is rejected' {
+            # invalid_grant means the refresh token is dead for good. Serving a
+            # fresh cache as 'ok' would hide a slot that needs re-authentication.
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $resp = [pscustomobject]@{ StatusCode = 400 }
+                $ex   = [System.Exception]::new('invalid_grant')
+                $ex | Add-Member -NotePropertyName Response -NotePropertyValue $resp -PassThru | Out-Null
+                throw $ex
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:TokSlot 6>$null
+
+            $r.Status           | Should -Be 'expired'
+            $r.IsCachedFallback | Should -BeNullOrEmpty
+            $r.Data             | Should -BeNullOrEmpty
+        }
+    }
+
     Context 'Invoke-UsageAction email rendering' {
         BeforeEach {
             $script:CredDirPath  = Join-Path $script:SandboxHome '.claude'
@@ -3491,6 +3588,26 @@ Describe 'switch_claude_account' {
             $snap  = New-KwSnapshot @( (New-KwRow -Name 'b' -Status 'rate-limited') )
             $out   = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 -CooldownMin 5 -CurrentLatch '[Warmup] Keeping all slots warm.'
             $out | Should -Be '[Warmup] Rate-limited; will re-warm when cooldown clears.'
+            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+        }
+
+        It 'distinguishes an at-limit throttle from a cooldown, which it cannot clear' {
+            # A throttled slot whose cached numbers are at or above -Threshold
+            # is held off by Test-WarmEligible's at-limit gate, not by the
+            # cooldown: warming re-opens a window that is already full. The
+            # cooldown wording would promise a recovery that never arrives.
+            $row = [pscustomobject]@{
+                Name = 'burned'; Status = 'rate-limited'; IsActive = $false
+                Error = $null;   Email  = 'burned@test.local'
+                Data = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $script:Future }
+                    seven_day = $null
+                }
+            }
+            $out = Invoke-KeepWarmStep -Snapshot (New-KwSnapshot @($row)) -WarmupTimes @{} `
+                                       -Threshold 95 -CurrentLatch '[Warmup] Keeping all slots warm.'
+
+            $out | Should -Be '[Warmup] Rate-limited at the rotation threshold; will re-warm after the next window reset.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
 

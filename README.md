@@ -260,7 +260,9 @@ If Claude Code is running when you invoke `save` or `switch`, the action exits i
 ### File locations and `CLAUDE_CONFIG_DIR`
 Credentials, slot files, and the state file live in `~/.claude/` (`%USERPROFILE%\.claude\` on Windows), except that Claude Code's own config is `~/.claude.json`, a sibling of that directory rather than a file inside it.
 
-Setting `CLAUDE_CONFIG_DIR` moves the whole tree, including `.claude.json`, and `sca` follows it. The value is used exactly as given: a leading `~` is **not** expanded and a relative path resolves against the current directory, matching what Claude Code itself does. When the variable relocates the directory, `sca` prints one line naming the directory in use and how many slots are being left behind in the default location.
+Setting `CLAUDE_CONFIG_DIR` moves the whole tree, including `.claude.json`, and `sca` follows it. The value is used exactly as given: a leading `~` is **not** expanded and a relative path resolves against the current directory, matching what Claude Code itself does. If the relocation leaves saved slots behind in the default directory, `sca` prints one line naming the directory in use and counting what is being skipped; with nothing stranded it stays silent, because the variable is a permanent setting and a line on every invocation would only teach you to ignore it.
+
+The home directory itself comes from `%USERPROFILE%` / `$HOME` when set, and otherwise from the account database, the same fallback Claude Code uses. `sca` works in a container or systemd unit started without those variables.
 
 ### File permissions (Linux and macOS)
 Every file `sca` writes is created `0600` before being moved into place, matching what Claude Code does. This includes `.credentials.json`, slot files, identity sidecars, the state file, and `~/.claude.json`.

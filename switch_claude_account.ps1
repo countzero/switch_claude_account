@@ -122,11 +122,22 @@ Param (
 # installing the alias into the user's PowerShell profile.
 $ScriptPath     = (Resolve-Path $PSCommandPath).Path
 
-# $env:HOME, not the $HOME automatic variable: $HOME is bound once at session
-# start and never re-reads the environment, so the test sandbox (which swaps
-# $env:HOME per test) could not redirect it and every test would operate on
-# the developer's real ~/.claude.
-$ScaHomeDir     = if ($IsWindows) { $env:USERPROFILE } else { $env:HOME }
+# $env:HOME is consulted BEFORE the $HOME automatic variable, not instead of
+# it. $HOME is bound once at session start and never re-reads the environment,
+# so the test sandbox (which swaps $env:HOME per test) could not redirect it
+# and every test would operate on the developer's real ~/.claude.
+#
+# $HOME is still the fallback, because it is the only getpwuid path we have.
+# With HOME unset on Unix, Node's os.homedir() falls back to the passwd entry,
+# so `claude` keeps working and writes ~/.claude; .NET's GetFolderPath does the
+# same, and that is what PowerShell binds $HOME from. Consulting only the
+# environment variable would make `sca` refuse in a container or systemd unit
+# where the process it mirrors is running fine.
+$ScaHomeDir     = if ($IsWindows) {
+    if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+} else {
+    if ($env:HOME) { $env:HOME } else { $HOME }
+}
 
 # CLAUDE_CONFIG_DIR relocates Claude Code's whole config tree, .credentials.json
 # and .claude.json included (verified against Claude Code 2.1.263). Taken
@@ -416,9 +427,11 @@ function Set-CredentialFileAtomic {
     # its own tmp name, the rename then serializes at the destination.
     $tmp = "$Path.sca-tmp.$([Guid]::NewGuid().ToString('N').Substring(0,8))"
     $maxAttempts = 3
+    $wrote       = $false
 
     try {
         Write-PrivateFileBytes -Path $tmp -Bytes $Bytes
+        $wrote = $true
 
         $lastErr = $null
         for ($i = 1; $i -le $maxAttempts; $i++) {
@@ -445,7 +458,12 @@ function Set-CredentialFileAtomic {
     finally {
         # Cleanup on failure path. Success path leaves $tmp consumed by
         # Replace/Move so Test-Path is already false here.
-        if (Test-Path -LiteralPath $tmp) {
+        #
+        # Gated on $wrote so this cannot delete a file we did not create.
+        # Write-PrivateFileBytes opens CreateNew precisely so a pre-existing
+        # temp path is refused rather than overwritten; deleting it here would
+        # undo that refusal and destroy whatever planted it.
+        if ($wrote -and (Test-Path -LiteralPath $tmp)) {
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         }
     }
@@ -518,7 +536,7 @@ function Get-CredentialSlotFiles {
 }
 
 # One-line advisory when CLAUDE_CONFIG_DIR has moved the working directory
-# away from the default, or $null when it has not.
+# away from the default AND slots are being left behind there, or $null.
 #
 # Honouring CLAUDE_CONFIG_DIR relocates every slot sca can see. Someone who
 # set the variable for an unrelated reason would run `sca list`, get "No slots
@@ -526,12 +544,23 @@ function Get-CredentialSlotFiles {
 # the default ~/.claude. Naming the directory in use, plus a count of what is
 # being skipped, turns a silent relocation into a visible one.
 #
+# Orphans are the whole trigger, not a detail appended to it. Setting the
+# variable is a permanent configuration, so an unconditional line would print
+# on every `sca list` and `sca switch` forever and teach the user to skip
+# yellow lines. When the default directory holds no slots, nothing is hidden
+# from anyone and there is nothing to say.
+#
 # GetFullPath normalises separators and relative segments without requiring
 # either path to exist, so the "already the default" case stays quiet instead
 # of emitting a permanent noise line for anyone who sets the variable
-# explicitly to ~/.claude. It resolves a relative value against the current
-# directory, which is what Claude Code does too. A malformed value fails open
-# and emits the advisory.
+# explicitly to ~/.claude. The base path is passed explicitly because the
+# one-argument overload resolves against [Environment]::CurrentDirectory, which
+# PowerShell never syncs to Set-Location: with a relative CLAUDE_CONFIG_DIR
+# (which this tool takes verbatim, so relative values are supported) the
+# comparison and the orphan count would target the process start directory
+# while every other read went through the provider and hit $PWD. A malformed
+# value fails open into the orphan check rather than being treated as "already
+# the default".
 # The three inputs arrive as parameters defaulting to the script-scope values
 # so the function is pure and the suite can drive every branch by argument,
 # rather than leaning on PowerShell's dynamic scoping to reach in and rebind
@@ -546,23 +575,22 @@ function Get-ConfigDirAdvisory {
 
     if ([string]::IsNullOrWhiteSpace($ConfigDir)) { return $null }
 
-    $message = "[Config] CLAUDE_CONFIG_DIR is set; using '$ActiveDir'."
-
-    # No resolvable home means there is no default directory to compare against
-    # or to count orphans in, so report the relocation and stop. Reachable
-    # whenever $env:HOME is unset on Linux, which is exactly the kind of
+    # No resolvable home means there is no default directory, so no slot can be
+    # stranded in one and there is nothing to report. Returning early also
+    # keeps Join-Path's binder off the empty string, which would throw and
+    # abort an otherwise-working invocation over an advisory line; reachable
+    # whenever the home lookup fails on Unix, which is exactly the kind of
     # environment (a container, a systemd unit) that sets CLAUDE_CONFIG_DIR in
-    # the first place: $CredDir does not depend on the home directory there, so
-    # letting Join-Path's binder throw on the empty string would abort an
-    # otherwise-working invocation over an advisory line.
-    if ([string]::IsNullOrWhiteSpace($HomeDir)) { return $message }
+    # the first place, and where $CredDir never needed a home directory.
+    if ([string]::IsNullOrWhiteSpace($HomeDir)) { return $null }
 
     $defaultDir = Join-Path $HomeDir '.claude'
     try {
+        $base       = $PWD.ProviderPath
         $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
         if ([string]::Equals(
-                [System.IO.Path]::GetFullPath($defaultDir),
-                [System.IO.Path]::GetFullPath($ActiveDir),
+                [System.IO.Path]::GetFullPath($defaultDir, $base),
+                [System.IO.Path]::GetFullPath($ActiveDir,  $base),
                 $comparison)) {
             return $null
         }
@@ -570,10 +598,8 @@ function Get-ConfigDirAdvisory {
     catch { Write-Verbose "Config-dir comparison failed, emitting advisory: $_" }
 
     $orphaned = @(Get-CredentialSlotFiles -Directory $defaultDir).Count
-    if ($orphaned -gt 0) {
-        $message += " $orphaned slot(s) in '$defaultDir' are not in use."
-    }
-    return $message
+    if ($orphaned -eq 0) { return $null }
+    return "[Config] CLAUDE_CONFIG_DIR is set; using '$ActiveDir'. $orphaned slot(s) in '$defaultDir' are not in use."
 }
 
 # Refuse when no credentials directory could be resolved.
@@ -2706,7 +2732,17 @@ function Resolve-SlotAccessToken {
             # Non-429 refresh failure (timeout, 4xx other than 429, 5xx,
             # malformed JSON, ...): the token IS expired and we couldn't
             # refresh it, so 'expired' remains the accurate label.
-            return [pscustomobject]@{ Status = 'expired'; Error = $_.Exception.Message }
+            #
+            # HttpStatus is carried so the caller can tell a rejected grant
+            # (4xx: the slot is genuinely dead, its numbers are gone) from a
+            # transport failure (no status / 5xx: the slot is probably fine and
+            # a cached reading is still worth showing). Get-SlotUsage gates its
+            # cache fallback on exactly that distinction.
+            return [pscustomobject]@{
+                Status     = 'expired'
+                Error      = $_.Exception.Message
+                HttpStatus = (Get-ExceptionHttpStatus $_.Exception)
+            }
         }
     }
 
@@ -2764,9 +2800,10 @@ function Get-SlotUsage {
         }
     }
 
-    # Resolve a non-expired access token (refresh if needed). Rate-
-    # limited from the token endpoint gets the cache-fallback path here;
-    # other non-ok statuses return verbatim.
+    # Resolve a non-expired access token (refresh if needed). A token-endpoint
+    # failure that the slot can recover from gets the same cache-fallback
+    # ladder as a usage-endpoint failure; a failure that says the grant itself
+    # is dead returns verbatim.
     $tok = Resolve-SlotAccessToken -SlotPath $SlotPath
     if ($tok.Status -ne 'ok') {
         if ($tok.Status -eq 'rate-limited') {
@@ -2778,6 +2815,22 @@ function Get-SlotUsage {
             # throttle. No retry arm here: the token endpoint has its own
             # 429 retry loop inside Update-SlotTokens.
             $fallback = Resolve-UsageFailureFallback -SlotPath $SlotPath -Reason 'rate-limit'
+            if ($fallback) { return $fallback }
+        }
+        elseif ($tok.Status -eq 'expired' -and (Test-IsTransportFailure -HttpStatus $tok.HttpStatus)) {
+            # The refresh POST died in transport, not on its merits. Its budget
+            # is the largest of the three calls ($Script:TokenTimeoutSec), so
+            # this is the likeliest place for a blip to land, and without the
+            # ladder one slow hourly refresh wiped the row to em-dashes, printed
+            # the 'run sca switch' remedy for something sca switch cannot fix,
+            # and (in `sca monitor`) turned the active row into 'active-unknown',
+            # pausing rotation until the next poll happened to succeed.
+            #
+            # A 4xx is deliberately NOT covered: invalid_grant means the refresh
+            # token is rejected for good, and serving a fresh cache as 'ok'
+            # would hide a slot that needs re-authentication.
+            $fallback = Resolve-UsageFailureFallback -SlotPath $SlotPath -Reason 'network' `
+                                                     -ErrorMessage $tok.Error -HttpStatus $tok.HttpStatus
             if ($fallback) { return $fallback }
         }
         return $tok
@@ -2883,7 +2936,21 @@ function Test-IsRetriableUsageFailure {
     )
 
     if ($Exception -is [System.OperationCanceledException]) { return $false }
-    if ($null -eq $HttpStatus)                             { return $true }
+    return (Test-IsTransportFailure -HttpStatus $HttpStatus)
+}
+
+# True when a failed HTTP call says nothing about the request's merits: no
+# status at all (DNS, socket, the -TimeoutSec TaskCanceledException) or a 5xx.
+#
+# The distinction this draws is "retry / cached data may still be valid" versus
+# "the server rejected this request and will reject it again": a 4xx describes
+# the credential or the call, so neither a second attempt nor a stale reading
+# is defensible. Shared by the usage-endpoint retry gate and the token-endpoint
+# cache gate in Get-SlotUsage so the two cannot drift apart.
+function Test-IsTransportFailure {
+    Param ([AllowNull()] $HttpStatus)
+
+    if ($null -eq $HttpStatus) { return $true }
     return ([int]$HttpStatus -ge 500)
 }
 
@@ -2917,8 +2984,10 @@ function Invoke-UsageRequest {
 
 # Numeric HTTP status carried by a web exception, or $null when it has none.
 # $null is the normal case for a codeless transport failure (DNS, socket, and
-# the -TimeoutSec TaskCanceledException), which is exactly the distinction the
-# 'error <code>' vs 'error: <tail>' status label turns on.
+# the -TimeoutSec TaskCanceledException). Two consumers turn on that
+# distinction: Format-UsageTable renders 'error <code>' when a status is
+# present and a bare 'error' when it is not, and Test-IsTransportFailure reads
+# it to decide whether a retry or a cached reading is defensible.
 function Get-ExceptionHttpStatus {
     Param ($Exception)
 
@@ -3440,11 +3509,11 @@ function Get-AggregateBarColor {
 #
 # Return:
 #   * Integer in [0, 100], rounded with [math]::Round, when at least one
-#     HTTP-ok row exists. Math: sum of per-row utilization (each clamped
+#     eligible row exists. Math: sum of per-row utilization (each clamped
 #     to [0,100], null/missing counted as 0) divided by cap = N*100,
 #     scaled to percent. Equivalently the mean utilization across all
-#     HTTP-ok rows.
-#   * $null when zero HTTP-ok rows. Callers decide what to render for
+#     eligible rows.
+#   * $null when zero eligible rows. Callers decide what to render for
 #     the empty case (Format-AggregateBars emits nothing; Format-WatchTitle
 #     collapses to bare suffix).
 function Get-PoolMeanUtilization {
@@ -3455,7 +3524,7 @@ function Get-PoolMeanUtilization {
 
     if (-not $Results) { return $null }
 
-    $eligible = @($Results | Where-Object { $_.Status -eq 'ok' })
+    $eligible = @($Results | Where-Object { Test-RowCountsTowardPool -Row $_ })
     if ($eligible.Count -eq 0) { return $null }
 
     $n   = $eligible.Count
@@ -3477,9 +3546,28 @@ function Get-PoolMeanUtilization {
     return [int][math]::Round(($usedSum / $cap) * 100)
 }
 
+# Whether a snapshot row belongs in the pool-wide aggregate.
+#
+# 'ok' OR any row carrying Data, not 'ok' alone. Since the cache-fallback
+# ladder landed, a non-ok row can carry last-known percentages: Format-UsageTable
+# already prints those numbers and Get-RowMaxUtilization already rotates on
+# them, so excluding the same row from the bars made the two bars disagree with
+# the table directly beneath them, and a pool whose reads had all gone stale
+# lost both bars entirely while every row still showed a percentage.
+#
+# 'ok' is kept as its own arm rather than collapsing to "has Data": an 'ok' row
+# whose response carried no buckets is a real 0%-utilized account and must stay
+# in the denominator, which is the behaviour the bar percentages were tuned
+# against.
+function Test-RowCountsTowardPool {
+    Param ([Parameter(Mandatory)] $Row)
+
+    return ($Row.Status -eq 'ok' -or [bool]$Row.Data)
+}
+
 # Render aggregate progress bars showing pool-wide USAGE above the
 # usage table. Two bars: 'Session' (five_hour) and 'Week' (seven_day).
-# For each bucket the function sums per-slot utilization across HTTP-ok
+# For each bucket the function sums per-slot utilization across eligible
 # rows, computes pool-used % as used / cap where cap = N * 100
 # (equivalently the mean utilization across eligible rows), and draws a
 # fit-to-table-width bar. Filled portion = used; empty portion = remaining
@@ -3490,8 +3578,8 @@ function Get-PoolMeanUtilization {
 # 2 (indent) + 8 (label pad) + 1 ('[') + 1 (']') + 1 (space) + 4
 # ("NNN%"). Floor keeps narrow 1-slot tables visually meaningful.
 #
-# Slot inclusion rules:
-#   * Status='ok' only (HTTP-failure rows have no usable data).
+# Slot inclusion rules (Test-RowCountsTowardPool):
+#   * Status='ok', or any row carrying Data from the cache fallback.
 #   * Buckets with null/missing utilization counted as 0% used.
 #
 # Color thresholds via $Script:AggregateRedPct / $Script:AggregateYellowPct.
@@ -3515,10 +3603,11 @@ function Format-AggregateBars {
 
     if (-not $Results) { return }
 
-    # Skip-render when no HTTP-ok rows exist. Get-PoolMeanUtilization
+    # Skip-render when no eligible rows exist. Get-PoolMeanUtilization
     # returns $null in that case; checking once up front (rather than
-    # per-bucket) keeps the per-bucket loop branch-free.
-    $eligible = @($Results | Where-Object { $_.Status -eq 'ok' })
+    # per-bucket) keeps the per-bucket loop branch-free. Same predicate as
+    # that helper, so the skip decision and the math cannot disagree.
+    $eligible = @($Results | Where-Object { Test-RowCountsTowardPool -Row $_ })
     if ($eligible.Count -eq 0) { return }
 
     # Width derivation explained above. Floor 8 so 1-slot tables with
@@ -4068,14 +4157,24 @@ function Format-UsageAdvisory {
 
     $lines = [System.Collections.Generic.List[string]]::new()
 
-    # NeedsCopula: the rate-limit tails read "<slots> is/are currently ..."; the
+    # NeedsCopula: the limit tails read "<slots> is/are currently ..."; the
     # read-failure tails carry their own verb, so injecting one would produce
     # "'a' is could not be read".
+    #
+    # The tails name no source and no cause, because this renderer serves two
+    # producers. Get-UsageSnapshot's rows come from /api/oauth/usage, but
+    # Invoke-WarmAllSlots feeds the same function rows whose Status came from
+    # `claude -p` (reachable from `sca warmup` and from monitor -KeepWarm's
+    # startup repaint). Saying "from the usage API" was false for an activation
+    # failure, and saying "by Anthropic" contradicted the plan-limit classifier
+    # in Invoke-SlotActivator, whose entire point is that "You've hit your
+    # session limit" is a plan limit and not a rate limit. The per-slot reason
+    # line below carries the real cause, which is accurate for both producers.
     foreach ($bucket in @(
-        @{ Rows = $bareError; NeedsCopula = $false; Tail = 'could not be read from the usage API; usage unknown.' },
-        @{ Rows = $bareLimit; NeedsCopula = $true;  Tail = 'currently rate-limited by Anthropic.' },
+        @{ Rows = $bareError; NeedsCopula = $false; Tail = 'could not be read; usage unknown.' },
+        @{ Rows = $bareLimit; NeedsCopula = $true;  Tail = 'currently rate-limited or at a plan limit.' },
         @{ Rows = $cachedNet; NeedsCopula = $false; Tail = 'could not be read live; showing last known usage.' },
-        @{ Rows = $cachedLim; NeedsCopula = $true;  Tail = 'currently rate-limited by Anthropic; showing last known usage.' }
+        @{ Rows = $cachedLim; NeedsCopula = $true;  Tail = 'currently rate-limited or at a plan limit; showing last known usage.' }
     )) {
         $names = @($bucket.Rows | ForEach-Object { $_.Name })
         if ($names.Count -eq 0) { continue }
@@ -5208,8 +5307,19 @@ function Invoke-KeepWarmStep {
         # Nothing eligible this tick. If a throttled slot is just held off by
         # its cooldown, say so rather than claim "Keeping all slots warm." (the
         # yellow advisory above the table already names the affected slots).
-        if (@($results | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0) {
-            return '[Warmup] Rate-limited; will re-warm when cooldown clears.'
+        $limited = @($results | Where-Object { $_.Status -eq 'rate-limited' })
+        if ($limited.Count -gt 0) {
+            # Split by WHY, because the two have different recoveries and only
+            # one of them is the cooldown. A throttled slot whose cached numbers
+            # are at or above -Threshold is held off by Test-WarmEligible's
+            # at-limit gate, not by $CooldownMin: warming re-opens a window that
+            # is already full, so waiting out the cooldown changes nothing and
+            # only the next window reset will.
+            $waiting = @($limited | Where-Object { (Get-RowMaxUtilization -Row $_ -Now $nowUtc) -lt $Threshold })
+            if ($waiting.Count -gt 0) {
+                return '[Warmup] Rate-limited; will re-warm when cooldown clears.'
+            }
+            return '[Warmup] Rate-limited at the rotation threshold; will re-warm after the next window reset.'
         }
         return $CurrentLatch
     }
@@ -5690,14 +5800,16 @@ function Invoke-Main {
     # the credentials directory is created so a refused run leaves no trace on
     # disk.
     #
-    # `uninstall` is exempt from the precondition, and from the directory
-    # creation below: it touches nothing but the PowerShell profile, so a
-    # missing home directory does not apply to it. Refusing it would strand the
-    # alias block on any machine that cannot satisfy the guard, with no way to
-    # remove it but a hand edit, and $PROFILE.CurrentUserAllHosts is the same
-    # path on Linux and macOS, so a synced profile puts a block there without
-    # anyone installing it.
-    $profileOnly = ($Action -eq 'uninstall')
+    # `install` and `uninstall` are exempt from the precondition, and from the
+    # directory creation below: Add-To-Profile and Remove-From-Profile touch
+    # nothing but $ProfilePath, so a missing home directory does not apply to
+    # either. Refusing `uninstall` would strand the alias block on any machine
+    # that cannot satisfy the guard, with no way to remove it but a hand edit,
+    # and $PROFILE.CurrentUserAllHosts is the same path on Linux and macOS, so
+    # a synced profile puts a block there without anyone installing it. The
+    # same argument covers `install`, which additionally has no use for the
+    # credentials directory the guarded path would create for it.
+    $profileOnly = ($Action -eq 'install' -or $Action -eq 'uninstall')
     if (-not $profileOnly) {
         Assert-CredentialDir
     }
