@@ -320,6 +320,17 @@ $Script:UsageUserAgent      = "claude-code/2.1.119"
 # The refresh POST gets its own (larger) budget rather than borrowing the
 # usage constant: it does server-side crypto plus refresh-token rotation, so
 # it is the slowest of the three calls and was the one running tightest.
+#
+# What one slot can cost a watch frame, since Get-UsageSnapshot polls slots
+# serially and the loop cannot repaint mid-poll:
+#   * usage read times out                     -> 12 s.
+#   * refresh times out                        -> 15 s, and the usage call is
+#     never made (Get-SlotUsage returns on the token failure), so 15 s is the
+#     ceiling for that path rather than 12 + 15.
+#   * refresh succeeds slowly, then usage times out -> up to 27 s. This is the
+#     real worst case for a reachable-but-degraded endpoint.
+#   * refresh 429s three times                 -> ~6 s of backoff on top,
+#     because a 429 answers fast; see the retry policy below.
 $Script:UsageTimeoutSec     = 12
 $Script:TokenTimeoutSec     = 15
 $Script:ProfileTimeoutSec   = 10
@@ -742,7 +753,14 @@ function Assert-CredentialDir {
 # account list even though Write-PrivateFileBytes keeps the bytes to 0600. An
 # existing directory is left exactly as it is, including its mode: it is
 # usually Claude Code's own ~/.claude, and silently re-permissioning another
-# tool's directory is not this tool's call to make.
+# tool's directory is not this tool's call to make. Repair-CredentialFileModes
+# draws the same line for ~/.claude.json.
+#
+# So the leak this guards against is NOT closed on most installs, and saying so
+# is the honest version: Claude Code creates ~/.claude first on any machine
+# where it ran before sca did, at whatever the umask gives it, and nothing here
+# revisits that. `chmod 700 ~/.claude` is the user's to run; the README says so
+# under "File permissions".
 function New-CredentialDirectory {
     Param ([Parameter(Mandatory)] [String] $Directory)
 
@@ -5178,11 +5196,17 @@ function Get-AutoRotationDecision {
     $eligible = $null
     for ($offset = 1; $offset -lt $sorted.Count; $offset++) {
         $candidate = $sorted[($activeIdx + $offset) % $sorted.Count]
-        # Peers still require a live-quality 'ok'. Deciding to LEAVE an
-        # exhausted slot on cached evidence is safe; deciding to ENTER an
-        # unverified one is not, and a 'rate-limited' peer is by definition a
-        # bad destination. A fresh cache fallback already reports 'ok', so a
-        # transient blip does not disqualify a peer.
+        # Peers are gated on Status, where the active slot is judged on Data:
+        # deciding to LEAVE an exhausted slot on cached evidence is safe,
+        # deciding to ENTER one whose reading is stale or absent is not, and a
+        # 'rate-limited' peer is by definition a bad destination.
+        #
+        # 'ok' here is not the same as "read live". A fresh cache fallback
+        # reports 'ok' too, so a peer can be entered on a reading up to
+        # $Script:UsageCacheTTL minutes old. That is deliberate and is the
+        # weaker half of this gate: without it a blip on one poll would
+        # disqualify every healthy peer and freeze rotation exactly when it is
+        # needed. The TTL is what keeps the window small.
         if ($candidate.Status -ne 'ok')         { continue }
         $candMax = Get-RowMaxUtilization -Row $candidate
         if ($candMax -ge $Threshold)            { continue }

@@ -267,7 +267,13 @@ The home directory itself comes from `%USERPROFILE%` / `$HOME` when set, and oth
 ### File permissions (Linux and macOS)
 Every file `sca` writes is created `0600` before being moved into place, matching what Claude Code does. This includes `.credentials.json`, slot files, identity sidecars, the state file, and `~/.claude.json`.
 
-Files an older version left readable are tightened on the first run of any action, and `sca` says how many it changed. A credentials directory `sca` creates for you is `0700`, since slot filenames carry account email addresses; one that already exists keeps the mode it has.
+Credential files left readable by anything else are tightened to `0600` on the first run of any action, and `sca` reports how many it changed. That pass covers the files `sca` creates under the credentials directory; `~/.claude.json` is Claude Code's and is left alone, as are symlinks.
+
+A credentials directory `sca` creates for you is `0700`, since slot filenames carry account email addresses. **One that already exists keeps the mode it has**, and on any machine where Claude Code ran before `sca` did, that is the usual case. `sca` will not re-permission another tool's directory, so if the filenames matter to you, run it yourself once:
+
+```bash
+chmod 700 ~/.claude
+```
 
 ### Name sanitization
 Spaces, filename-unsafe characters (`\ / : * ? " < > |` and control chars), PowerShell wildcard brackets (`[` `]`), and parentheses (`(` `)`) are automatically replaced with `_`. Trailing dots are stripped. Reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`) are rejected.
