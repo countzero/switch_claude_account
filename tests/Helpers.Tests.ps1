@@ -2462,7 +2462,7 @@ Describe 'switch_claude_account' {
         # Claude Code. But a directory name is not a running Claude Code, and
         # this repo's own checkout would otherwise lock out `sca save`.
         It 'ignores a command line that merely mentions claude: <Case>' -ForEach @(
-            @{ Case = 'repo path';   CommandLine = 'code /home/ada/windows_switch_claude_account' }
+            @{ Case = 'repo path';   CommandLine = 'code /home/ada/switch_claude_account' }
             @{ Case = 'bare word';   CommandLine = 'less /home/ada/notes-about-claude.md' }
             @{ Case = 'no cli.js';   CommandLine = 'node /home/ada/claude-code/index.js' }
             @{ Case = 'null';        CommandLine = $null }

@@ -1,6 +1,6 @@
 # Switch Claude Account
 
-[![Latest release](https://img.shields.io/github/v/release/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/releases/latest) [![Last commit](https://img.shields.io/github/last-commit/countzero/windows_switch_claude_account)](https://github.com/countzero/windows_switch_claude_account/commits/main) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![PowerShell 7.4+](https://img.shields.io/badge/PowerShell-7.4%2B-5391FE)](https://github.com/PowerShell/PowerShell) [![GitHub Sponsors](https://img.shields.io/github/sponsors/countzero?label=Sponsor&logo=GitHub)](https://github.com/sponsors/countzero) [![Ko-fi](https://img.shields.io/badge/Ko--fi-Tip-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/finnkumkar)
+[![Latest release](https://img.shields.io/github/v/release/countzero/switch_claude_account)](https://github.com/countzero/switch_claude_account/releases/latest) [![Last commit](https://img.shields.io/github/last-commit/countzero/switch_claude_account)](https://github.com/countzero/switch_claude_account/commits/main) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![PowerShell 7.4+](https://img.shields.io/badge/PowerShell-7.4%2B-5391FE)](https://github.com/PowerShell/PowerShell) [![GitHub Sponsors](https://img.shields.io/github/sponsors/countzero?label=Sponsor&logo=GitHub)](https://github.com/sponsors/countzero) [![Ko-fi](https://img.shields.io/badge/Ko--fi-Tip-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/finnkumkar)
 
 A zero-dependency PowerShell utility for Claude Code on Windows, Linux, and macOS that combines secure multi-account management with a live usage dashboard and automated limit-based rotation.
 
@@ -47,10 +47,10 @@ The test suite runs on all three on every push.
 
 ### Download
 
-[Download latest switch_claude_account.ps1](https://github.com/countzero/windows_switch_claude_account/releases/latest/download/switch_claude_account.ps1) and place it anywhere on disk.
+[Download latest switch_claude_account.ps1](https://github.com/countzero/switch_claude_account/releases/latest/download/switch_claude_account.ps1) and place it anywhere on disk.
 
 > [!TIP]
-> Check the [releases page](https://github.com/countzero/windows_switch_claude_account/releases) for older versions.
+> Check the [releases page](https://github.com/countzero/switch_claude_account/releases) for older versions.
 
 ### Manual (run once)
 
