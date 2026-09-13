@@ -1478,21 +1478,24 @@ Describe 'switch_claude_account' {
             Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 20
         }
 
-        # A cached row has no upper age bound once it goes stale, so its 5h
-        # window can roll while it is still on screen. Rotation and keep-warm
-        # read such a bucket as 0 via Get-BucketUtilizationOrZero; the bars have
-        # to agree, or they contradict the rotation decision taken beneath them.
+        # A cached row can sit on screen long enough for its 5h window to roll.
+        # Select-LiveBuckets drops such a bucket at New-UsageResult, so it
+        # reaches the bars as missing and counts 0, the same as it counts for
+        # rotation and keep-warm. The row is built through New-UsageResult
+        # rather than by hand precisely because that is where the rule runs:
+        # a hand-built row with a rolled bucket is not one production can emit.
         It 'counts a bucket whose window has already reset as 0' {
             $past   = [DateTimeOffset]::UtcNow.AddHours(-1)
             $future = [DateTimeOffset]::UtcNow.AddHours(2)
+            $rolled = New-UsageResult -Status 'error' -CachedReason 'network' -Data ([pscustomobject]@{
+                five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $past.ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                seven_day = $null
+            })
             $rows = @(
                 [pscustomobject]@{
                     Name = 'rolled'; IsActive = $false; Status = 'error'; Error = $null; Email = $null
                     IsCachedFallback = $true
-                    Data = [pscustomobject]@{
-                        five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $past.ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
-                        seven_day = $null
-                    }
+                    Data = $rolled.Data
                 }
                 [pscustomobject]@{
                     Name = 'live'; IsActive = $true; Status = 'ok'; Error = $null; Email = $null
@@ -2580,6 +2583,40 @@ Describe 'switch_claude_account' {
             $r.Data.five_hour.utilization | Should -Be 88
         }
 
+        # -AllowStale exists so a row survives a BRIEF outage with its numbers
+        # intact. Without a ceiling that argument kept applying at any age, and
+        # the cost was not cosmetic: Get-AutoRotationDecision only reports
+        # 'active-unknown' for an active row with NO Data, so an unbounded
+        # entry left a permanently unreadable active slot being judged on a
+        # days-old reading while the monitor reported itself armed.
+        It '-AllowStale refuses an entry past UsageCacheMaxAgeMin' {
+            $slot = 'D:/ancient/path.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 88.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheMaxAgeMin + 1))
+            }
+            (Get-CachedUsageOrNull -SlotPath $slot -AllowStale) | Should -BeNullOrEmpty
+        }
+
+        It '-AllowStale still serves an entry just inside the ceiling' {
+            $slot = 'D:/elderly/path.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data      = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 88.0 } }
+                Timestamp = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheMaxAgeMin - 1))
+            }
+            (Get-CachedUsageOrNull -SlotPath $slot -AllowStale).Data.five_hour.utilization | Should -Be 88
+        }
+
+        It 'an ancient entry leaves the active row reporting active-unknown' {
+            # The end-to-end consequence of the ceiling: with no Data the
+            # rotation engine says so instead of judging on an obsolete number.
+            $row = [pscustomobject]@{ Name = 'a'; IsActive = $true; Status = 'error'; Data = $null }
+            $decision = Get-AutoRotationDecision -Threshold 95 `
+                -Snapshot ([pscustomobject]@{ Results = @($row); NoSlots = $false })
+            $decision.Action       | Should -Be 'active-unknown'
+            $decision.ActiveStatus | Should -Be 'error'
+        }
+
         It '-AllowStale still returns $null on a true cache miss' {
             (Get-CachedUsageOrNull -SlotPath 'missing/path.json' -AllowStale) | Should -BeNullOrEmpty
         }
@@ -3621,10 +3658,14 @@ Describe 'switch_claude_account' {
             Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeFalse
         }
 
+        # Built through New-UsageResult so the row is what production emits:
+        # Select-LiveBuckets has already dropped the rolled 5h bucket, which is
+        # what takes the slot back under the at-limit gate.
         It 'a rate-limited slot becomes eligible again once its window has reset' {
-            $row = [pscustomobject]@{ Status = 'rate-limited'; Data = [pscustomobject]@{
+            $result = New-UsageResult -Status 'rate-limited' -CachedReason 'rate-limit' -Now $script:Now -Data ([pscustomobject]@{
                 five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $script:Now.AddMinutes(-5).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
-                seven_day = $null } }
+                seven_day = $null })
+            $row = [pscustomobject]@{ Status = 'rate-limited'; Data = $result.Data }
             Test-WarmEligible -Row $row -Now $script:Now -Threshold 95 | Should -BeTrue
         }
 

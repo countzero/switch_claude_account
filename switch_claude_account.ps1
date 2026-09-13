@@ -356,6 +356,23 @@ $Script:TokenRefreshRetryDelayMs = 2000
 $Script:SlotUsageCache = @{}
 $Script:UsageCacheTTL  = 10
 
+# Hard upper bound on how old a reading may be and still be shown at all.
+# Past it Get-CachedUsageOrNull refuses even under -AllowStale, so the row
+# loses its numbers and reports the failure instead.
+#
+# -AllowStale exists so a row keeps its percentages through a BRIEF outage
+# rather than collapsing to em-dashes and looking like a dead slot. Without a
+# ceiling that argument kept applying at any age, and the consequence was not
+# cosmetic: Get-AutoRotationDecision's 'active-unknown' arm fires only for an
+# active row with no Data, so an unbounded entry meant a permanently
+# unreadable active slot was judged on a days-old reading while the monitor
+# reported itself armed.
+#
+# 360 minutes is one five_hour window plus an hour of slack: beyond it the
+# session bucket has certainly rolled and the reading describes a window the
+# account is no longer in.
+$Script:UsageCacheMaxAgeMin = 360
+
 # Seconds to suppress live token/usage HTTP for a slot after it returns
 # 'rate-limited' (see RateLimitedUntil above). Short enough to re-probe
 # within a poll or two once the throttle likely clears, long enough to break
@@ -2459,6 +2476,56 @@ function Invoke-RemoveAction {
 
 # --- usage action internals ---
 
+# The usage body with every bucket whose window has already rolled removed.
+#
+# A bucket carries the utilization of a window that ENDS at resets_at, so once
+# that instant passes the number says nothing about the window the account is
+# in now. The endpoint never returns one (it reports the new window), but the
+# per-process cache can: an entry served after a reset boundary holds a reading
+# the world has moved past. $Script:UsageCacheMaxAgeMin bounds how far past,
+# not whether.
+#
+# Removed rather than zeroed, because "the 5h window rolled" is the same fact
+# as "this account made no call in the current window", which is exactly what
+# an absent bucket already means to every consumer: the table renders an
+# em-dash, Get-PlanStatus falls to its 'no plan data' tier, the bars and
+# Get-RowMaxUtilization count 0. Zeroing would instead assert a measurement we
+# do not have.
+#
+# This runs at New-UsageResult, the single construction site for every row, so
+# the answer is computed once. Applying the rule per consumer is what let the
+# Session cell print '100% now' beside a 0% aggregate bar, a '[!] 100%' title
+# and a rotation engine that read the same row as idle.
+#
+# The input is never mutated: $Script:SlotUsageCache holds what the server
+# actually said, and its own Timestamp is what ages it. PSObject.Copy() is a
+# shallow clone, which is enough because only top-level bucket properties are
+# replaced, never anything inside one.
+function Select-LiveBuckets {
+    Param (
+        [AllowNull()] $Data,
+        [Parameter(Mandatory)] [DateTimeOffset] $Now
+    )
+
+    if (-not $Data) { return $Data }
+
+    $rolled = @(
+        foreach ($key in @('five_hour', 'seven_day')) {
+            $bucket = $Data.$key
+            if (-not $bucket -or -not $bucket.resets_at) { continue }
+            $reset = ConvertTo-DateTimeOffsetOrNull $bucket.resets_at
+            if ($null -ne $reset -and $reset -le $Now) { $key }
+        }
+    )
+    if ($rolled.Count -eq 0) { return $Data }
+
+    # Select-Object -ExcludeProperty rather than assigning $null, so the
+    # bucket is ABSENT from `sca usage -Json` rather than present-and-null.
+    # A scripted consumer testing for the key then sees the same thing every
+    # renderer sees.
+    return ($Data | Select-Object -Property * -ExcludeProperty $rolled)
+}
+
 # The one shape every usage read returns, whatever happened. Get-SlotUsage,
 # Get-CachedUsageOrNull and Get-UsageSnapshot all build through this, so a
 # consumer can read any field on any result without an existence check and
@@ -2481,6 +2548,11 @@ function Invoke-RemoveAction {
 # Four consumers used to re-derive "is this row trustworthy" from different
 # subsets of those fields and disagreed with each other; the union of return
 # shapes this replaces is what made that easy to do by accident.
+#
+# Data is projected through Select-LiveBuckets on the way in, which is what
+# makes this the ONE place the "is this reading still current" question is
+# answered. Every producer of a row builds here, so no renderer or decision
+# path can disagree with another about a rolled window.
 function New-UsageResult {
     Param (
         [Parameter(Mandatory)]
@@ -2491,12 +2563,15 @@ function New-UsageResult {
         # shadow PowerShell's automatic error variable inside this function.
         [AllowNull()] [AllowEmptyString()] [String] $ErrorMessage,
         [AllowNull()] $HttpStatus,
-        [AllowNull()] [ValidateSet('rate-limit', 'network')] [String] $CachedReason
+        [AllowNull()] [ValidateSet('rate-limit', 'network')] [String] $CachedReason,
+        # Injected only by the tests; production always means "as of now",
+        # because the row is consumed in the same tick it is built.
+        [DateTimeOffset] $Now = [DateTimeOffset]::UtcNow
     )
 
     return [pscustomobject]@{
         Status           = $Status
-        Data             = $Data
+        Data             = Select-LiveBuckets -Data $Data -Now $Now
         Error            = if ([string]::IsNullOrEmpty($ErrorMessage)) { $null } else { $ErrorMessage }
         HttpStatus       = $HttpStatus
         IsCachedFallback = [bool]$CachedReason
@@ -2778,6 +2853,9 @@ function Update-SlotTokens {
 #     percentages stay visible (so the row keeps its numbers instead of
 #     collapsing to em-dashes and looking like a dead slot) but the status
 #     drops out of 'ok' so stale data is never mistaken for a live reading.
+#   * Past $Script:UsageCacheMaxAgeMin -> $null even under -AllowStale. See
+#     that constant for why an unbounded last-known reading is not a display
+#     question.
 #
 # -Reason distinguishes WHY the live read failed. It picks the stale label
 # ('rate-limited' for a 429, 'error' for a network/transport failure) and is
@@ -2801,7 +2879,10 @@ function Get-CachedUsageOrNull {
     )
     if (-not $Script:SlotUsageCache.ContainsKey($SlotPath)) { return $null }
     $entry   = $Script:SlotUsageCache[$SlotPath]
-    $isStale = ([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -ge $Script:UsageCacheTTL
+    $ageMin  = ([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes
+    if ($ageMin -ge $Script:UsageCacheMaxAgeMin) { return $null }
+
+    $isStale = $ageMin -ge $Script:UsageCacheTTL
     if ($isStale) {
         if (-not $AllowStale) { return $null }
         $staleStatus = if ($Reason -eq 'network') { 'error' } else { 'rate-limited' }
@@ -2988,7 +3069,14 @@ function Get-SlotUsage {
     # keep-warm step can still recover the slot.
     $entry = $Script:SlotUsageCache[$SlotPath]
     if ($entry -and $entry.RateLimitedUntil -and [DateTime]::UtcNow -lt $entry.RateLimitedUntil) {
-        return New-UsageResult -Status 'rate-limited' -Data $entry.Data -CachedReason 'rate-limit'
+        # Same ceiling as Get-CachedUsageOrNull: the backoff suppresses HTTP for
+        # $Script:RateLimitBackoffSec, but the entry it serves instead can be
+        # arbitrarily older than that. Past the ceiling the short-circuit still
+        # applies (the point is not to re-trip a hot limiter) but it stops
+        # carrying numbers nobody should act on.
+        $tooOld = ([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -ge $Script:UsageCacheMaxAgeMin
+        $data   = if ($tooOld) { $null } else { $entry.Data }
+        return New-UsageResult -Status 'rate-limited' -Data $data -CachedReason 'rate-limit'
     }
 
     # Resolve a non-expired access token (refresh if needed). A token-endpoint
@@ -3723,20 +3811,16 @@ function Get-AggregateBarColor {
 # Return:
 #   * Integer in [0, 100], rounded with [math]::Round, when at least one
 #     eligible row exists. Math: sum of per-row utilization (each clamped
-#     to [0,100]; null, missing, or already-reset counted as 0) divided by
-#     cap = N*100, scaled to percent. Equivalently the mean utilization
-#     across all eligible rows.
+#     to [0,100]; null or missing counted as 0, which by Select-LiveBuckets
+#     also covers a window that has rolled) divided by cap = N*100, scaled
+#     to percent. Equivalently the mean utilization across all eligible rows.
 #   * $null when zero eligible rows. Callers decide what to render for
 #     the empty case (Format-AggregateBars emits nothing; Format-WatchTitle
 #     collapses to bare suffix).
 function Get-PoolMeanUtilization {
     Param (
         [object[]] $Results,
-        [string]   $BucketKey,
-        # Defaulted rather than threaded from the callers: both of them render,
-        # neither has a poll instant to share, and a bar whose reference time
-        # is the moment it is drawn is the honest one. Tests pass it explicitly.
-        [DateTimeOffset] $Now = [DateTimeOffset]::UtcNow
+        [string]   $BucketKey
     )
 
     if (-not $Results) { return $null }
@@ -3749,12 +3833,11 @@ function Get-PoolMeanUtilization {
 
     $usedSum = 0.0
     foreach ($r in $eligible) {
-        # Same closed-window rule as Get-RowMaxUtilization: a bucket whose
-        # resets_at has passed counts 0. Without it a stale cache entry whose
-        # 5h window has rolled kept inflating the bars while rotation and
-        # keep-warm read the same bucket as free, which is the disagreement
-        # Test-RowIsMeasurable exists to prevent.
-        $u = Get-BucketUtilizationOrZero -Bucket $r.Data.$BucketKey -Now $Now
+        # Same helper as Get-RowMaxUtilization, so a bar and the rotation
+        # decision drawn from the same row cannot report different numbers.
+        # A bucket whose window has rolled is already gone (Select-LiveBuckets)
+        # and therefore counts 0 here, exactly as a missing one does.
+        $u = Get-BucketUtilizationOrZero -Bucket $r.Data.$BucketKey
         if ($u -lt 0)   { $u = 0 }
         if ($u -gt 100) { $u = 100 }
         $usedSum += $u
@@ -4939,7 +5022,7 @@ function Get-AutoRotationDecision {
         }
     }
 
-    $activeMax = Get-RowMaxUtilization -Row $activeRow -Now $nowUtc
+    $activeMax = Get-RowMaxUtilization -Row $activeRow
     if ($activeMax -lt $Threshold) {
         # Steady state: active is below threshold; nothing to do.
         return [pscustomobject]@{
@@ -4972,7 +5055,7 @@ function Get-AutoRotationDecision {
         # bad destination. A fresh cache fallback already reports 'ok', so a
         # transient blip does not disqualify a peer.
         if ($candidate.Status -ne 'ok')         { continue }
-        $candMax = Get-RowMaxUtilization -Row $candidate -Now $nowUtc
+        $candMax = Get-RowMaxUtilization -Row $candidate
         if ($candMax -ge $Threshold)            { continue }
         $eligible = $candidate
         break
@@ -5040,44 +5123,32 @@ function Get-AutoRotationDecision {
 # utilized. Callers that must distinguish "0% because idle" from "0% because
 # unreadable" check $Row.Data themselves.
 #
-# A bucket whose resets_at has already passed contributes 0: its window has
-# rolled and the utilization we hold is known-obsolete. Without this, cached
-# data (which has no upper age bound once stale) could keep reporting a slot
-# as exhausted long after its window reset, rotating away from a slot that is
-# actually free. Same closed-window rule Test-WarmEligible applies.
+# A bucket whose window has rolled never reaches here: Select-LiveBuckets
+# removes it at New-UsageResult, so "missing" already covers "obsolete" and
+# this function does not re-test resets_at. Keeping a second copy of that rule
+# here is what let this function and the renderers disagree about one row.
 #
 # Format-WatchTitle and Get-PlanStatus keep their own bucket walking; their
 # semantics differ (Format-WatchTitle preserves nulls for display).
 function Get-RowMaxUtilization {
-    Param (
-        [Parameter(Mandatory)] [pscustomobject] $Row,
-        [Parameter(Mandatory)] [DateTimeOffset] $Now
-    )
+    Param ([Parameter(Mandatory)] [pscustomobject] $Row)
 
     if (-not (Test-RowHasUsableData -Row $Row)) { return 0.0 }
 
-    $five  = Get-BucketUtilizationOrZero -Bucket $Row.Data.five_hour -Now $Now
-    $seven = Get-BucketUtilizationOrZero -Bucket $Row.Data.seven_day -Now $Now
+    $five  = Get-BucketUtilizationOrZero -Bucket $Row.Data.five_hour
+    $seven = Get-BucketUtilizationOrZero -Bucket $Row.Data.seven_day
     if ($five -ge $seven) { return $five }
     return $seven
 }
 
-# Utilization of one usage bucket, or 0 when it is missing, has no
-# utilization, or has already reset. Extracted so Get-RowMaxUtilization reads
-# as the max of two comparable numbers instead of two inline ternaries.
+# Utilization of one usage bucket, or 0 when it is missing or carries no
+# utilization. Extracted so Get-RowMaxUtilization reads as the max of two
+# comparable numbers instead of two inline ternaries. A rolled window is
+# already absent by the time a row exists; see Select-LiveBuckets.
 function Get-BucketUtilizationOrZero {
-    Param (
-        [AllowNull()] $Bucket,
-        [Parameter(Mandatory)] [DateTimeOffset] $Now
-    )
+    Param ([AllowNull()] $Bucket)
 
     if (-not $Bucket -or $null -eq $Bucket.utilization) { return 0.0 }
-
-    if ($Bucket.resets_at) {
-        $reset = ConvertTo-DateTimeOffsetOrNull $Bucket.resets_at
-        if ($null -ne $reset -and $reset -le $Now) { return 0.0 }
-    }
-
     return [double]$Bucket.utilization
 }
 
@@ -5506,7 +5577,7 @@ function Test-WarmEligible {
         [Parameter(Mandatory)] [int]            $Threshold
     )
 
-    if ((Get-RowMaxUtilization -Row $Row -Now $Now) -ge $Threshold) { return $false }
+    if ((Get-RowMaxUtilization -Row $Row) -ge $Threshold) { return $false }
 
     if ($Row.Status -eq 'rate-limited') { return $true }
     if ($Row.Status -ne 'ok')          { return $false }
@@ -5575,7 +5646,7 @@ function Invoke-KeepWarmStep {
             # at-limit gate, not by $CooldownMin: warming re-opens a window that
             # is already full, so waiting out the cooldown changes nothing and
             # only the next window reset will.
-            $waiting = @($limited | Where-Object { (Get-RowMaxUtilization -Row $_ -Now $nowUtc) -lt $Threshold })
+            $waiting = @($limited | Where-Object { (Get-RowMaxUtilization -Row $_) -lt $Threshold })
             if ($waiting.Count -gt 0) {
                 return '[Warmup] Rate-limited; will re-warm when cooldown clears.'
             }

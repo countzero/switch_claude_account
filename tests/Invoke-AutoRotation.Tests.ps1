@@ -24,11 +24,106 @@ Describe 'switch_claude_account' {
         . (Join-Path $PSScriptRoot 'Common.ps1')
     }
 
-    Context 'Get-RowMaxUtilization' {
+    # Select-LiveBuckets is the one place the "has this window rolled" question
+    # is answered, and it answers it at New-UsageResult, before any consumer
+    # sees the row. Every renderer and both decision paths therefore read the
+    # same buckets; the tests below pin that they agree.
+    Context 'Select-LiveBuckets' {
         BeforeAll {
-            $script:MaxNow = [DateTimeOffset]::new(2026, 8, 4, 12, 0, 0, [TimeSpan]::Zero)
+            $script:LiveNow = [DateTimeOffset]::new(2026, 8, 4, 12, 0, 0, [TimeSpan]::Zero)
+            function script:IsoAt { Param ($Offset) $script:LiveNow.Add($Offset).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
         }
 
+        It 'passes null and bucket-less bodies straight through' {
+            Select-LiveBuckets -Data $null -Now $script:LiveNow | Should -BeNullOrEmpty
+            $empty = [pscustomobject]@{ extra_usage = [pscustomobject]@{ is_enabled = $false } }
+            (Select-LiveBuckets -Data $empty -Now $script:LiveNow).extra_usage.is_enabled | Should -BeFalse
+        }
+
+        It 'removes a bucket whose resets_at has passed' {
+            $data = [pscustomobject]@{
+                five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = (IsoAt ([TimeSpan]::FromHours(-1))) }
+                seven_day = [pscustomobject]@{ utilization = 20.0;  resets_at = (IsoAt ([TimeSpan]::FromDays(3))) }
+            }
+            $live = Select-LiveBuckets -Data $data -Now $script:LiveNow
+
+            # Absent, not null: a scripted `sca usage -Json` consumer testing
+            # for the key sees what every renderer sees.
+            $live.PSObject.Properties.Name | Should -Not -Contain 'five_hour'
+            $live.seven_day.utilization | Should -Be 20.0
+        }
+
+        It 'removes a bucket exactly at the reset instant' {
+            $data = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 50.0; resets_at = (IsoAt ([TimeSpan]::Zero)) } }
+            (Select-LiveBuckets -Data $data -Now $script:LiveNow).PSObject.Properties.Name |
+                Should -Not -Contain 'five_hour'
+        }
+
+        It 'keeps a bucket whose resets_at is still in the future' {
+            $data = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = (IsoAt ([TimeSpan]::FromMinutes(12))) } }
+            (Select-LiveBuckets -Data $data -Now $script:LiveNow).five_hour.utilization | Should -Be 100.0
+        }
+
+        It 'keeps a bucket with no resets_at, and one it cannot parse' {
+            $data = [pscustomobject]@{
+                five_hour = [pscustomobject]@{ utilization = 77.0; resets_at = 'garbage' }
+                seven_day = [pscustomobject]@{ utilization = 66.0; resets_at = $null }
+            }
+            $live = Select-LiveBuckets -Data $data -Now $script:LiveNow
+            $live.five_hour.utilization | Should -Be 77.0
+            $live.seven_day.utilization | Should -Be 66.0
+        }
+
+        It 'never mutates the cached body it was handed' {
+            # $Script:SlotUsageCache holds what the server actually said; its
+            # own Timestamp is what ages it. Mutating in place would corrupt
+            # every later read of the same entry.
+            $data = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = (IsoAt ([TimeSpan]::FromHours(-1))) } }
+            Select-LiveBuckets -Data $data -Now $script:LiveNow | Out-Null
+            $data.five_hour.utilization | Should -Be 100.0
+        }
+
+        It 'is applied by New-UsageResult, so no consumer can see a rolled bucket' {
+            $data = [pscustomobject]@{
+                five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = (IsoAt ([TimeSpan]::FromHours(-1))) }
+                seven_day = [pscustomobject]@{ utilization = 20.0;  resets_at = (IsoAt ([TimeSpan]::FromDays(3))) }
+            }
+            $row = New-UsageResult -Status 'ok' -Data $data -Now $script:LiveNow
+            $row.Data.PSObject.Properties.Name | Should -Not -Contain 'five_hour'
+        }
+
+        # The regression this whole change exists for: one row printed '100%
+        # now' in the Session cell and 'limited 5h' in Status while the
+        # aggregate bar above it read 0%, the terminal title read '[!] 100%',
+        # and auto-rotation treated the slot as idle and refused to move.
+        It 'leaves the cell, the status, the bar, the title and rotation agreeing' {
+            $data = [pscustomobject]@{
+                five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = (IsoAt ([TimeSpan]::FromHours(-1))) }
+                seven_day = [pscustomobject]@{ utilization = 20.0;  resets_at = (IsoAt ([TimeSpan]::FromDays(3))) }
+            }
+            $result = New-UsageResult -Status 'ok' -Data $data -CachedReason 'network' -Now $script:LiveNow
+            $row    = [pscustomobject]@{
+                Name = 'a'; IsActive = $true; Status = $result.Status; Data = $result.Data
+                Error = $result.Error; Email = $null; HttpStatus = $null
+                IsCachedFallback = $result.IsCachedFallback; FallbackReason = $result.FallbackReason
+            }
+
+            $table = Format-UsageTable -Results @($row) 6>&1 | Out-String
+
+            # Session cell: em-dash, not '100% now'.
+            $table | Should -Not -Match '100%'
+            # Status: no longer 'limited 5h'.
+            Get-PlanStatus $row.Data | Should -Be 'ok'
+            # Bar and rotation: both read the surviving 7d bucket only.
+            Get-PoolMeanUtilization -Results @($row) -BucketKey 'five_hour' | Should -Be 0
+            Get-RowMaxUtilization -Row $row | Should -Be 20.0
+            # Title: the 5h segment reads as no-data, not as an alarm.
+            Format-WatchTitle -Snapshot ([pscustomobject]@{ Results = @($row); NoSlots = $false }) |
+                Should -Not -Match '\[!\]'
+        }
+    }
+
+    Context 'Get-RowMaxUtilization' {
         It 'returns max of two non-null utilizations' {
             $row = [pscustomobject]@{
                 Status = 'ok'
@@ -37,7 +132,7 @@ Describe 'switch_claude_account' {
                     seven_day = [pscustomobject]@{ utilization = 80.0; resets_at = $null }
                 }
             }
-            Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 80.0
+            Get-RowMaxUtilization -Row $row | Should -Be 80.0
         }
 
         It 'treats null five_hour as 0 and returns seven_day' {
@@ -48,7 +143,7 @@ Describe 'switch_claude_account' {
                     seven_day = [pscustomobject]@{ utilization = 99.0; resets_at = $null }
                 }
             }
-            Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 99.0
+            Get-RowMaxUtilization -Row $row | Should -Be 99.0
         }
 
         It 'treats both buckets null as 0' {
@@ -59,12 +154,12 @@ Describe 'switch_claude_account' {
                     seven_day = $null
                 }
             }
-            Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 0.0
+            Get-RowMaxUtilization -Row $row | Should -Be 0.0
         }
 
         It 'returns 0 when the row carries no Data at all' {
             $row = [pscustomobject]@{ Status = 'error'; Data = $null }
-            Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 0.0
+            Get-RowMaxUtilization -Row $row | Should -Be 0.0
         }
 
         # This used to return 0 for ANY non-ok row
@@ -82,70 +177,40 @@ Describe 'switch_claude_account' {
                         seven_day = $null
                     }
                 }
-                Get-RowMaxUtilization -Row $row -Now $script:MaxNow |
+                Get-RowMaxUtilization -Row $row |
                     Should -Be 99.0 -Because "status '$status' still carries usable percentages"
             }
         }
 
-        # Cached data has no upper age bound once stale, so without this a
-        # long-failing slot would keep reporting the utilization it had before
-        # its window reset, rotating away from a slot that is actually free.
-        It 'treats a bucket whose resets_at has passed as 0 (window rolled)' {
+        # The window-rolled rule lives in Select-LiveBuckets, one layer up, so
+        # a rolled bucket is already absent by the time a row exists. Reading
+        # resets_at again here is what let this function and the table
+        # disagree; the Select-LiveBuckets Context owns those cases now.
+        It 'reads resets_at nowhere, so a rolled bucket that reached it still counts' {
             $row = [pscustomobject]@{
                 Status = 'ok'
                 Data   = [pscustomobject]@{
-                    five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $script:MaxNow.AddHours(-1).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
-                    seven_day = [pscustomobject]@{ utilization = 20.0;  resets_at = $script:MaxNow.AddDays(3).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
-                }
-            }
-            Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 20.0
-        }
-
-        It 'keeps a bucket whose resets_at is still in the future' {
-            $row = [pscustomobject]@{
-                Status = 'ok'
-                Data   = [pscustomobject]@{
-                    five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = $script:MaxNow.AddMinutes(12).ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
+                    five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = '2000-01-01T00:00:00Z' }
                     seven_day = $null
                 }
             }
-            Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 100.0
-        }
-
-        It 'ignores an unparseable resets_at rather than zeroing the bucket' {
-            $row = [pscustomobject]@{
-                Status = 'ok'
-                Data   = [pscustomobject]@{
-                    five_hour = [pscustomobject]@{ utilization = 77.0; resets_at = 'garbage' }
-                    seven_day = $null
-                }
-            }
-            Get-RowMaxUtilization -Row $row -Now $script:MaxNow | Should -Be 77.0
+            Get-RowMaxUtilization -Row $row | Should -Be 100.0
         }
     }
 
     Context 'Get-BucketUtilizationOrZero' {
-        BeforeAll {
-            $script:BucketNow = [DateTimeOffset]::new(2026, 8, 4, 12, 0, 0, [TimeSpan]::Zero)
-        }
-
         It 'returns 0 for a null bucket' {
-            Get-BucketUtilizationOrZero -Bucket $null -Now $script:BucketNow | Should -Be 0.0
+            Get-BucketUtilizationOrZero -Bucket $null | Should -Be 0.0
         }
 
         It 'returns 0 when utilization is null' {
             $b = [pscustomobject]@{ utilization = $null; resets_at = $null }
-            Get-BucketUtilizationOrZero -Bucket $b -Now $script:BucketNow | Should -Be 0.0
+            Get-BucketUtilizationOrZero -Bucket $b | Should -Be 0.0
         }
 
-        It 'returns 0 for utilization exactly at the reset instant' {
-            $b = [pscustomobject]@{ utilization = 50.0; resets_at = $script:BucketNow.ToString('o', [Globalization.CultureInfo]::InvariantCulture) }
-            Get-BucketUtilizationOrZero -Bucket $b -Now $script:BucketNow | Should -Be 0.0
-        }
-
-        It 'returns the utilization when there is no resets_at' {
-            $b = [pscustomobject]@{ utilization = 50.0; resets_at = $null }
-            Get-BucketUtilizationOrZero -Bucket $b -Now $script:BucketNow | Should -Be 50.0
+        It 'returns the utilization regardless of resets_at' {
+            $b = [pscustomobject]@{ utilization = 50.0; resets_at = '2000-01-01T00:00:00Z' }
+            Get-BucketUtilizationOrZero -Bucket $b | Should -Be 50.0
         }
     }
 
