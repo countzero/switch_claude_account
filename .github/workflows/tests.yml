@@ -9,6 +9,15 @@ on:
 permissions:
   contents: read
 
+# A push to `develop` while a PR from it is open matches both triggers, so the
+# whole 3-OS matrix ran twice for one commit. Keyed on the ref rather than the
+# event so those two runs collapse into one. Superseded runs are cancelled:
+# the tip is the only revision anyone reads a verdict from, and a 70-second
+# suite is not worth protecting a stale one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pester:
     # Every platform the script supports. fail-fast is off so one platform's
