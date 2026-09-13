@@ -141,12 +141,12 @@ The output shows the 5-hour session limit (`Session` column, "Current session" i
 
 Decoding the output:
 
-- **Pool-aggregate bars**: sum utilization across HTTP-ok slots over `N × 100%`. Bar color: green &lt;50%, yellow ≥50%, red ≥90%.
+- **Pool-aggregate bars**: sum utilization over `N × 100%` across every slot with numbers to show, whether read live or served from the cache after a failed read, so the bars never contradict the rows beneath them. Bar color: green &lt;50%, yellow ≥50%, red ≥90%.
 - **Active marker (`*`)**: sourced from `~/.claude/.sca-state.json`; appears at the start of the row and inherits the row's color.
 - **`Account` column**: the OAuth email captured at save time. Shows `—` when the email equals the slot name (deduped filename), the actual email otherwise.
-- **`Session` / `Week` cells**: `<pct>% <delta>`. The delta is `(2h 11m)` under 24h with minute precision, `(102h)` at 24h+ with integer hours, `now` if the reset is past, or `—` when no data is available.
+- **`Session` / `Week` cells**: `<pct>% <delta>`. The delta is `(2h 11m)` under 24h with minute precision, `(102h)` at 24h+ with integer hours, or `—` when there is no data. A bucket whose window has already rolled also shows `—`: the percentage it carried describes a window the account has left, so it is dropped rather than shown as stale.
 - **`Status` column**: one of `ok`, `near limit` (≥90%), `limited 5h` / `limited 7d` (≥100%), `error` (`error <code>` on an HTTP failure that carried one), `expired`, `unauthorized`, `rate-limited`, or `no-oauth`. Status drives the entire row's color.
-- **Failure reasons**: labels stay short so they cannot widen the table. Why a slot failed prints below it as `[Usage] <slot>: <reason>`. Up to three slots get the API's own message; `expired`, `unauthorized` and `no-oauth` slots beyond that get one grouped remedy line per status, so no failed slot is left unexplained.
+- **Failure reasons**: labels stay short so they cannot widen the table. Why a slot failed prints below it as `[Usage] <slot>: <reason>`. The block is capped at eight lines so it cannot push the table off screen in a live watch; the lines naming every affected slot and the per-status remedies (`expired`, `unauthorized`, `no-oauth`) are kept first, and up to three per-slot messages take whatever is left. No failed slot is left unexplained.
 
 Drill into a single slot for absolute reset times in your local timezone:
 
