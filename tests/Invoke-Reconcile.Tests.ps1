@@ -718,6 +718,30 @@ Describe 'switch_claude_account' {
             $sidecar.source | Should -Be 'api_profile'
         }
 
+        # Unlike Invoke-SaveAction's identical call, this one can run beside a
+        # live client. Refreshing to resolve an identity would rotate the
+        # refresh token out from under it AND rewrite the very file whose bytes
+        # reconcile read at the top, stranding the ($bytes, $hash) pair every
+        # branch below is decided on.
+        It 'never refreshes the active credentials to resolve a fallback identity' {
+            $credFile = Join-Path $script:CD '.credentials.json'
+            Set-Content -LiteralPath $credFile -NoNewline `
+                -Value '{"claudeAiOauth":{"accessToken":"sk-ant-oat-OLD","refreshToken":"sk-ant-ort-OLD","expiresAt":1}}'
+            Set-Content -LiteralPath $ClaudeJsonPath -Value '{"numStartups":1}' -NoNewline -Encoding utf8NoBOM
+
+            Mock Update-SlotTokens { throw 'the identity fallback must not rotate tokens' }
+
+            $before = @(Get-CredentialSlotFiles).Count
+
+            $r = Invoke-Reconcile 6>$null
+
+            Should -Invoke Update-SlotTokens -Times 0
+            # No identity, so the unattributable-bytes branch takes over.
+            $r.Action | Should -Be 'noop'
+            $r.Reason | Should -Be 'identity-unresolved'
+            @(Get-CredentialSlotFiles).Count | Should -Be $before
+        }
+
         # When state.active_slot points at a slot whose sidecar email
         # matches the profile-fallback email, reconcile mirrors (no
         # cross-account swap). Exercises the sidecar-email comparison

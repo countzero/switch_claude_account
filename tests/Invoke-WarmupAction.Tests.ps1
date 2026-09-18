@@ -35,7 +35,7 @@ Describe 'switch_claude_account' {
         # Stub the orchestration's side effects so no real claude spawns and
         # no real HTTP fires; each slot resolves to a healthy 'ok' row.
         Mock Invoke-SlotSwap      -MockWith { }
-        Mock Invoke-Reconcile     -MockWith { }
+        Mock Invoke-Reconcile     -MockWith { New-ReconcileResult }
         Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'ok' } }
         Mock Get-SlotUsage        -MockWith {
             [pscustomobject]@{
@@ -63,6 +63,20 @@ Describe 'switch_claude_account' {
             New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null
 
             { Invoke-WarmupAction -Name '' 6>$null } | Should -Throw -ExpectedMessage "*claude*not found*"
+        }
+
+        # The warm pass makes every slot active in turn, so it overwrites
+        # .credentials.json once per slot. Starting it on bytes reconcile could
+        # not attribute discards them on the very first swap.
+        It 'refuses when reconcile could not capture the active credentials' {
+            Mock Invoke-Reconcile -MockWith {
+                [pscustomobject]@{ Action = 'noop'; Reason = 'identity-unresolved'; Slot = 'a'; Captured = $false }
+            }
+            New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null
+
+            { Invoke-WarmupAction -Name '' 6>$null } |
+                Should -Throw -ExpectedMessage '*could not be attributed to an account*'
+            Should -Invoke Invoke-SlotActivator -Times 0 -Exactly
         }
 
         It 'prints an advisory and does not throw when no slots are saved' {

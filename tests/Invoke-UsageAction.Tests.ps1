@@ -3313,7 +3313,7 @@ Describe 'switch_claude_account' {
 
             # The mirror step after an ok activation calls Invoke-Reconcile;
             # the orchestration does not care about its internals, so stub it.
-            Mock Invoke-Reconcile -MockWith { }
+            Mock Invoke-Reconcile -MockWith { New-ReconcileResult }
 
             # Default /api/oauth/usage mock for the verify-after-activation
             # read: an ok activation triggers a Get-SlotUsage call so the

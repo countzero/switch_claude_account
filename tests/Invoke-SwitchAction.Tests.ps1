@@ -519,6 +519,50 @@ Describe 'switch_claude_account' {
             Get-Content -LiteralPath $script:CredFilePath  -Raw | Should -Be 'NEW_TARGET'
             (Read-ScaState).active_slot | Should -Be 'new'
         }
+
+        # Reconciling first is only worth anything if a reconcile that captured
+        # nothing stops the switch. Proceeding would overwrite the very bytes it
+        # failed to save, leaving the outgoing slot holding a refresh token the
+        # server has already rotated: a dead login, and nothing later repairs it.
+        It 'refuses to switch when reconcile could not capture the active credentials' {
+            $oldSlot = New-SlotPair -CredDir $script:CredDirPath -Name 'old' -Content 'STALE_OLD'
+            New-SlotPair -CredDir $script:CredDirPath -Name 'new' -Content 'NEW_TARGET' | Out-Null
+
+            # No oauthAccount in ~/.claude.json and Common.ps1's profile mock
+            # throws, so reconcile cannot attribute the changed bytes.
+            Set-Content -LiteralPath $ClaudeJsonPath -Value '{"numStartups":1}' -NoNewline -Encoding utf8NoBOM
+            Set-Content -LiteralPath $script:CredFilePath -Value 'REFRESHED' -NoNewline
+            Update-ScaState -ActiveSlot 'old' -LastSyncHash 'STALE_HASH' | Out-Null
+
+            { Invoke-SwitchAction -Name 'new' 6>$null } |
+                Should -Throw "*could not be attributed to an account*"
+
+            Get-Content -LiteralPath $script:CredFilePath -Raw |
+                Should -Be 'REFRESHED' -Because 'the uncaptured bytes must survive the refusal'
+            Get-Content -LiteralPath $oldSlot -Raw | Should -Be 'STALE_OLD'
+            (Read-ScaState).active_slot | Should -Be 'old'
+        }
+
+        # The recovery has to name the slot at stake; two of the three callers
+        # suppress reconcile's own advisory, so this string is all the user gets.
+        It 'names the outgoing slot and its recovery in the refusal' {
+            $sync = [pscustomobject]@{ Action = 'noop'; Reason = 'identity-unresolved'; Slot = 'work'; Captured = $false }
+
+            $msg = Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca switch'
+
+            $msg | Should -BeLike "*'sca switch'*"
+            $msg | Should -BeLike "*slot 'work'*"
+            $msg | Should -BeLike "*'sca save work'*"
+        }
+
+        It 'offers a name of the user''s choosing when no slot is tracked' {
+            $sync = [pscustomobject]@{ Action = 'noop'; Reason = 'identity-unresolved'; Slot = $null; Captured = $false }
+
+            $msg = Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca warmup'
+
+            $msg | Should -BeLike "*'sca save <name>'*"
+            $msg | Should -Not -BeLike '*slot ''''*'
+        }
     }
 
     Context 'Invoke-SlotSwap' {

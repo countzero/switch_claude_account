@@ -2278,9 +2278,24 @@ function Test-CredentialAccountMatch {
 # can assert on the action without parsing stdout. Stdout still carries
 # the user-visible advisory for the two non-silent branches (auto-save,
 # identity-change).
+#
+# `Captured` on that object answers the one question every caller that goes on
+# to overwrite .credentials.json has to ask: are the bytes currently in it
+# safely represented on disk? It is $false for exactly the two outcomes that
+# saw changed bytes and deliberately wrote nothing (identity-unresolved,
+# credentials-changed-mid-probe). Swapping on top of those discards a refresh
+# the tracked slot never received, leaving it holding a refresh token the
+# server has already rotated -- a dead login, and the one loss here that no
+# later pass can repair. Callers must read the field rather than allowlist
+# Action values; the allowlist is what missed these two when they were added.
+#
+# `Captured` and "did the active slot move" are different questions. The
+# second is answered by Action alone (adopt / identity-change / auto-save all
+# move it), and only auto-rotation cares, because only it holds a decision
+# computed before the call.
 function Invoke-Reconcile {
     if (-not (Test-Path -LiteralPath $CredFile)) {
-        return [pscustomobject]@{ Action = 'noop'; Reason = 'no-active-credentials' }
+        return [pscustomobject]@{ Action = 'noop'; Reason = 'no-active-credentials'; Captured = $true }
     }
 
     $bytes = [System.IO.File]::ReadAllBytes($CredFile)
@@ -2294,7 +2309,7 @@ function Invoke-Reconcile {
 
     $state = Read-ScaState
     if ($state -and $state.last_sync_hash -eq $hash) {
-        return [pscustomobject]@{ Action = 'noop'; Reason = 'hash-match' }
+        return [pscustomobject]@{ Action = 'noop'; Reason = 'hash-match'; Captured = $true }
     }
 
     # Bytes differ from last sync. Resolve new identity. Preferred: read
@@ -2309,7 +2324,10 @@ function Invoke-Reconcile {
     $newEmail    = if ($newAccount) { $newAccount.emailAddress } else { $null }
     $sourceLabel = 'claude_json'
     if (-not $newEmail) {
-        $profileResult = Get-SlotProfile -SlotPath $CredFile
+        # -NoRefresh because this path runs beside a live client, unlike
+        # Invoke-SaveAction's identical call. A refresh here would also rewrite
+        # .credentials.json and strand the ($bytes, $hash) pair read above.
+        $profileResult = Get-SlotProfile -SlotPath $CredFile -NoRefresh
         if ($profileResult.Status -eq 'ok') {
             $newEmail    = $profileResult.Email
             $newAccount  = New-OAuthAccountFromProfile -ProfileResult $profileResult
@@ -2368,6 +2386,7 @@ function Invoke-Reconcile {
             Slot         = $twin.Name
             PreviousSlot = $activeName
             Email        = $twin.Email
+            Captured     = $true
         }
     }
 
@@ -2391,9 +2410,10 @@ function Invoke-Reconcile {
         }
         Write-Color "[Sync] Active credentials changed but no account could be read from ~/.claude.json or /api/oauth/profile, $tail" 'Yellow'
         return [pscustomobject]@{
-            Action = 'noop'
-            Reason = 'identity-unresolved'
-            Slot   = $activeName
+            Action   = 'noop'
+            Reason   = 'identity-unresolved'
+            Slot     = $activeName
+            Captured = $false
         }
     }
 
@@ -2436,9 +2456,10 @@ function Invoke-Reconcile {
                     Set-CredentialFileAtomic -Path $slot.Path -Bytes $bytes
                     Update-ScaState -LastSyncHash $hash | Out-Null
                     return [pscustomobject]@{
-                        Action = 'mirror'
-                        Slot   = $state.active_slot
-                        Email  = $slotEmail
+                        Action   = 'mirror'
+                        Slot     = $state.active_slot
+                        Email    = $slotEmail
+                        Captured = $true
                     }
                 }
 
@@ -2461,9 +2482,10 @@ function Invoke-Reconcile {
                 if (-not $stillSame) {
                     Write-Color "[Sync] Active credentials changed while their account was being verified, so slot '$($state.active_slot)' is left untouched rather than risk filing one account's tokens under another's name. The next run reads them afresh." 'Yellow'
                     return [pscustomobject]@{
-                        Action = 'noop'
-                        Reason = 'credentials-changed-mid-probe'
-                        Slot   = $state.active_slot
+                        Action   = 'noop'
+                        Reason   = 'credentials-changed-mid-probe'
+                        Slot     = $state.active_slot
+                        Captured = $false
                     }
                 }
 
@@ -2494,6 +2516,7 @@ function Invoke-Reconcile {
                 Slot         = $autoName
                 PreviousSlot = $state.active_slot
                 Email        = $newEmail
+                Captured     = $true
             }
         }
         # state.active_slot pointed at a slot file that no longer exists
@@ -2511,10 +2534,32 @@ function Invoke-Reconcile {
     $autoIdent = Format-SlotIdentity -Name $autoName -Email $newEmail
     Write-Color "[Sync] Auto-saved unknown active credentials as $autoIdent." 'Yellow'
     return [pscustomobject]@{
-        Action = 'auto-save'
-        Slot   = $autoName
-        Email  = $newEmail
+        Action   = 'auto-save'
+        Slot     = $autoName
+        Email    = $newEmail
+        Captured = $true
     }
+}
+
+# Build the refusal an action throws when it was about to overwrite
+# .credentials.json and Invoke-Reconcile reported `Captured = $false`.
+#
+# Self-contained on purpose: two of the three callers suppress reconcile's own
+# advisory (6>$null, to keep JSON parseable and watch frames intact), so this
+# is the only thing the user sees. It names the recovery for the same reason
+# the adopt advisory does -- nothing retries a refused action on its own.
+function Get-UncapturedCredentialsRefusal {
+    Param (
+        [Parameter(Mandatory)] [pscustomobject] $Sync,
+        [Parameter(Mandatory)] [String] $ActionLabel
+    )
+
+    $stake = if ($Sync.Slot) {
+        "so the token refresh they carry would be lost and slot '$($Sync.Slot)' left holding a refresh token the server has already rotated. Re-run once an account can be resolved, or run 'sca save $($Sync.Slot)' to capture them now"
+    } else {
+        "so they would be lost with no saved copy anywhere. Re-run once an account can be resolved, or run 'sca save <name>' to capture them first"
+    }
+    return "The active credentials could not be attributed to an account, so nothing captured them. '$ActionLabel' overwrites them, $stake."
 }
 
 # We are extracting each action body into its own function so the logic
@@ -2768,7 +2813,14 @@ function Invoke-SwitchAction {
     # identity-change branch, its yellow advisory prints above the
     # subsequent switch output; that is desired (the user sees
     # context for the unusual state).
-    Invoke-Reconcile | Out-Null
+    #
+    # Refusing when it could not capture is the whole point of reconciling
+    # here: a switch that proceeds anyway destroys the refresh it was meant to
+    # preserve. See Invoke-Reconcile's `Captured`.
+    $sync = Invoke-Reconcile
+    if (-not $sync.Captured) {
+        throw (Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca switch')
+    }
 
     # When invoked without a name, rotate to the next saved slot
     # (alphabetical, wrap-around). Get-NextSlotName returns $null for
@@ -5427,8 +5479,13 @@ function Invoke-WarmupAction {
     }
 
     # Reconcile first so a cross-account swap landed since the last sca call
-    # is captured before any slot bytes are read (matches list / usage).
-    Invoke-Reconcile | Out-Null
+    # is captured before any slot bytes are read (matches list / usage), and
+    # refuse if it could not: this walk overwrites .credentials.json once per
+    # slot. See Invoke-Reconcile's `Captured`.
+    $sync = Invoke-Reconcile
+    if (-not $sync.Captured) {
+        throw (Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca warmup')
+    }
 
     Write-Color "[Warmup] Activating saved slots via 'claude -p' (billable; ~`$0.004/slot on Haiku, a few seconds each)..." 'DarkYellow'
 
@@ -5809,6 +5866,15 @@ function Invoke-AutoRotationStep {
                 # failure, which is correct -- rotating away from a slot we
                 # could not capture is the loss this call exists to prevent.
                 $sync = Invoke-Reconcile 6>$null
+
+                # A reconcile that wrote nothing leaves the swap below about to
+                # discard the refresh this call exists to preserve, so the tick
+                # is abandoned for the same reason a throw would abandon it.
+                # Nothing is lost by waiting: the next poll re-reads and the
+                # threshold that triggered this will still be crossed.
+                if (-not $sync.Captured) {
+                    return '[Monitor] Rotation refused! The active slot''s latest tokens could not be captured; retrying at the next poll.'
+                }
 
                 # Reconcile is not only a capture. Adopt, identity-change and
                 # auto-save each move state.active_slot, and that makes
@@ -6413,7 +6479,13 @@ function Invoke-UsageWatch {
         # any slot bytes are read; matches the polling loop's per-poll
         # contract below.
         if ($Warmup) {
-            Invoke-Reconcile 6>$null | Out-Null
+            # Refuse rather than warm on top of bytes nothing captured; the
+            # round-robin below overwrites .credentials.json once per slot.
+            # See Invoke-Reconcile's `Captured`.
+            $sync = Invoke-Reconcile 6>$null
+            if (-not $sync.Captured) {
+                throw (Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca monitor -KeepWarm')
+            }
 
             # -Auto's right-aligned "▶ switching slot at N%" header
             # indicator stays off when -Auto is absent.

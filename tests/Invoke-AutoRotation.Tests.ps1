@@ -629,7 +629,7 @@ Describe 'switch_claude_account' {
                 FromName = 'work'
                 ToName   = 'personal'
             } }
-            Mock Invoke-Reconcile { }
+            Mock Invoke-Reconcile { New-ReconcileResult }
             Mock Find-SlotByName  { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap  { }
 
@@ -650,7 +650,7 @@ Describe 'switch_claude_account' {
                 ToName   = 'personal'
             } }
             Mock Test-ClaudeRunning { $true }
-            Mock Invoke-Reconcile { }
+            Mock Invoke-Reconcile { New-ReconcileResult }
             Mock Find-SlotByName  { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap    { }
 
@@ -666,7 +666,7 @@ Describe 'switch_claude_account' {
                 FromName = 'work'
                 ToName   = 'personal'
             } }
-            Mock Invoke-Reconcile { }
+            Mock Invoke-Reconcile { New-ReconcileResult }
             Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap { throw [System.IO.IOException]::new('locked file') }
 
@@ -683,7 +683,7 @@ Describe 'switch_claude_account' {
                 FromName = 'work'
                 ToName   = 'personal'
             } }
-            Mock Invoke-Reconcile { }
+            Mock Invoke-Reconcile { New-ReconcileResult }
             Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap { throw [System.IO.IOException]::new("first line`r`nsecond line") }
 
@@ -699,7 +699,7 @@ Describe 'switch_claude_account' {
                 FromName = 'work'
                 ToName   = 'personal'
             } }
-            Mock Invoke-Reconcile { }
+            Mock Invoke-Reconcile { New-ReconcileResult }
             Mock Find-SlotByName { return $null }
             Mock Invoke-SlotSwap { }
 
@@ -759,7 +759,11 @@ Describe 'switch_claude_account' {
                 FromName = 'work'
                 ToName   = 'personal'
             } }
-            Mock Invoke-Reconcile { return [pscustomobject]@{ Action = $Outcome; Slot = 'someone-else' } }.GetNewClosure()
+            # Built outside the scriptblock: GetNewClosure captures the scope as
+            # it stands now, and Common.ps1's fixtures are not resolvable from
+            # inside it. Capturing the finished object sidesteps that.
+            $syncResult = New-ReconcileResult -Action $Outcome -Slot 'someone-else'
+            Mock Invoke-Reconcile { $syncResult }.GetNewClosure()
             Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap { }
 
@@ -767,6 +771,31 @@ Describe 'switch_claude_account' {
 
             Should -Invoke Invoke-SlotSwap -Times 0
             $out | Should -Be "[Monitor] Active account changed to 'someone-else'; re-evaluating at the next poll."
+        }
+
+        # The capture is the reason that reconcile is there. An outcome that
+        # wrote nothing leaves the swap about to discard the refresh it was
+        # meant to preserve, so the tick is abandoned exactly as a throw would
+        # abandon it. Waiting costs nothing: the threshold is still crossed at
+        # the next poll.
+        It 'on rotate refuses when reconcile captured nothing' -ForEach @(
+            @{ Reason = 'identity-unresolved' }
+            @{ Reason = 'credentials-changed-mid-probe' }
+        ) {
+            Mock Get-AutoRotationDecision { return [pscustomobject]@{
+                Action   = 'rotate'
+                FromName = 'work'
+                ToName   = 'personal'
+            } }
+            $syncResult = New-ReconcileResult -Action 'noop' -Reason $Reason -Slot 'work' -Captured $false
+            Mock Invoke-Reconcile { $syncResult }.GetNewClosure()
+            Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
+            Mock Invoke-SlotSwap { }
+
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch 'x'
+
+            Should -Invoke Invoke-SlotSwap -Times 0
+            $out | Should -Be "[Monitor] Rotation refused! The active slot's latest tokens could not be captured; retrying at the next poll."
         }
 
         # The capture outcomes leave the active slot where it was, so the
@@ -777,7 +806,7 @@ Describe 'switch_claude_account' {
                 FromName = 'work'
                 ToName   = 'personal'
             } }
-            Mock Invoke-Reconcile { return [pscustomobject]@{ Action = 'mirror'; Slot = 'work' } }
+            Mock Invoke-Reconcile { New-ReconcileResult -Action 'mirror' -Slot 'work' }
             Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap { }
 

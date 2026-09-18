@@ -195,3 +195,27 @@ function Set-SandboxClaudeJson {
 
     Set-Content -LiteralPath $ClaudeJsonPath -Value ($top | ConvertTo-Json -Depth 6) -NoNewline -Encoding utf8NoBOM
 }
+
+# New-ReconcileResult: the shape `Mock Invoke-Reconcile` must return.
+#
+# A bare `Mock Invoke-Reconcile { }` returns $null, which reads as
+# Captured = $false to every caller that checks it, so a stub meant to say
+# "reconcile is not what this test is about" silently asserts the opposite.
+# Defaulting to the hash-match noop keeps such a stub inert.
+function New-ReconcileResult {
+    Param (
+        [string] $Action   = 'noop',
+        [string] $Reason   = 'hash-match',
+        [string] $Slot,
+        [string] $Email,
+        [bool]   $Captured = $true
+    )
+
+    return [pscustomobject]@{
+        Action   = $Action
+        Reason   = $Reason
+        Slot     = $Slot
+        Email    = $Email
+        Captured = $Captured
+    }
+}
