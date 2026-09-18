@@ -408,6 +408,42 @@ Describe 'switch_claude_account' {
                 Should -Be $script:CredsBody -Because 'the tracked login is the artifact that cannot be recovered'
         }
 
+        # The probe answers about the file it read, not about the bytes read at
+        # the top of reconcile, and a /login landing between the two is the
+        # event this branch exists to catch. Auto-saving anyway would file the
+        # OLD account's tokens under the NEW account's email and uuid: the
+        # mislabelled slot `sca save` refuses to create, with nothing later to
+        # correct it.
+        It 'writes nothing when the credentials move while their account is being verified' {
+            Mock Test-ClaudeRunning { $true }
+
+            $credPath = $script:GuardCred
+            Mock Invoke-RestMethod -ParameterFilter {
+                $Uri -eq 'https://api.anthropic.com/api/oauth/profile'
+            } -MockWith {
+                # A third account lands in .credentials.json mid-probe.
+                Set-Content -LiteralPath $credPath -NoNewline `
+                    -Value '{"claudeAiOauth":{"accessToken":"sk-ant-oat-THIRD","refreshToken":"sk-ant-ort-THIRD","expiresAt":9999999999999}}'
+                return [pscustomobject]@{
+                    account      = [pscustomobject]@{ uuid = 'test-acct-uuid-INTRUDER'; email = 'intruder@example.com' }
+                    organization = [pscustomobject]@{ uuid = 'org-uuid' }
+                }
+            }.GetNewClosure()
+
+            $before = @(Get-CredentialSlotFiles).Count
+
+            $r = Invoke-Reconcile 6>$null
+            $r.Action | Should -Be 'noop'
+            $r.Reason | Should -Be 'credentials-changed-mid-probe'
+            $r.Slot   | Should -Be 'work'
+
+            @(Get-CredentialSlotFiles).Count | Should -Be $before -Because 'no slot may be minted from bytes the probe did not see'
+            Get-Content -LiteralPath $script:GuardSlot -Raw | Should -Be $script:CredsBody
+            # Hash not advanced, so the next reconcile re-reads and re-decides.
+            (Read-ScaState).last_sync_hash | Should -Be 'STALE_HASH'
+            (Read-ScaState).active_slot    | Should -Be 'work'
+        }
+
         It 'mirrors when the tokens confirm the same account despite a new token pair' {
             Mock Test-ClaudeRunning { $true }
             MockProfileUuid -Uuid 'test-acct-uuid-work' -Email 'alice@example.com'

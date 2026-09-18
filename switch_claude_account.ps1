@@ -2231,7 +2231,9 @@ function Test-CredentialAccountMatch {
 #   5. tracked slot exists, identity matches       -> mirror bytes -> slot
 #   6. tracked slot exists, identity DIFFERS       -> auto-save under new name
 #                                                     (cross-account swap detected;
-#                                                      old slot file preserved)
+#                                                      old slot file preserved, or
+#                                                      noop when the file moved
+#                                                      under the identity probe)
 #   7. no tracked slot, OR slot file is gone       -> auto-save under new name
 #
 # Outcomes 3 and 4 exist to guard the three that write, and both are ordered
@@ -2437,6 +2439,31 @@ function Invoke-Reconcile {
                         Action = 'mirror'
                         Slot   = $state.active_slot
                         Email  = $slotEmail
+                    }
+                }
+
+                # The probe answered about .credentials.json as it stood when
+                # it read the file, NOT about $bytes, which were read at the
+                # top of this function. Between the two sit a ~/.claude.json
+                # parse, a hash pass over every slot, a Get-Process, and an
+                # HTTP round trip; and a /login landing inside that window is
+                # the very event this branch exists to catch. Writing anyway
+                # would file the OLD account's tokens under the NEW account's
+                # email and uuid, which is precisely the mislabelled slot
+                # `sca save` refuses to create, with no later pass to correct
+                # it. A re-hash is cheap next to the request just made.
+                #
+                # Only the mismatch arm pays for it. The mirror arm above
+                # writes bytes we read into a slot we already attribute, which
+                # the read-once contract at the top of this docblock already
+                # sanctions: one refresh stale, caught by the next reconcile.
+                $stillSame = try { (Get-SHA256Hex -Path $CredFile) -eq $hash } catch { $false }
+                if (-not $stillSame) {
+                    Write-Color "[Sync] Active credentials changed while their account was being verified, so slot '$($state.active_slot)' is left untouched rather than risk filing one account's tokens under another's name. The next run reads them afresh." 'Yellow'
+                    return [pscustomobject]@{
+                        Action = 'noop'
+                        Reason = 'credentials-changed-mid-probe'
+                        Slot   = $state.active_slot
                     }
                 }
 
