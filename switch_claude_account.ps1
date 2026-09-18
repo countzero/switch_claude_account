@@ -353,7 +353,7 @@ $Script:TokenRefreshRetryDelayMs = 2000
 #
 # Everything this tool does rests on .credentials.json being the active login,
 # so it is worth recording what that premise is and how it could stop holding.
-# Extracted from claude.exe 2.1.270 with the same string-scan recipe as above.
+# Extracted from claude.exe 2.1.274 with the same string-scan recipe as above.
 #
 # Claude Code's secureStorage module defines exactly two credential backends:
 #
@@ -1011,13 +1011,49 @@ function Update-ScaState {
 #      block back into ~/.claude.json so Claude Code's display follows the
 #      active slot across switches.
 #
-# Writing is gated by Test-ClaudeRunning: Claude Code holds ~/.claude.json
-# in an in-memory cache (Un.config) that is not auto-invalidated on external
-# changes, and a flush from a running Claude Code instance would silently
-# overwrite our oauthAccount mutation. Refuse-while-running is the chosen
-# mitigation.
+# Writing is gated by Test-ClaudeRunning, whose docblock owns the reason.
 
 # Returns $true if Claude Code is running on the host.
+#
+# THE CONCURRENCY STORY. Every refusal in this script that cites "a running
+# Claude Code" points here, and so does every decision NOT to refuse.
+#
+# Claude Code 2.1.274 follows both files when they change underneath it, which
+# earlier versions did not. ~/.claude.json is polled with fs.watchFile at 1 s
+# and an external mtime bump replaces its in-memory config wholesale; its own
+# writer takes ~/.claude.json.lock, re-reads under that lock, merges, and
+# refuses the write outright when the re-read has lost the auth block.
+# .credentials.json is stat'd at the top of every token-refresh check and a
+# changed mtime drops the cached credentials. Verified live on 2.1.274: a
+# `claude -p` run started on one account, handed a second account's
+# .credentials.json 4 s in, died 4 s later on the SECOND account's 5h limit.
+#
+# So swapping accounts under a live Claude Code works, and `sca switch` and
+# `sca monitor` do not refuse. What still does, and why:
+#
+#   * save    Captures .credentials.json and an identity in the same breath,
+#             reading them from two files that a /login updates separately.
+#             Catching that window mislabels the slot permanently, and unlike
+#             a bad mirror there is no later pass that corrects it.
+#   * warmup, monitor -KeepWarm
+#             Both make EVERY slot active in turn. A live session would be
+#             dragged across every account on the machine and bill whichever
+#             one was mounted when the user hit enter. Rotation moves to one
+#             chosen destination and stays; a round-robin underneath a user is
+#             not something they can reason about.
+#
+# Residual risk on the paths that no longer refuse: our ~/.claude.json write
+# does not take their lock, so a read-modify-write of ours can still drop a
+# config change Claude Code made in between. That costs a counter or a project
+# flag, never a credential, which is why it does not justify a refusal.
+#
+# The credential-level hazard that DID justify one is now handled in
+# Invoke-Reconcile rather than by refusing: it adopts a slot whose bytes match
+# the active file instead of mirroring over it, and declines to write at all
+# when it cannot attribute the bytes.
+#
+# Recovery if a write ever does corrupt the file: Claude Code keeps rolling
+# ~/.claude/backups/.claude.json.backup.<unix-ms> copies.
 #
 # Two probes, because the CLI ships in two shapes. The native installer
 # produces a real executable named 'claude', which the name probe finds on
@@ -1047,20 +1083,12 @@ function Update-ScaState {
 #
 # Get-Process enumerates processes from ALL users on the system (limited
 # detail for processes owned by other users, but the Process objects
-# themselves still come back), so this refuses save/switch even when a
-# DIFFERENT user on a shared host has Claude Code open. That is intentional
-# multi-user safety: if any user's Claude Code holds the ~/.claude.json
-# in-memory cache, our oauthAccount mutation could race its flush. Wrapped as
-# a function so tests can mock it without driving real process state.
-#
-# This is our whole concurrency story for ~/.claude.json, and it is a
-# deliberate non-participation: Claude Code serialises its OWN writes with
-# proper-lockfile via ~/.claude.json.lock, and we do not take that lock.
-# Taking it would only order our write against theirs; it would not evict the
-# in-memory copy a running Claude Code may still flush over the top of us.
-# Refusing to run at all is the stronger guarantee, because there is no live
-# cache to lose the race against. Recovery if a write ever does corrupt the
-# file: Claude Code keeps rolling ~/.claude.json.backup.<unix-ms> copies.
+# themselves still come back), so the actions that do refuse refuse even when
+# a DIFFERENT user on a shared host has Claude Code open. Intentional: the
+# files at stake are per-user only if every user has their own home, and a
+# shared-home host is exactly where a fleet walk would surprise someone.
+# Wrapped as a function so tests can mock it without driving real process
+# state.
 function Test-ClaudeRunning {
     if (Get-Process -Name 'claude' -ErrorAction SilentlyContinue) { return $true }
     if ($IsWindows) { return $false }
@@ -1089,8 +1117,8 @@ function Test-ClaudeRunning {
 # rather than the bare word 'claude', because a checkout directory with
 # 'claude' in its name is not a running Claude Code and must not lock the user
 # out of `sca save`. Over-matching would only refuse a safe action, but
-# under-matching races Claude Code's in-memory ~/.claude.json cache, so the
-# pattern is deliberately the narrower of the two.
+# under-matching lets a write land beside a live Claude Code, so the pattern is
+# deliberately the narrower of the two. What that costs is on Test-ClaudeRunning.
 function Test-ClaudeNodeProcess {
     Param ([AllowNull()] $Processes)
 
@@ -1492,8 +1520,9 @@ function Show-Help {
         "  PS profile   : $ProfilePath",
         "",
         "NOTES",
-        "  • Close Claude Code / VS Code before 'save', 'switch', 'warmup', or 'monitor'.",
-        "  • OpenCode + opencode-claude-auth support swapping accounts without restart.",
+        "  • 'switch' and 'monitor' work with Claude Code open; it follows the swap.",
+        "  • Close Claude Code / VS Code before 'save', 'warmup', or 'monitor -KeepWarm'.",
+        "  • Needs Claude Code >= 2.1.274, or OpenCode + opencode-claude-auth >= 1.5.4.",
         ""
     )
 
@@ -1846,6 +1875,38 @@ function Find-SlotByName {
     return Get-Slots | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
 }
 
+# Find the saved slot whose file is byte-identical to $Hash. Answers a question
+# the email cannot: ".credentials.json changed, but is it new bytes or an
+# existing slot moved into place?" Byte equality with a saved slot proves the
+# latter, because a token refresh mints tokens no slot file has ever held.
+#
+# Reads each candidate off disk rather than trusting a cached hash, because the
+# whole point is to compare against what is on disk right now. Hashing is
+# skipped for -ExcludeName so the common reconcile call does not re-hash the
+# slot it is about to write.
+function Find-SlotByHash {
+    Param (
+        [Parameter(Mandatory)] [String] $Hash,
+        [String] $ExcludeName
+    )
+
+    foreach ($slot in Get-Slots) {
+        if ($ExcludeName -and $slot.Name -eq $ExcludeName) { continue }
+        # Any unreadable candidate (deleted mid-scan, locked, bad ACL) is
+        # treated as "not a match" so reconcile cannot fail because of one bad
+        # file. That silently costs a detection: an unreadable twin sends the
+        # caller to the email comparison, the very branch this exists to
+        # pre-empt. Too rare for 0600 files we own to justify failing the
+        # action over, but traced so it is diagnosable when it does happen.
+        try { if ((Get-SHA256Hex -Path $slot.Path) -eq $Hash) { return $slot } }
+        catch {
+            Write-Verbose "Find-SlotByHash: skipped unreadable slot '$($slot.Name)': $_"
+            continue
+        }
+    }
+    return $null
+}
+
 # We are determining which slot should become active when `switch` is
 # called without an explicit name. Behavior:
 #   * No slots saved          -> throw (nothing to rotate to).
@@ -2039,14 +2100,22 @@ function New-AutoSaveSlot {
 # tracked slot to reflect Claude Code's most recent token refresh (sca
 # switch and sca usage in the redesigned model).
 #
-# Algorithm (5 outcomes; never throws unless an atomic write itself fails):
+# Algorithm (7 outcomes; never throws unless an atomic write itself fails):
 #   1. .credentials.json missing                   -> noop
 #   2. hash matches state.last_sync_hash           -> noop
-#   3. tracked slot exists, identity matches       -> mirror bytes -> slot
-#   4. tracked slot exists, identity DIFFERS       -> auto-save under new name
+#   3. bytes are byte-identical to ANOTHER saved   -> adopt that slot as active
+#      slot                                           (state + ~/.claude.json;
+#                                                      no slot file is written)
+#   4. identity unresolvable                       -> noop, nothing written
+#   5. tracked slot exists, identity matches       -> mirror bytes -> slot
+#   6. tracked slot exists, identity DIFFERS       -> auto-save under new name
 #                                                     (cross-account swap detected;
 #                                                      old slot file preserved)
-#   5. no tracked slot, OR slot file is gone       -> auto-save under new name
+#   7. no tracked slot, OR slot file is gone       -> auto-save under new name
+#
+# Outcomes 3 and 4 exist because outcome 5 is the only destructive one: it
+# overwrites a slot file, the single artifact a login cannot be recovered
+# from. Both guard it, and both are ordered ahead of it.
 #
 # Identity probe: ~/.claude.json's oauthAccount.emailAddress. This is the
 # same source Claude Code uses for /status, so reconcile and Claude Code can
@@ -2054,8 +2123,12 @@ function New-AutoSaveSlot {
 # /api/oauth/profile, which can return a different email for the same
 # account. When ~/.claude.json has no
 # oauthAccount yet (rare: fresh install, never logged into Claude Code),
-# we fall back to /api/oauth/profile so the noop / mirror branches still
-# work for users in that transient state.
+# we fall back to /api/oauth/profile.
+#
+# The probe reads a DIFFERENT file than the one that changed, which is why
+# outcome 3 leads: the email can lag the tokens (a /login writes the two files
+# separately), and during that lag "same email" does not mean "same account".
+# Byte equality with a saved slot settles it without consulting either email.
 #
 # Tracked slot's identity comes from the slot's sidecar (which was
 # captured at save time from ~/.claude.json or /api/oauth/profile). This
@@ -2114,13 +2187,66 @@ function Invoke-Reconcile {
     if ($state -and $state.active_slot) {
         $slot = Find-SlotByName -Name $state.active_slot
         if ($slot) {
-            # Tracked slot's email comes from its sidecar (Get-Slots
-            # always populates this on the slot object). Tolerate
-            # offline / unknown-new-identity by falling into the
-            # same-identity branch; preserves continuity over paranoia.
-            $slotEmail    = if ($slot.Sidecar) { [string]$slot.Sidecar.oauthAccount.emailAddress } else { $slot.Email }
-            $sameIdentity = (-not $newEmail) -or (-not $slotEmail) -or ($newEmail -eq $slotEmail)
-            if ($sameIdentity) {
+            # Tracked slot's email comes from its sidecar (Get-Slots always
+            # populates this on the slot object).
+            $slotEmail = if ($slot.Sidecar) { [string]$slot.Sidecar.oauthAccount.emailAddress } else { $slot.Email }
+
+            # A saved slot moved into place behind our back: another writer (a
+            # `claude` /login, a second sca, a hand-edit) already activated it.
+            # Mirroring would copy its tokens over the slot state still names
+            # and destroy that login, so adopt the slot instead of writing.
+            #
+            # Checked BEFORE the email comparison because byte equality is
+            # proof where the email is only evidence. A /login writes
+            # .credentials.json and ~/.claude.json as two separate writes, so
+            # between them the tokens are already the new account's while the
+            # email still reads as the old one; that window is precisely when
+            # the email says "same account, just refreshed" and is wrong.
+            $twin = Find-SlotByHash -Hash $hash -ExcludeName $state.active_slot
+            if ($twin) {
+                Update-ScaState -ActiveSlot $twin.Name -LastSyncHash $hash | Out-Null
+
+                # Carry the identity across too, the one branch that must. The
+                # other outcomes leave ~/.claude.json alone because they do not
+                # change WHICH account is active; this one does. Leaving it
+                # stale would make the next reconcile read the old email, find
+                # it differs from the adopted slot's, and auto-save a duplicate
+                # of an account already saved. Non-fatal for the same reason as
+                # in Invoke-SlotSwap: the credentials are already in place, so
+                # a failed display update must not undo the adoption.
+                try {
+                    Set-OAuthAccountInClaudeJson -OAuthAccount $twin.Sidecar.oauthAccount
+                }
+                catch {
+                    Write-Color "[Sync] Tracking '$($twin.Name)' as active, but the ~/.claude.json identity update failed: $($_.Exception.Message)" 'Yellow'
+                }
+
+                $twinIdent = Format-SlotIdentity -Name $twin.Name -Email $twin.Email
+                Write-Color "[Sync] Active credentials match saved slot $twinIdent; tracking it as active." 'Yellow'
+                return [pscustomobject]@{
+                    Action       = 'adopt'
+                    Slot         = $twin.Name
+                    PreviousSlot = $state.active_slot
+                    Email        = $twin.Email
+                }
+            }
+
+            # Unattributable bytes, because ~/.claude.json carries no email and
+            # the profile endpoint did not answer either (offline, 429). Both
+            # remaining branches need to know whose tokens these are, and the
+            # mirror branch overwrites a slot file, which is the one artifact
+            # the login cannot be recovered from once gone. Do nothing and let
+            # a later reconcile retry with a resolvable identity.
+            if (-not $newEmail -or -not $slotEmail) {
+                Write-Color "[Sync] Active credentials changed but no account could be read from ~/.claude.json or /api/oauth/profile, so slot '$($state.active_slot)' is left untouched rather than risk overwriting it. It will catch up on the next run that can resolve an identity; if this persists while online, re-run 'sca save $($state.active_slot)' to recapture the slot." 'Yellow'
+                return [pscustomobject]@{
+                    Action = 'noop'
+                    Reason = 'identity-unresolved'
+                    Slot   = $state.active_slot
+                }
+            }
+
+            if ($newEmail -eq $slotEmail) {
                 Set-CredentialFileAtomic -Path $slot.Path -Bytes $bytes
                 Update-ScaState -LastSyncHash $hash | Out-Null
                 return [pscustomobject]@{
@@ -2182,12 +2308,12 @@ function Invoke-SaveAction {
         throw "$CredFile not found. Log in via Claude Code first."
     }
 
-    # Refuse if Claude Code is running. We resolve identity from
-    # ~/.claude.json's oauthAccount, which Claude Code keeps in an
-    # in-memory cache and may flush back to disk at any moment. Saving
-    # while Claude Code runs would silently capture stale identity into
-    # the sidecar AND risk overwriting our writes if a flush races our
-    # write. Refuse-while-running is the chosen mitigation.
+    # Refuse if Claude Code is running. Save pairs the tokens from
+    # .credentials.json with an identity from ~/.claude.json, two files a
+    # /login updates separately. Catching that window writes a sidecar naming
+    # the wrong account, and nothing later corrects it: a mislabelled slot
+    # looks valid forever. See Test-ClaudeRunning for why switch and monitor
+    # do not need this and save does.
     if (Test-ClaudeRunning) {
         throw "Claude Code is running. Close it before 'sca save' so identity capture is consistent."
     }
@@ -2368,12 +2494,14 @@ function Invoke-SaveAction {
 #      and state.last_sync_hash matches the new credentials bytes.
 #
 # Preconditions (callers MUST enforce):
-#   * Test-ClaudeRunning returned $false. The ~/.claude.json write
-#     races Claude Code's in-memory oauthAccount cache; this helper
-#     does NOT recheck the running guard.
 #   * $Slot has a valid sidecar (the caller resolved it via
 #     Find-SlotByName / Get-Slots, both of which filter out
 #     sidecar-less slots).
+#
+# Deliberately NOT a precondition: that Claude Code is closed. Switch and the
+# watch loop's rotation call this with it live, by design; only the two warmup
+# callers hold it closed, and that is their own guard, not this helper's
+# contract. See Test-ClaudeRunning.
 #
 # No reconcile prelude here either; the caller's higher-level workflow
 # already reconciled or has its own per-tick capture (the watch loop's
@@ -2393,12 +2521,11 @@ function Invoke-SlotSwap {
     $slotBytes = [System.IO.File]::ReadAllBytes($Slot.Path)
     Set-CredentialFileAtomic -Path $CredFile -Bytes $slotBytes
 
-    # Restore the captured oauthAccount into ~/.claude.json so Claude
-    # Code's /status display matches the active slot on next start.
-    # Failure to write ~/.claude.json (file locked, malformed,
-    # disappeared) is surfaced as an advisory; we do NOT rollback the
-    # credentials write because Claude Code (or the OpenCode plugin in
-    # the -Auto case) may have already started using the new tokens.
+    # Restore the captured oauthAccount into ~/.claude.json so /status matches
+    # the active slot. A running Claude Code picks this up within a second.
+    # Failure to write it (file locked, malformed, disappeared) is surfaced as
+    # an advisory; we do NOT roll back the credentials write, because by now
+    # the client may already be using the new tokens.
     try {
         Set-OAuthAccountInClaudeJson -OAuthAccount $Slot.Sidecar.oauthAccount
     }
@@ -2414,14 +2541,11 @@ function Invoke-SlotSwap {
 function Invoke-SwitchAction {
     Param ([String] $Name)
 
-    # Refuse if Claude Code is running. Switch writes to ~/.claude.json's
-    # oauthAccount block from the destination slot's sidecar, and a
-    # running Claude Code instance keeps that file in an in-memory
-    # cache that may flush and clobber our update. Refusing is the
-    # simplest reliability guarantee.
-    if (Test-ClaudeRunning) {
-        throw "Claude Code is running. Close it before 'sca switch' so the email-display change applies cleanly."
-    }
+    # No Claude-Code guard: switching under a live session is supported, and
+    # is the point of the command. Claude Code 2.1.274 follows both files on
+    # its own, and Invoke-Reconcile no longer writes bytes it cannot attribute,
+    # which is what made a concurrent Claude Code dangerous. Test-ClaudeRunning
+    # carries the evidence and the residual risk.
 
     # Reconcile FIRST so any pending Claude Code refresh on the outgoing
     # active slot is mirrored into the saved slot file before we
@@ -5010,14 +5134,14 @@ function Invoke-UsageAction {
 # (Invoke-UsageWatch), which keeps its internal -Auto / -Warmup parameter
 # names; the public surface is `monitor` (rotation is unconditional) and
 # -KeepWarm. A positional <name> is ignored: rotation and keep-warm span
-# the whole slot fleet, so scoping to one slot is meaningless. The
-# Claude-Code-running refusal lives in Invoke-UsageWatch's pre-loop guard.
+# the whole slot fleet, so scoping to one slot is meaningless.
 #
-# Scope is OpenCode-only by design (issue #8). Rotation depends on the client
-# re-reading .credentials.json when its cached token misses, which
-# opencode-claude-auth >= 1.5.4 does, so a swap propagates without a restart.
-# Claude Code caches ~/.claude.json in memory instead and would race the
-# swap, which is why the guard refuses rather than warns.
+# Rotation needs the client to re-read .credentials.json when its cached token
+# misses. Both do: opencode-claude-auth >= 1.5.4, and Claude Code >= 2.1.274.
+# The scope was OpenCode-only while that was true of OpenCode alone (issue #8);
+# it no longer is, so plain `monitor` runs beside either. Only -KeepWarm still
+# refuses a live Claude Code, guarded in Invoke-UsageWatch. See
+# Test-ClaudeRunning for both the evidence and the one remaining exception.
 function Invoke-MonitorAction {
     Param (
         [string] $Name,
@@ -5044,7 +5168,7 @@ function Invoke-WarmupAction {
     Param ([String] $Name)
 
     if (Test-ClaudeRunning) {
-        throw "Claude Code is running. Close it before 'sca warmup' so each per-slot credentials swap applies cleanly without racing Claude Code's in-memory ~/.claude.json cache."
+        throw "Claude Code is running. Close it before 'sca warmup', which makes every slot active in turn and would drag the live session across all of them. 'sca switch' and 'sca monitor' do not have that problem and run fine alongside Claude Code."
     }
     if (-not (Get-Command claude -CommandType Application -ErrorAction SilentlyContinue)) {
         throw "The 'claude' CLI was not found on PATH. 'sca warmup' activates each slot by running 'claude -p', so Claude Code must be installed."
@@ -5340,13 +5464,13 @@ function Format-AutoCooldownDelta {
 #
 #   1. Get-AutoRotationDecision (pure) to classify the active slot's
 #      state against -Threshold.
-#   2. Re-check Test-ClaudeRunning before any rotation (covers the
-#      "Claude Code launched after -Auto started" race; the pre-loop
-#      guard in Invoke-UsageWatch only fires once at startup).
-#   3. Find-SlotByName + Invoke-SlotSwap when a peer is eligible.
-#   4. Map the outcome to a single-line latched footer string that
+#   2. Find-SlotByName + Invoke-SlotSwap when a peer is eligible.
+#   3. Map the outcome to a single-line latched footer string that
 #      Invoke-UsageWatch appends to every subsequent frame until the
 #      next state change.
+#
+# No Claude-Code check: rotating under a live session is the supported case,
+# not a race to be dodged. See Test-ClaudeRunning.
 #
 # Returns the new footer-latch string. Never throws: any exception from
 # the swap path is caught and rendered as '[Monitor] Rotation failed! …'
@@ -5418,14 +5542,6 @@ function Invoke-AutoRotationStep {
         }
 
         'rotate' {
-            # Per-rotation Test-ClaudeRunning re-check. The pre-loop
-            # guard caught the startup case; this catches the "Claude
-            # Code launched mid-watch" race. Surface the refusal as
-            # a [Monitor] line; the credentials swap does NOT happen.
-            if (Test-ClaudeRunning) {
-                return '[Monitor] Rotation refused! Claude Code is running.'
-            }
-
             try {
                 $slot = Find-SlotByName -Name $decision.ToName
                 if (-not $slot) {
@@ -5925,26 +6041,23 @@ function Invoke-UsageWatch {
         [switch] $Warmup
     )
 
-    # Pre-loop Claude Code guard for -Auto and -Warmup. Both write
-    # ~/.claude.json's oauthAccount block via Invoke-SlotSwap (-Auto
-    # during the in-loop rotation step; -Warmup during the per-slot
-    # swap-then-activate round-robin). Claude Code keeps that block in an
-    # in-memory cache; racing its flush would clobber our update. The
-    # short-lived `claude -p` the warmup spawns is awaited to exit before
-    # the next swap, so it never overlaps a file write.
-    # Same guard / wording as Invoke-SwitchAction so the user sees a
-    # consistent message regardless of entry point. Only `sca monitor`
-    # reaches this branch ($Auto is always set by Invoke-MonitorAction;
-    # `usage -Watch` is read-only and sets neither switch). -Auto
-    # additionally re-checks Test-ClaudeRunning before every rotation
-    # attempt to cover the "Claude Code launched mid-watch" race;
-    # -Warmup's window is short enough (one round-robin pass) that the
-    # pre-loop check is the only one needed.
+    # Pre-loop Claude Code guard, -Warmup only. Rotation (-Auto) is
+    # deliberately allowed to run beside a live Claude Code: following the
+    # active account is what `sca monitor` is for, and Claude Code 2.1.274
+    # picks the swap up within a turn.
+    #
+    # Keep-warm cannot have the same licence. It walks the WHOLE fleet, making
+    # every slot active in turn, so a live session would be dragged across
+    # every account on the machine and bill whichever one happened to be
+    # mounted when the user hit enter. Rotation moves to exactly one chosen
+    # destination and stays there, which a user can follow; a round-robin
+    # underneath them is not something they can reason about.
+    #
     # Checked BEFORE the IsOutputRedirected guard so the user sees the
     # more actionable "close Claude Code" message rather than the
     # interactive-terminal one (which the test harness always hits).
-    if (($Auto -or $Warmup) -and (Test-ClaudeRunning)) {
-        throw "Claude Code is running. Close it before 'sca monitor' so the credentials swap applies cleanly without racing Claude Code's in-memory ~/.claude.json cache."
+    if ($Warmup -and (Test-ClaudeRunning)) {
+        throw "Claude Code is running. Close it before 'sca monitor -KeepWarm', which makes every slot active in turn and would drag the live session across all of them. Plain 'sca monitor' rotates without that and runs fine alongside Claude Code."
     }
 
     if ([Console]::IsOutputRedirected) {
@@ -6119,10 +6232,9 @@ function Invoke-UsageWatch {
                     # the decision so it stays visible until the next
                     # state change (the next 'rotate' / 'no-eligible'
                     # outcome). Failures inside the swap are caught and
-                    # surfaced as 'Rotation failed!' / 'Rotation refused!'
-                    # lines; the loop never aborts because of an auto-
-                    # rotation issue (user can still quit with Ctrl-C
-                    # and inspect the table).
+                    # surfaced as a 'Rotation failed!' line; the loop never
+                    # aborts because of an auto-rotation issue (user can
+                    # still quit with Ctrl-C and inspect the table).
                     if ($Auto) {
                         $lastAutoFooter = Invoke-AutoRotationStep -Snapshot $snapshot -Threshold $Threshold -CurrentLatch $lastAutoFooter
                     }

@@ -68,13 +68,17 @@ Describe 'switch_claude_account' {
             { Invoke-SwitchAction -Name 'legacy' 6>$null } | Should -Throw -ExpectedMessage "*Slot 'legacy' not found*"
         }
 
-        It 'refuses to operate while Claude Code is running' {
+        # Switching under a live Claude Code is supported as of 2.1.274, which
+        # re-reads .credentials.json on its next token-refresh check. Refusing
+        # here would block the feature the guard used to protect.
+        It 'switches while Claude Code is running' {
             Mock Test-ClaudeRunning -MockWith { $true }
-            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Content 'X' | Out-Null
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'work@test.local' -Content 'X' | Out-Null
 
-            { Invoke-SwitchAction -Name 'work' 6>$null } | Should -Throw -ExpectedMessage '*Claude Code is running*'
-            # .credentials.json untouched.
-            Test-Path -LiteralPath $script:CredFilePath | Should -BeFalse
+            Invoke-SwitchAction -Name 'work' 6>$null
+
+            Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be 'X'
+            (Read-ScaState).active_slot | Should -Be 'work'
         }
 
         It 'overwrites an existing active credentials file' {

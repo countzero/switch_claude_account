@@ -28,11 +28,11 @@ This file is the canonical agent-instructions source for this repository, read n
 | Action | Requires name | What it does |
 |------------|---------------|--------------|
 | `save` | Yes | Refuses if Claude Code is running. Captures `.credentials.json` plus an identity sidecar into a named slot. Refuses if no identity can be resolved. |
-| `switch` | Optional | Refuses if Claude Code is running. Reconciles, swaps slot bytes into `.credentials.json`, writes the slot's `oauthAccount` into `~/.claude.json`. No name rotates to the next slot alphabetically (wraps). |
+| `switch` | Optional | Runs with Claude Code open. Reconciles, swaps slot bytes into `.credentials.json`, writes the slot's `oauthAccount` into `~/.claude.json`. No name rotates to the next slot alphabetically (wraps). |
 | `list` | No | Reconciles, then renders saved slots as `Slot \| Account` with an active-marker column. |
 | `remove` | Yes | Deletes a named slot and its sidecar. Refuses to remove the active slot. |
 | `usage` | Optional | Read-only. Reconciles, then calls the **undocumented** `GET /api/oauth/usage` per slot for 5h / 7d percentages. `-Json` for scripted output, `-Watch` (`-Interval <seconds>`, floor 60) for a live view. With `<name>`, renders a verbose single-slot block. |
-| `monitor` | No | Live, side-effecting supervisor. Auto-rotates to the next eligible slot when the active slot reaches `-Threshold` (default 95, range 1..100). OpenCode-only; refuses if Claude Code is running. `-KeepWarm` also keeps every slot warm for the life of the watch. A positional `<name>` is ignored. |
+| `monitor` | No | Live, side-effecting supervisor. Auto-rotates to the next eligible slot when the active slot reaches `-Threshold` (default 95, range 1..100). Runs with Claude Code open. `-KeepWarm` also keeps every slot warm, and refuses if Claude Code is running. A positional `<name>` is ignored. |
 | `warmup` | Optional | Refuses if Claude Code is running or the `claude` binary is absent. One-shot warm pass over each slot (swap, `claude -p`, mirror, usage read), then restores the original active slot. Billable, ~$0.004/slot. |
 | `install` / `uninstall` | No | Adds / removes the wrapper function and aliases in the PowerShell profile. Both are exempt from `Assert-CredentialDir` and from the credentials-directory creation: they touch nothing but `$PROFILE`, so they must stay usable on a machine the other actions refuse. |
 | `help` | No | Shows detailed help. |
@@ -53,7 +53,7 @@ The block below it, `# --- Where Claude Code actually keeps the active login ---
 
 ## Platform gotchas
 
-- **Atomic-rename writes survive an open Claude Code**, for `.credentials.json` only. `Set-CredentialFileAtomic` uses `MoveFileEx` semantics, which succeed against the `FILE_SHARE_DELETE` handle Claude Code holds. `save` / `switch` still refuse to run while Claude Code is open, for the different reason documented on `Test-ClaudeRunning`.
+- **Hot-swapping a live client is supported**: Claude Code >= 2.1.274 polls `~/.claude.json` at 1 s and re-`stat`s `.credentials.json` on every refresh check, so `switch` and `monitor` run with it open. `save`, `warmup` and `monitor -KeepWarm` still refuse. `Test-ClaudeRunning` owns the evidence and the exceptions; `Set-CredentialFileAtomic`'s `MoveFileEx` semantics are why writes survive the `FILE_SHARE_DELETE` handle Claude Code holds.
 - **Execution policy** (Windows): may need `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` on first run.
 - **POSIX has no mandatory locking**: `FileShare` is a Win32 concept, so on Linux and macOS `::Replace` succeeds regardless of open handles and a reader keeps the old inode. Share-mode tests are therefore `-Skip:(-not $IsWindows)`, paired with a Unix test asserting the inode property instead.
 - **Token expiry**: OAuth tokens refresh after roughly an hour of inactivity. Without a daemon a slot file is at most one Claude-Code refresh behind; the next reconciling action captures it. Harmless, because the slot's previous refresh token stays valid until rotated again.

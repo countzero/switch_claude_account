@@ -638,19 +638,24 @@ Describe 'switch_claude_account' {
             $out | Should -Match '^\[Monitor\] Rotated from "work" to "personal" at \d{2}:\d{2}:\d{2}$'
         }
 
-        It 'on rotate with Claude Code running: refuses, does NOT call Invoke-SlotSwap' {
+        # Rotating under a live Claude Code is the supported case, not a race
+        # to dodge: 2.1.274 picks the swapped credentials up within a turn.
+        # Following the active account is the whole job of `sca monitor`, so a
+        # running Claude Code must not stop it.
+        It 'on rotate with Claude Code running: still rotates' {
             Mock Get-AutoRotationDecision { return [pscustomobject]@{
                 Action   = 'rotate'
                 FromName = 'work'
                 ToName   = 'personal'
             } }
             Mock Test-ClaudeRunning { $true }
+            Mock Find-SlotByName  { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap    { }
 
             $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Monitor] Automatic slot switching is enabled.'
 
-            Should -Invoke Invoke-SlotSwap -Times 0
-            $out | Should -Be '[Monitor] Rotation refused! Claude Code is running.'
+            Should -Invoke Invoke-SlotSwap -Times 1
+            $out | Should -Match '^\[Monitor\] Rotated from "work" to "personal" at \d{2}:\d{2}:\d{2}$'
         }
 
         It 'on rotate when swap throws, returns Rotation failed!' {

@@ -23,12 +23,12 @@ A zero-dependency PowerShell utility for Claude Code on Windows, Linux, and macO
 **Automation**
 
 - **Auto-reconcile**: silently captures Claude Code's hourly token refreshes into the tracked slot; auto-saves cross-account swaps under a timestamped name so you never lose state
-- **Smart rotation (OpenCode only)**: `sca monitor` auto-rotates to the next eligible slot when the active one hits a usage threshold (default 95%); refuses to run while Claude Code is open
+- **Smart rotation**: `sca monitor` auto-rotates to the next eligible slot when the active one hits a usage threshold (default 95%); works with Claude Code or OpenCode running, no restart needed
 - **Cold-slot warmup**: `sca warmup` (and `sca monitor -KeepWarm`) opens each dormant slot's 5h window by running the real Claude Code CLI, so Anthropic reports usage data for every account (billable)
 
 **Reliability & footprint**
 
-- **Atomic-safe writes**: slot-file updates use an atomic rename (`MoveFileEx` on Windows, `rename(2)` on Unix) with retry so they survive a running Claude Code on `.credentials.json`; `save` / `switch` still refuse to run while it's open to protect `~/.claude.json`
+- **Atomic-safe writes**: slot-file updates use an atomic rename (`MoveFileEx` on Windows, `rename(2)` on Unix) with retry so they survive a running Claude Code on `.credentials.json`; only `save` and `warmup` still need it closed, see [which actions](#which-actions-still-need-claude-code-closed)
 - **Zero dependencies**: pure PowerShell 7.4+, no external packages, no companion assets
 
 ## Installation
@@ -94,7 +94,9 @@ The active slot is marked with `*` (sourced from `~/.claude/.sca-state.json`). S
 sca switch work
 ```
 
-`switch` refuses to run while Claude Code is open. It atomically writes the slot's bytes into `.credentials.json` AND restores the slot's captured `oauthAccount` block into `~/.claude.json` so Claude Code's `/status` shows the matching email.
+`switch` atomically writes the slot's bytes into `.credentials.json` AND restores the slot's captured `oauthAccount` block into `~/.claude.json` so Claude Code's `/status` shows the matching email.
+
+**You can switch while Claude Code is running.** It picks the new account up on its next request, no restart needed. See [Hot-swapping a live session](#hot-swapping-a-live-session).
 
 ### Rotate to the next slot
 
@@ -200,9 +202,9 @@ sca monitor -KeepWarm                 # auto-rotate AND keep every slot warm for
 
 `sca monitor -KeepWarm` does more than the one-shot pass: at each poll it re-opens any slot whose 5h window has since closed, so a long session keeps every slot warm instead of letting them all expire ~5h after startup. (A 5h window can only be reopened *after* it closes, so a just-expired slot is re-warmed within one poll, not before.) A per-slot cooldown keeps a slot whose warm keeps failing from being retried every poll.
 
-Both `sca warmup` and `sca monitor -KeepWarm` refuse to operate while Claude Code is running (the per-slot swap writes `~/.claude.json`) and require the `claude` CLI to be installed and logged in. A slot whose token refresh is temporarily rate-limited is reported and skipped, not retried. `-KeepWarm` is the typical companion to `monitor`: rotation needs every peer slot reporting real data to make good decisions, which keeping them warm guarantees.
+Both `sca warmup` and `sca monitor -KeepWarm` refuse to operate while Claude Code is running, because both make *every* slot active in turn and a live session would be dragged across all of them ([details](#which-actions-still-need-claude-code-closed)). Both also require the `claude` CLI to be installed and logged in. A slot whose token refresh is temporarily rate-limited is reported and skipped, not retried. `-KeepWarm` is the typical companion to `monitor`: rotation needs every peer slot reporting real data to make good decisions, which keeping them warm guarantees.
 
-### Auto-rotate on usage limit (OpenCode only)
+### Auto-rotate on usage limit
 
 `sca monitor` is a live watch that auto-rotates to the next eligible slot when the active slot's `max(Session, Week)` utilization hits the threshold. Rotation is what `monitor` is for, so it is always on (there is no `-Auto` flag); for a read-only live view use `sca usage -Watch` instead.
 
@@ -218,8 +220,8 @@ Peer slots are walked in alphabetical wrap order (same direction as `sca switch`
   <img src="docs/images/monitor.svg" alt="sca monitor: same five-row slot table as the watch view, with a right-aligned '▶ switching slot at 95%' header indicator and a '[Monitor] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
 </p>
 
-> [!IMPORTANT]
-> **OpenCode-scoped feature.** Requires [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4**, which re-reads `~/.claude/.credentials.json` on cache miss so a swap propagates to a running OpenCode process without restart. **Claude Code itself is NOT supported**: its in-memory `~/.claude.json` cache would race the swap, so `sca monitor` refuses to start (and to rotate mid-watch) while `claude` is running. Close Claude Code before running `sca monitor`; OpenCode can keep running.
+> [!NOTE]
+> **Works with a live client, either one.** Rotation lands in `.credentials.json` and `~/.claude.json`, and both clients follow it without a restart: Claude Code from 2.1.274 on, and OpenCode via [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4**. Leave the app open while `sca monitor` runs. Adding `-KeepWarm` is the exception and still needs Claude Code closed, see [which actions](#which-actions-still-need-claude-code-closed).
 
 ### Install / uninstall alias
 
@@ -240,20 +242,36 @@ sca help         # Show usage info
 5. **Close Claude Code**
 6. Run `sca save personal`
 
-If Claude Code is running when you invoke `save` or `switch`, the action exits immediately with a clear message; no partial writes occur. One install shape escapes that check, see [Why close Claude Code first?](#why-close-claude-code-first).
+`save` is the one action that still needs Claude Code closed. It exits immediately with a clear message if you forget; no partial writes occur. See [Which actions still need Claude Code closed](#which-actions-still-need-claude-code-closed).
 
 ### Switching between accounts
 
-1. **Close Claude Code**
-2. Run `sca switch work`
-3. Open Claude Code: it now uses the `work` credentials and `/status` shows the matching email
+1. Run `sca switch work`
+2. That is it. Claude Code can stay open, and `/status` shows the matching email.
 
-### Why close Claude Code first?
+### Hot-swapping a live session
 
-`sca save` and `sca switch` read and write `~/.claude.json`'s `oauthAccount` block. Claude Code keeps that block in an in-memory cache that may flush back and clobber the update. Closing the app eliminates the race. (Slot-file updates done by `sca usage`'s token refresh use `MoveFileEx` with retry, so they survive an open Claude Code on `.credentials.json` itself; but the `~/.claude.json` cache race means you still need to close it for the two write actions.)
+`sca switch` and `sca monitor` work with Claude Code running. No restart, no reopening.
+
+Claude Code 2.1.274 follows both files on its own: it polls `~/.claude.json` once a second and picks up external edits, and it re-`stat`s `.credentials.json` at the top of every token-refresh check, dropping its cached credentials when the file moved. Verified against 2.1.274 by handing a running session a different account's credentials mid-request; it re-read them and hit the *new* account's rate limit four seconds later.
+
+That makes Claude Code equivalent to [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4** for this purpose, so `sca monitor` is no longer OpenCode-scoped.
+
+One residual difference from closing the app: `sca` does not take Claude Code's `~/.claude.json.lock`, so an `sca` read-modify-write can drop a config change Claude Code made in the same instant. That costs a counter or a project flag, never a credential.
+
+### Which actions still need Claude Code closed
+
+| Action | While Claude Code runs | Why |
+|---|---|---|
+| `switch`, `usage`, `list`, `remove` | fine | `switch` writes one destination and Claude Code follows it |
+| `monitor` | fine | rotation is one destination at a time, same as `switch` |
+| `save` | **refuses** | it pairs tokens from `.credentials.json` with an identity from `~/.claude.json`, and a `/login` updates those two separately. Catching that window writes a sidecar naming the wrong account, and nothing later corrects it |
+| `warmup`, `monitor -KeepWarm` | **refuses** | both make *every* slot active in turn, so a live session would be dragged across every account and bill whichever one was mounted when you hit enter |
+
+Slot-file updates done by `sca usage`'s token refresh use `MoveFileEx` with retry, so those survive an open Claude Code on `.credentials.json` itself.
 
 > [!IMPORTANT]
-> **The guard does not catch every install shape.** Claude Code installed from npm (`@anthropic-ai/claude-code`) runs as a `node` process rather than one named `claude`, so `sca` has to recognise it from the process command line instead. That works on Linux. It does **not** work on Windows, where reading command lines costs ~53 s and a guard on every write cannot spend that, nor on macOS, where PowerShell does not expose process command lines at all. On those two platforms, close Claude Code yourself rather than relying on the refusal. Claude Code from the native installer is detected on all three.
+> **The guard does not catch every install shape.** Claude Code installed from npm (`@anthropic-ai/claude-code`) runs as a `node` process rather than one named `claude`, so `sca` has to recognise it from the process command line instead. That works on Linux. It does **not** work on Windows, where reading command lines costs ~53 s and a guard on every write cannot spend that, nor on macOS, where PowerShell does not expose process command lines at all. On those two platforms, close Claude Code yourself before `sca save` and `sca warmup` rather than relying on the refusal. Claude Code from the native installer is detected on all three.
 
 ## Platform Notes
 

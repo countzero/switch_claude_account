@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Common Changelog](https://common-changelog.org),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Hot-swapping a live Claude Code session. `sca switch` and `sca monitor` no longer refuse while `claude` is running: 2.1.274 polls `~/.claude.json` once a second and re-`stat`s `.credentials.json` at the top of every token-refresh check, so it follows a swap without a restart. Verified by handing a running `claude -p` a second account's credentials four seconds in; it re-read them and died on that account's 5h limit four seconds later. `sca monitor` is no longer OpenCode-scoped, and needs Claude Code >= 2.1.274 or opencode-claude-auth >= 1.5.4.
+
+### Changed
+- `sca save`, `sca warmup` and `sca monitor -KeepWarm` are now the only actions that refuse while Claude Code is running. `save` pairs tokens from `.credentials.json` with an identity from `~/.claude.json`, two files a `/login` updates separately, and catching that window mislabels a slot permanently. The other two make every slot active in turn, which would drag a live session across every account on the machine.
+
+### Fixed
+- Reconcile no longer overwrites a saved slot with another account's tokens. It decided whether `.credentials.json` had changed account by reading an email out of `~/.claude.json`, a different file, so anything that moved the tokens without moving that email was taken for a token refresh and mirrored over the tracked slot. A `/login` does exactly that between its two writes. Bytes byte-identical to another saved slot are now recognised as that slot and adopted, leaving both slot files untouched. Adopting also carries the identity into `~/.claude.json`, because it is the one outcome that changes which account is active; leaving it stale made the next reconcile auto-save a duplicate of an account already saved.
+- Reconcile declines to write when it cannot attribute the new bytes to an account, rather than mirroring them into the tracked slot on the assumption that continuity beats caution. It took that branch whenever `~/.claude.json` carried no email and `/api/oauth/profile` did not answer, and the slot file it overwrote is the one artifact a login cannot be recovered from.
+
 ## [4.0.0] - 2026-09-13
 
 ### Changed

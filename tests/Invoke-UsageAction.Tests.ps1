@@ -854,8 +854,11 @@ Describe 'switch_claude_account' {
             # Seed state pointing at 'work' so reconcile mirrors there.
             Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE_HASH' | Out-Null
 
-            # Default Common.ps1 mock makes Get-SlotProfile fail -> offline
-            # tolerance branch -> mirror through.
+            # Identity must resolve to the tracked slot's own account, which is
+            # what makes this a refresh rather than a swap. New-Slot writes the
+            # sidecar email as "<name>@test.local". Without this, reconcile
+            # cannot attribute the new bytes and declines to write at all.
+            Set-SandboxClaudeJson -Email 'work@test.local'
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 if ($Headers['Authorization'] -ne 'Bearer sk-ant-oat-NEW') {
                     throw "expected new token in Authorization header, got '$($Headers['Authorization'])'"
