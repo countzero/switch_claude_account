@@ -5312,9 +5312,11 @@ function Invoke-UsageAction {
     }
 
     if ($Watch) {
-        # Read-only live view: no auto-rotation, no keep-warm. Those modes
-        # are `sca monitor` (Invoke-MonitorAction), which calls the same
-        # watch engine with -Auto / -Warmup set.
+        # Non-rotating live view: no auto-rotation, no keep-warm. Those
+        # modes are `sca monitor` (Invoke-MonitorAction), which calls the
+        # same watch engine with -Auto / -Warmup set. Not read-only: the
+        # per-poll Invoke-Reconcile below mirrors into the tracked slot,
+        # and its adopt branch writes state and ~/.claude.json.
         Invoke-UsageWatch -Name $Name -Interval $Interval
         return
     }
@@ -5407,9 +5409,11 @@ function Invoke-MonitorAction {
 # table with live percentages and exits. This is the automation of the
 # manual "switch to a slot, send one message" routine across all slots.
 #
-# Refuses up front if Claude Code is already running (the per-slot swap
-# writes ~/.claude.json's oauthAccount, which a live Claude Code caches)
-# and if the `claude` binary is not on PATH (the activation IS `claude`).
+# Refuses up front if Claude Code is already running, because this makes
+# EVERY slot active in turn and would drag a live session across all of them
+# (see Test-ClaudeRunning; `switch` and `monitor` move to one destination and
+# stay, which is why they do not refuse). Also refuses when the `claude`
+# binary is not on PATH, since the activation IS `claude`.
 # The original active slot is restored by Invoke-WarmAllSlots' finally
 # block. Billable: ~$0.004 per slot on the pinned Haiku model.
 function Invoke-WarmupAction {
@@ -6154,10 +6158,13 @@ function Test-WarmEligible {
 # pathological FAILED-warm case: a successful warm pushes resets_at ~5h out,
 # so the closed-window check holds a healthy slot off on its own.
 #
-# Re-checks Test-ClaudeRunning per tick (the swap writes ~/.claude.json), same
-# rationale as Invoke-AutoRotationStep. Re-warmed rows are NOT merged back into
-# $Snapshot; the next poll re-reads /api/oauth/usage. Never throws: a warm-path
-# exception surfaces as a '[Warmup] Re-warm failed! ...' line.
+# Re-checks Test-ClaudeRunning per tick, catching a Claude Code launched
+# mid-watch that the pre-loop guard could not see. Rotation has no such check
+# and needs none: it moves to one destination, while this walks the fleet, so
+# only this one can drag a live session across every account. Re-warmed rows
+# are NOT merged back into $Snapshot; the next poll re-reads /api/oauth/usage.
+# Never throws: a warm-path exception surfaces as a '[Warmup] Re-warm failed!
+# ...' line.
 # -Threshold is mandatory rather than defaulted: it must be the SAME value
 # auto-rotation uses, and the caller always has it. A default here would let a
 # wiring mistake silently disable the at-limit skip instead of failing loudly.
@@ -6695,11 +6702,11 @@ function Invoke-Main {
     }
 
     # Cross-action flag-misuse guards. Only the switch flags are guarded:
-    # -Watch / -Json belong to read-only `usage`, -KeepWarm to `monitor`.
+    # -Watch / -Json belong to `usage`, -KeepWarm to `monitor`.
     # The int flags (-Threshold / -Interval) live in __AllParameterSets and
     # are harmless when an action ignores them, so they need no guard.
     if ($Action -eq 'monitor' -and ($Watch -or $Json)) {
-        throw "'monitor' is always a live, side-effecting watch; -Watch / -Json do not apply. For a read-only live view use 'sca usage -Watch'."
+        throw "'monitor' is always a live, side-effecting watch; -Watch / -Json do not apply. For a live view that does not rotate use 'sca usage -Watch'."
     }
     if ($KeepWarm -and $Action -ne 'monitor') {
         throw "-KeepWarm applies only to 'sca monitor'. Did you mean 'sca monitor -KeepWarm'?"

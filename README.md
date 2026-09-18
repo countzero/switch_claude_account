@@ -206,7 +206,7 @@ Both `sca warmup` and `sca monitor -KeepWarm` refuse to operate while Claude Cod
 
 ### Auto-rotate on usage limit
 
-`sca monitor` is a live watch that auto-rotates to the next eligible slot when the active slot's `max(Session, Week)` utilization hits the threshold. Rotation is what `monitor` is for, so it is always on (there is no `-Auto` flag); for a read-only live view use `sca usage -Watch` instead.
+`sca monitor` is a live watch that auto-rotates to the next eligible slot when the active slot's `max(Session, Week)` utilization hits the threshold. Rotation is what `monitor` is for, so it is always on; for a live view that does not rotate use `sca usage -Watch` instead.
 
 ```powershell
 sca monitor                  # rotate when active slot hits 95% (default)
