@@ -58,7 +58,7 @@ Describe 'switch_claude_account' {
             $obj.schema                       | Should -Be 1
             $obj.source                       | Should -Be 'claude_json'
             $obj.oauthAccount.emailAddress    | Should -Be 'alice@example.com'
-            $obj.oauthAccount.accountUuid     | Should -Be '11111111-1111-1111-1111-111111111111'
+            $obj.oauthAccount.accountUuid     | Should -Be (Get-TestAccountUuid -Email 'alice@example.com')
             $obj.oauthAccount.organizationUuid| Should -Be '22222222-2222-2222-2222-222222222222'
         }
 

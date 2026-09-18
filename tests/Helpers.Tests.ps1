@@ -2759,6 +2759,47 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Test-SameOAuthAccount' {
+        # Two records of one account can disagree about the email: Claude Code
+        # fills ~/.claude.json's emailAddress from the profile response on one
+        # login path and from the access token's embedded account_email on
+        # another. Both paths agree on the uuid, so the uuid decides wherever
+        # both sides carry one.
+        It 'answers on the uuid when both sides carry one: <Case>' -ForEach @(
+            @{ Case = 'same uuid, same email';  LUuid = 'u1'; LMail = 'a@x'; RUuid = 'u1'; RMail = 'a@x'; Expected = $true }
+            @{ Case = 'same uuid, other email'; LUuid = 'u1'; LMail = 'a@x'; RUuid = 'u1'; RMail = 'b@x'; Expected = $true }
+            @{ Case = 'other uuid, same email'; LUuid = 'u1'; LMail = 'a@x'; RUuid = 'u2'; RMail = 'a@x'; Expected = $false }
+            @{ Case = 'uuid case differs';      LUuid = 'U1'; LMail = 'a@x'; RUuid = 'u1'; RMail = 'b@x'; Expected = $true }
+        ) {
+            $left  = [pscustomobject]@{ accountUuid = $LUuid; emailAddress = $LMail }
+            $right = [pscustomobject]@{ accountUuid = $RUuid; emailAddress = $RMail }
+            Test-SameOAuthAccount -Left $left -Right $right | Should -Be $Expected
+        }
+
+        # Read-Sidecar requires an email but not a uuid, so a sidecar written
+        # before uuid capture has only the email to offer.
+        It 'falls back to the email when either side has no uuid: <Case>' -ForEach @(
+            @{ Case = 'left has none';  LUuid = $null; RUuid = 'u1'; LMail = 'a@x'; RMail = 'a@x'; Expected = $true }
+            @{ Case = 'right has none'; LUuid = 'u1';  RUuid = '';   LMail = 'a@x'; RMail = 'a@x'; Expected = $true }
+            @{ Case = 'neither has';    LUuid = $null; RUuid = $null; LMail = 'a@x'; RMail = 'b@x'; Expected = $false }
+        ) {
+            $left  = [pscustomobject]@{ accountUuid = $LUuid; emailAddress = $LMail }
+            $right = [pscustomobject]@{ accountUuid = $RUuid; emailAddress = $RMail }
+            Test-SameOAuthAccount -Left $left -Right $right | Should -Be $Expected
+        }
+
+        # No evidence is not sameness. Answering $true here would let an empty
+        # record mirror one account's tokens over another's slot, which is the
+        # degeneration Read-Sidecar's email requirement exists to prevent.
+        It 'answers false when a side is absent or carries neither field: <Case>' -ForEach @(
+            @{ Case = 'left null';   Left = $null;                                             Right = [pscustomobject]@{ accountUuid = 'u'; emailAddress = 'a@x' } }
+            @{ Case = 'right null';  Left = [pscustomobject]@{ accountUuid = 'u'; emailAddress = 'a@x' }; Right = $null }
+            @{ Case = 'both empty';  Left = [pscustomobject]@{ accountUuid = ''; emailAddress = '' };     Right = [pscustomobject]@{ accountUuid = ''; emailAddress = '' } }
+        ) {
+            Test-SameOAuthAccount -Left $Left -Right $Right | Should -BeFalse
+        }
+    }
+
     Context 'Test-ClaudeNodeProcess' {
         # The npm package runs as 'node', so Test-ClaudeRunning's name probe
         # misses it entirely and the ~/.claude.json write would go ahead

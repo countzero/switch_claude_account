@@ -86,6 +86,51 @@ Describe 'switch_claude_account' {
             (Read-ScaState).last_sync_hash | Should -Be $expectedHash
         }
 
+        # Two records of one account may legitimately disagree about the email:
+        # Claude Code fills ~/.claude.json's emailAddress from the profile
+        # response on one login path and from the access token's own embedded
+        # account_email on another. On the email alone this reads as a
+        # cross-account swap and auto-saves a second slot for an account
+        # already saved, mislabelled with the other email form. The uuid both
+        # records agree on settles it offline.
+        It 'mirrors when the emails disagree but the uuid says one account' {
+            $credFile = Join-Path $script:CD '.credentials.json'
+            Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
+
+            $slotFile = New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content 'STALE_OLD_CONTENT'
+            Set-SandboxClaudeJson -Email 'alice+work@example.com' `
+                                  -AccountUuid (Get-TestAccountUuid -Email 'alice@example.com')
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE_HASH' | Out-Null
+
+            $before = @(Get-CredentialSlotFiles).Count
+
+            $r = Invoke-Reconcile 6>$null
+            $r.Action | Should -Be 'mirror'
+            $r.Slot   | Should -Be 'work'
+
+            Get-Content -LiteralPath $slotFile -Raw | Should -Be $script:CredsBody
+            @(Get-CredentialSlotFiles).Count |
+                Should -Be $before -Because 'one account must not end up with two slots'
+        }
+
+        # The converse, offline. The network probe covers this only while a
+        # client is running; the uuid covers it always.
+        It 'does not mirror when the emails agree but the uuid says two accounts' {
+            $credFile = Join-Path $script:CD '.credentials.json'
+            Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
+
+            $slotFile = New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content 'STALE_OLD_CONTENT'
+            Set-SandboxClaudeJson -Email 'alice@example.com' -AccountUuid 'a-different-account'
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE_HASH' | Out-Null
+
+            $r = Invoke-Reconcile 6>$null
+            $r.Action       | Should -Be 'identity-change'
+            $r.PreviousSlot | Should -Be 'work'
+
+            Get-Content -LiteralPath $slotFile -Raw |
+                Should -Be 'STALE_OLD_CONTENT' -Because 'the tracked login is the artifact that cannot be recovered'
+        }
+
         # When ~/.claude.json is missing AND the /api/oauth/profile fallback
         # fails, nothing can say whose tokens these are. Mirroring on a guess
         # is what overwrote a working login in practice, so the unattributable
@@ -220,37 +265,57 @@ Describe 'switch_claude_account' {
             (Get-OAuthAccountFromClaudeJson).emailAddress | Should -Be 'bob@example.com'
         }
 
-        It 'adopts anyway when the ~/.claude.json identity update fails' {
+        # Adopt is the one outcome that changes WHICH account is active, so the
+        # two files must agree about it. Committing state while ~/.claude.json
+        # still names the old account splits them, and nothing revisits it: the
+        # next reconcile hash-matches and returns. The one after that reads two
+        # identities that disagree and files the adopted slot's tokens under the
+        # old account's name, the mislabelled slot `sca save` refuses to create.
+        It 'leaves tracking alone when ~/.claude.json names another account and cannot be updated' {
             $credFile  = Join-Path $script:CD '.credentials.json'
             $otherBody = '{"claudeAiOauth":{"accessToken":"sk-ant-oat-OTHER","refreshToken":"sk-ant-ort-OTHER","expiresAt":9999999999999}}'
-            New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content $script:CredsBody | Out-Null
-            New-SlotPair -CredDir $script:CD -Name 'personal' -Email 'bob@example.com' -Content $otherBody | Out-Null
+            $workFile = New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content $script:CredsBody
+            $persFile = New-SlotPair -CredDir $script:CD -Name 'personal' -Email 'bob@example.com' -Content $otherBody
             Set-Content -LiteralPath $credFile -Value $otherBody -NoNewline
             Set-SandboxClaudeJson -Email 'alice@example.com'
             Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE_HASH' | Out-Null
 
             Mock Set-OAuthAccountInClaudeJson { throw 'claude.json is locked' }
 
+            $r = Invoke-Reconcile 6>&1
+            $out = $r | Out-String
+
+            # Neither file moved, so the next run re-enters this branch and
+            # retries rather than acting on a half-applied adoption.
+            $st = Read-ScaState
+            $st.active_slot    | Should -Be 'work'
+            $st.last_sync_hash | Should -Be 'STALE_HASH'
+            Get-Content -LiteralPath $workFile -Raw | Should -Be $script:CredsBody
+            Get-Content -LiteralPath $persFile -Raw | Should -Be $otherBody
+
+            $out | Should -Match 'claude.json is locked'
+            $out | Should -Match "run 'sca switch personal'"
+        }
+
+        # The same failure is harmless when there is no identity on file to go
+        # stale against: Set-OAuthAccountInClaudeJson throws for that too, and
+        # refusing there would leave a user with no ~/.claude.json unable to
+        # ever track the slot that is actually active.
+        It 'adopts anyway when ~/.claude.json holds no identity to contradict it' {
+            $credFile  = Join-Path $script:CD '.credentials.json'
+            $otherBody = '{"claudeAiOauth":{"accessToken":"sk-ant-oat-OTHER","refreshToken":"sk-ant-ort-OTHER","expiresAt":9999999999999}}'
+            New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content $script:CredsBody | Out-Null
+            New-SlotPair -CredDir $script:CD -Name 'personal' -Email 'bob@example.com' -Content $otherBody | Out-Null
+            Set-Content -LiteralPath $credFile -Value $otherBody -NoNewline
+            # No oauthAccount block, so the write throws and nothing is stale.
+            Set-Content -LiteralPath $ClaudeJsonPath -Value '{"numStartups":1}' -NoNewline -Encoding utf8NoBOM
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE_HASH' | Out-Null
+
             $out = Invoke-Reconcile 6>&1 | Out-String
 
-            # The credentials are already in place, so a failed display update
-            # must not undo the adoption; it downgrades to an advisory.
             (Read-ScaState).active_slot | Should -Be 'personal'
-            $out | Should -Match 'still names the previous account'
-            $out | Should -Match 'claude.json is locked'
-
-            # Nothing retries this on its own: the next reconcile hash-matches
-            # and returns before reaching the adopt branch, so the advisory has
-            # to carry the recovery command and say what it costs to ignore.
-            $out | Should -Match "Run 'sca switch personal'"
-            $out | Should -Match 'auto-save a duplicate'
-
-            # Cause before consequence: the adoption line is the event, the
-            # failure is a footnote to it.
-            $adoptAt = $out.IndexOf('Active credentials match saved slot')
-            $failAt  = $out.IndexOf('still names the previous account')
-            $adoptAt | Should -BeGreaterThan -1
-            $failAt  | Should -BeGreaterThan $adoptAt
+            $out | Should -Match 'Active credentials match saved slot'
+            $out | Should -Match 'may lag'
         }
 
         It 'prints a yellow advisory naming the adopted slot' {
@@ -382,7 +447,7 @@ Describe 'switch_claude_account' {
             Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE_HASH' | Out-Null
         }
 
-        # New-SlotPair's sidecar uuid is "test-acct-uuid-<name>".
+        # New-SlotPair's sidecar uuid is Get-TestAccountUuid of its email.
         function script:MockProfileUuid {
             Param ([string] $Uuid, [string] $Email = 'someone@example.com')
             Mock Invoke-RestMethod -ParameterFilter {
@@ -446,7 +511,7 @@ Describe 'switch_claude_account' {
 
         It 'mirrors when the tokens confirm the same account despite a new token pair' {
             Mock Test-ClaudeRunning { $true }
-            MockProfileUuid -Uuid 'test-acct-uuid-work' -Email 'alice@example.com'
+            MockProfileUuid -Uuid (Get-TestAccountUuid -Email 'alice@example.com') -Email 'alice@example.com'
 
             $r = Invoke-Reconcile 6>$null
             $r.Action | Should -Be 'mirror'

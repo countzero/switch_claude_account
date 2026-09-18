@@ -2220,6 +2220,44 @@ function Test-CredentialAccountMatch {
     }
 }
 
+# True when two oauthAccount-shaped records describe the same account.
+#
+# Compares accountUuid when both carry one, and falls back to emailAddress
+# otherwise, because Read-Sidecar requires an email but not a uuid: a sidecar
+# written before uuid capture has only the email to offer. Where the uuid
+# exists it is the better answer, and the email is actively unsafe: Claude Code
+# fills ~/.claude.json's emailAddress from the profile response on one login
+# path and from the access token's own embedded account_email on another, so
+# two records of one account can disagree about the email while both agree on
+# the uuid. See the $Script:ProfileEndpoint docblock for that evidence.
+#
+# Case-insensitive on both fields by PowerShell's default -eq, deliberately:
+# Claude Code lowercases uuids on some of its own comparison paths, so two
+# records of one account can differ in case alone.
+function Test-SameOAuthAccount {
+    Param (
+        [AllowNull()] [pscustomobject] $Left,
+        [AllowNull()] [pscustomobject] $Right
+    )
+
+    if (-not $Left -or -not $Right) { return $false }
+
+    $leftUuid  = [string]$Left.accountUuid
+    $rightUuid = [string]$Right.accountUuid
+    if (-not [string]::IsNullOrWhiteSpace($leftUuid) -and
+        -not [string]::IsNullOrWhiteSpace($rightUuid)) {
+        return $leftUuid -eq $rightUuid
+    }
+
+    $leftEmail  = [string]$Left.emailAddress
+    $rightEmail = [string]$Right.emailAddress
+    if ([string]::IsNullOrWhiteSpace($leftEmail) -or
+        [string]::IsNullOrWhiteSpace($rightEmail)) {
+        return $false
+    }
+    return $leftEmail -eq $rightEmail
+}
+
 # Decide whether the bytes now in .credentials.json belong to the account the
 # tracked slot holds. One of:
 #
@@ -2255,7 +2293,8 @@ function Confirm-TrackedSlotIdentity {
     # another.
     $slotEmail = if ($Slot.Sidecar) { [string]$Slot.Sidecar.oauthAccount.emailAddress } else { $Slot.Email }
 
-    if ($IncomingEmail -ne $slotEmail) {
+    $slotAccount = if ($Slot.Sidecar) { $Slot.Sidecar.oauthAccount } else { $null }
+    if (-not (Test-SameOAuthAccount -Left $IncomingAccount -Right $slotAccount)) {
         return [pscustomobject]@{
             Verdict   = 'differs'
             SlotEmail = $slotEmail
@@ -2436,29 +2475,47 @@ function Invoke-Reconcile {
     $activeName = if ($state) { $state.active_slot } else { $null }
     $twin = Find-SlotByHash -Hash $hash -ExcludeName $activeName
     if ($twin) {
-        Update-ScaState -ActiveSlot $twin.Name -LastSyncHash $hash | Out-Null
-
-        # Success line first: the adoption is already committed by the state
-        # write above, so it is the cause and any identity-write failure below
-        # is the consequence. Printed the other way round the user reads the
-        # complaint before the thing it is about.
         $twinIdent = Format-SlotIdentity -Name $twin.Name -Email $twin.Email
-        Write-Color "[Sync] Active credentials match saved slot $twinIdent; tracking it as active." 'Yellow'
 
-        # Carry the identity across too, the one branch that must. The other
-        # outcomes leave ~/.claude.json alone because they do not change WHICH
-        # account is active; this one does. Leaving it stale would make the next
-        # reconcile read the old email, find it differs from the adopted slot's,
-        # and auto-save a duplicate of an account already saved. Non-fatal for
-        # the same reason as in Invoke-SlotSwap: the credentials are already in
-        # place, so a failed display update must not undo the adoption. The
-        # advisory names the recovery because nothing retries this on its own --
-        # the next reconcile hash-matches and returns before reaching here.
+        # The identity write goes FIRST and the state write is conditional on
+        # it, because this is the one branch that changes WHICH account is
+        # active and the two files must agree about that. Committing state
+        # first and letting this fail leaves state naming the twin while
+        # ~/.claude.json still names the old account, and nothing revisits it:
+        # the next reconcile hash-matches and returns before reaching here. The
+        # one after that reads two identities that disagree, takes the differs
+        # arm, and files the twin's tokens under the OLD account's email and
+        # uuid -- a permanently mislabelled slot, the artifact `sca save`
+        # refuses to create.
+        $identityError = $null
         try {
             Set-OAuthAccountInClaudeJson -OAuthAccount $twin.Sidecar.oauthAccount
         }
         catch {
-            Write-Color "[Sync] ~/.claude.json still names the previous account: $($_.Exception.Message). Run 'sca switch $($twin.Name)' to write it from the same sidecar; until then the next token refresh will auto-save a duplicate of this account." 'Yellow'
+            $identityError = $_.Exception.Message
+        }
+
+        # A failed write only splits the two files when ~/.claude.json holds an
+        # identity to disagree with. It also throws when there is none to hold
+        # (file absent, or never signed in), and that case is safe: nothing can
+        # go stale against the adoption, so it stands and only the display
+        # lags. $newEmail was resolved from that same file at the top.
+        if ($identityError -and $newEmail -and $newEmail -ne $twin.Email) {
+            Write-Color "[Sync] Active credentials match saved slot $twinIdent, but ~/.claude.json could not be pointed at it ($identityError), so the active slot is left as it was rather than split across the two files. Fix that and re-run, or run 'sca switch $($twin.Name)'." 'Yellow'
+            return [pscustomobject]@{
+                Action   = 'noop'
+                Reason   = 'adopt-identity-write-failed'
+                Slot     = $activeName
+                # The bytes are byte-identical to the twin's slot file, so they
+                # are already saved and a caller may overwrite them freely.
+                Captured = $true
+            }
+        }
+
+        Update-ScaState -ActiveSlot $twin.Name -LastSyncHash $hash | Out-Null
+        Write-Color "[Sync] Active credentials match saved slot $twinIdent; tracking it as active." 'Yellow'
+        if ($identityError) {
+            Write-Color "[Sync] ~/.claude.json was not updated ($identityError); Claude Code's /status email may lag until you run 'sca switch $($twin.Name)'." 'Yellow'
         }
 
         return [pscustomobject]@{

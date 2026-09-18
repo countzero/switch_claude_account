@@ -58,7 +58,7 @@ Describe 'switch_claude_account' {
                     captured_at  = '2026-04-26T00:00:00.000Z'
                     source       = 'test'
                     oauthAccount = [ordered]@{
-                        accountUuid      = "test-acct-uuid-$Name"
+                        accountUuid      = (Get-TestAccountUuid -Email "$Name@test.local")
                         emailAddress     = "$Name@test.local"
                         organizationUuid = 'test-org-uuid'
                         displayName      = $Name

@@ -85,7 +85,21 @@ $Script:TokenRefreshRetryDelayMs   = 0
 $Script:WarmupSpacingMs            = 0
 
 # --- Test fixtures --------------------------------------------------------
+
+# Get-TestAccountUuid: the uuid a fixture account with this email carries.
 #
+# Derived from the email, not the slot name, because production compares
+# accountUuid first and falls back to the email only when one side lacks a
+# uuid (Test-SameOAuthAccount). A fixture that gives one account two uuids
+# depending on which helper wrote it does not model any real state: Claude
+# Code's own records of an account agree on the uuid even where they disagree
+# on the email. Keying both helpers off the email keeps "same email" and "same
+# account" from drifting apart in the fixtures the way they cannot on disk.
+function Get-TestAccountUuid {
+    Param ([Parameter(Mandatory)] [string] $Email)
+    return "test-acct-uuid-$Email"
+}
+
 # New-SlotPair: build a slot file + sidecar pair as production save would
 # produce. Without a sidecar, Get-Slots hides the slot per the post-v2.1.0
 # contract, so every test that creates a slot via the filesystem (rather
@@ -94,8 +108,8 @@ $Script:WarmupSpacingMs            = 0
 # This helper is intentionally a thin wrapper: it writes the bytes you
 # pass to the slot file and a synthetic sidecar with stable test values
 # in the oauthAccount block. Tests that need to assert on specific
-# sidecar values override -OAuthAccount; the default produces predictable
-# accountUuid/orgUuid strings derived from the slot name.
+# sidecar values override -OAuthAccount; the default derives the
+# accountUuid from the email via Get-TestAccountUuid.
 function New-SlotPair {
     Param (
         [Parameter(Mandatory)] [string] $CredDir,
@@ -124,7 +138,7 @@ function New-SlotPair {
     if (-not $OAuthAccount) {
         $sidecarEmail = if ($Email) { $Email } else { "$Name@test.local" }
         $OAuthAccount = [pscustomobject]@{
-            accountUuid      = "test-acct-uuid-$Name"
+            accountUuid      = (Get-TestAccountUuid -Email $sidecarEmail)
             emailAddress     = $sidecarEmail
             organizationUuid = 'test-org-uuid'
             displayName      = $sidecarEmail
@@ -154,15 +168,21 @@ function New-SlotPair {
 # with the given oauthAccount. Used by Invoke-SaveAction tests to exercise
 # the "primary identity from ~/.claude.json" path. Default produces a
 # fully-populated oauthAccount so Get-OAuthAccountFromClaudeJson succeeds.
+#
+# -AccountUuid defaults to the same derivation New-SlotPair uses, so a
+# ~/.claude.json and a slot written with one email describe one account. Pass
+# it explicitly to write a claude.json that names a DIFFERENT account.
 function Set-SandboxClaudeJson {
     Param (
         [string] $Email             = 'test@example.com',
-        [string] $AccountUuid       = '11111111-1111-1111-1111-111111111111',
+        [string] $AccountUuid,
         [string] $OrganizationUuid  = '22222222-2222-2222-2222-222222222222',
         [string] $DisplayName       = 'Test User',
         [string] $OrganizationName  = 'test-org',
         [hashtable] $ExtraTopLevel  = @{}
     )
+
+    if (-not $AccountUuid) { $AccountUuid = Get-TestAccountUuid -Email $Email }
 
     # Mirror the on-disk shape Claude Code 2.1.119 writes: oauthAccount
     # carries the cached metadata fields populateOAuthAccountInfoIfNeeded

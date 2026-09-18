@@ -501,8 +501,10 @@ Describe 'switch_claude_account' {
         # captured into its saved-slot file BEFORE we overwrite
         # .credentials.json with the destination slot.
         It 'reconciles before switching: outgoing slot bytes match the active file' {
+            # Same account as the BeforeEach's ~/.claude.json, uuid included, so
+            # reconcile mirrors rather than reading a cross-account swap.
             $oldSlot = New-SlotPair -CredDir $script:CredDirPath -Name 'old' -Content 'STALE_OLD'  -OAuthAccount ([pscustomobject]@{
-                accountUuid      = 'old-uuid'
+                accountUuid      = (Get-TestAccountUuid -Email 'baseline@example.com')
                 emailAddress     = 'baseline@example.com'
                 organizationUuid = 'old-org-uuid'
                 displayName      = 'Old'
