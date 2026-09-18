@@ -745,6 +745,48 @@ Describe 'switch_claude_account' {
             Get-Content -LiteralPath $credFile -Raw | Should -Be 'PERSONAL'
         }
 
+        # That same reconcile is not only a capture. Three of its outcomes move
+        # state.active_slot, which invalidates the decision: it was computed
+        # from a snapshot taken before the call, judging a slot that is no
+        # longer active. Rotating on it moves off an account nobody measured.
+        It 'on rotate abandons the tick when reconcile moved the active slot' -ForEach @(
+            @{ Outcome = 'adopt' }
+            @{ Outcome = 'identity-change' }
+            @{ Outcome = 'auto-save' }
+        ) {
+            Mock Get-AutoRotationDecision { return [pscustomobject]@{
+                Action   = 'rotate'
+                FromName = 'work'
+                ToName   = 'personal'
+            } }
+            Mock Invoke-Reconcile { return [pscustomobject]@{ Action = $Outcome; Slot = 'someone-else' } }.GetNewClosure()
+            Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
+            Mock Invoke-SlotSwap { }
+
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch 'x'
+
+            Should -Invoke Invoke-SlotSwap -Times 0
+            $out | Should -Be "[Monitor] Active account changed to 'someone-else'; re-evaluating at the next poll."
+        }
+
+        # The capture outcomes leave the active slot where it was, so the
+        # decision still holds and the rotation must proceed.
+        It 'on rotate proceeds when reconcile only mirrored' {
+            Mock Get-AutoRotationDecision { return [pscustomobject]@{
+                Action   = 'rotate'
+                FromName = 'work'
+                ToName   = 'personal'
+            } }
+            Mock Invoke-Reconcile { return [pscustomobject]@{ Action = 'mirror'; Slot = 'work' } }
+            Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
+            Mock Invoke-SlotSwap { }
+
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch 'x'
+
+            Should -Invoke Invoke-SlotSwap -Times 1
+            $out | Should -Match '^\[Monitor\] Rotated from "work" to "personal"'
+        }
+
         It 'on no-eligible with a future reset, returns cooldown line with a delta' {
             $future = [DateTimeOffset]::UtcNow.AddMinutes(72).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
             Mock Get-AutoRotationDecision { return [pscustomobject]@{

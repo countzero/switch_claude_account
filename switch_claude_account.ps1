@@ -5713,7 +5713,8 @@ function Format-AutoCooldownDelta {
 #   1. Get-AutoRotationDecision (pure) to classify the active slot's
 #      state against -Threshold.
 #   2. Invoke-Reconcile, then Find-SlotByName + Invoke-SlotSwap when a
-#      peer is eligible.
+#      peer is eligible. An outcome that moved state.active_slot aborts
+#      the tick instead, because it invalidates the decision from step 1.
 #   3. Map the outcome to a single-line latched footer string that
 #      Invoke-UsageWatch appends to every subsequent frame until the
 #      next state change.
@@ -5803,7 +5804,19 @@ function Invoke-AutoRotationStep {
                 # A throw here is caught below and reported as a rotation
                 # failure, which is correct -- rotating away from a slot we
                 # could not capture is the loss this call exists to prevent.
-                Invoke-Reconcile 6>$null | Out-Null
+                $sync = Invoke-Reconcile 6>$null
+
+                # Reconcile is not only a capture. Adopt, identity-change and
+                # auto-save each move state.active_slot, and that makes
+                # $decision stale: it was computed from a snapshot taken before
+                # this call, judging a slot that is no longer the active one.
+                # Rotating on it would move off an account whose usage nobody
+                # has read, and latch a FromName that is not where we came
+                # from. Skipping costs one tick; the next poll reads usage
+                # again and replaces this latch with a decision that fits.
+                if ($sync.Action -in @('adopt', 'identity-change', 'auto-save')) {
+                    return "[Monitor] Active account changed to '$($sync.Slot)'; re-evaluating at the next poll."
+                }
 
                 $slot = Find-SlotByName -Name $decision.ToName
                 if (-not $slot) {
