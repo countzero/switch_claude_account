@@ -629,6 +629,7 @@ Describe 'switch_claude_account' {
                 FromName = 'work'
                 ToName   = 'personal'
             } }
+            Mock Invoke-Reconcile { }
             Mock Find-SlotByName  { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap  { }
 
@@ -649,6 +650,7 @@ Describe 'switch_claude_account' {
                 ToName   = 'personal'
             } }
             Mock Test-ClaudeRunning { $true }
+            Mock Invoke-Reconcile { }
             Mock Find-SlotByName  { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap    { }
 
@@ -664,6 +666,7 @@ Describe 'switch_claude_account' {
                 FromName = 'work'
                 ToName   = 'personal'
             } }
+            Mock Invoke-Reconcile { }
             Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap { throw [System.IO.IOException]::new('locked file') }
 
@@ -680,6 +683,7 @@ Describe 'switch_claude_account' {
                 FromName = 'work'
                 ToName   = 'personal'
             } }
+            Mock Invoke-Reconcile { }
             Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap { throw [System.IO.IOException]::new("first line`r`nsecond line") }
 
@@ -695,12 +699,50 @@ Describe 'switch_claude_account' {
                 FromName = 'work'
                 ToName   = 'personal'
             } }
+            Mock Invoke-Reconcile { }
             Mock Find-SlotByName { return $null }
             Mock Invoke-SlotSwap { }
 
             $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Monitor] Automatic slot switching is enabled.'
             Should -Invoke Invoke-SlotSwap -Times 0
             $out | Should -Match '^\[Monitor\] Rotation failed! Slot ''personal'' not found'
+        }
+
+        # The regression this call exists for. The watch loop reconciles BEFORE
+        # Get-UsageSnapshot, then spends a full serial HTTP pass across every
+        # slot before reaching the swap. A Claude Code refresh landing in that
+        # window used to be overwritten by the swap and never mirrored, leaving
+        # the outgoing slot holding a refresh token the server already rotated.
+        # Real Invoke-Reconcile here, not a mock: the point is the capture.
+        It 'on rotate captures a refresh that landed since the poll reconciled' {
+            $cd = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $cd -Force | Out-Null
+            $credFile = Join-Path $cd '.credentials.json'
+
+            $workFile = New-SlotPair -CredDir $cd -Name 'work'     -Email 'alice@example.com' -Content 'OLD-WORK'
+            New-SlotPair -CredDir $cd -Name 'personal' -Email 'bob@example.com' -Content 'PERSONAL' | Out-Null
+            Set-SandboxClaudeJson -Email 'alice@example.com'
+
+            Set-Content -LiteralPath $credFile -Value 'OLD-WORK' -NoNewline
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash (Get-SHA256Hex -Path $credFile) | Out-Null
+
+            # Claude Code refreshes the active slot's tokens after the watch
+            # loop's own reconcile ran and while Get-UsageSnapshot is still
+            # walking the fleet.
+            Set-Content -LiteralPath $credFile -Value 'REFRESHED-WORK' -NoNewline
+
+            Mock Get-AutoRotationDecision { return [pscustomobject]@{
+                Action   = 'rotate'
+                FromName = 'work'
+                ToName   = 'personal'
+            } }
+
+            Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch 'x' 6>$null |
+                Should -Match '^\[Monitor\] Rotated from "work" to "personal"'
+
+            Get-Content -LiteralPath $workFile -Raw |
+                Should -Be 'REFRESHED-WORK' -Because 'the outgoing slot must capture the refresh before its bytes are replaced'
+            Get-Content -LiteralPath $credFile -Raw | Should -Be 'PERSONAL'
         }
 
         It 'on no-eligible with a future reset, returns cooldown line with a delta' {

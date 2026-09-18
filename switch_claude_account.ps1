@@ -301,6 +301,28 @@ $MarkerEnd   = "# === End Switch Claude Account ==="
 # iguana_necktie, omelette_promotional. Only five_hour (Session) and
 # seven_day (Week) are rendered, matching Claude Code's own /usage bars.
 $Script:UsageEndpoint       = "https://api.anthropic.com/api/oauth/usage"
+# GET /api/oauth/profile response body, extracted from claude.exe 2.1.276.
+# The client validates it with a Zod schema before use, which is the
+# authoritative statement of the shape (locate it via `Select-String 'api/
+# oauth/profile'`, then the `safeParse` call one function above it):
+#
+#   et({ account:      et({ uuid: ce(), email: ce() }).passthrough(),
+#        organization: et({ uuid: ce() }).passthrough() }).passthrough()
+#
+# So `account.uuid`, `account.email` and `organization.uuid` are required
+# strings; everything else (`account.display_name`, `account.full_name`,
+# `organization.billing_type`, `organization.rate_limit_tier`, ...) passes
+# through unvalidated and is optional.
+#
+# Load-bearing for Test-CredentialAccountMatch: the same binary assigns this
+# response straight into ~/.claude.json, `accountUuid: M.account.uuid` and
+# `emailAddress: M.account.email`, so `oauthAccount.accountUuid` IS this
+# endpoint's `account.uuid` and the two are directly comparable. The email is
+# NOT equally safe to compare: a login that never fetched a profile takes the
+# binary's other path and fills `emailAddress` from the access token's own
+# embedded `account_email`, which need not equal `account.email` here. The
+# uuid is the one field both paths agree on, which is why the identity guard
+# compares uuids and not emails.
 $Script:ProfileEndpoint     = "https://api.anthropic.com/api/oauth/profile"
 $Script:TokenEndpoint       = "https://platform.claude.com/v1/oauth/token"
 $Script:OAuthClientId       = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -1007,11 +1029,14 @@ function Update-ScaState {
 #   1. READ (sca save / reconcile identity probe): the email Claude Code
 #      shows IS what we want to label slots with. Drift between sca and
 #      Claude Code becomes structurally impossible.
-#   2. WRITE (sca switch): we copy the destination slot's captured oauthAccount
-#      block back into ~/.claude.json so Claude Code's display follows the
-#      active slot across switches.
+#   2. WRITE (sca switch, and reconcile's adopt branch): we copy the
+#      destination slot's captured oauthAccount block back into
+#      ~/.claude.json so Claude Code's display follows the active slot.
+#      Because reconcile adopts, this write also reaches actions that
+#      deliberately mutate nothing themselves, `sca usage` and `sca list`.
 #
-# Writing is gated by Test-ClaudeRunning, whose docblock owns the reason.
+# Writing is NOT gated on Claude Code being closed; see Test-ClaudeRunning for
+# which actions still refuse and why this write is not one of them.
 
 # Returns $true if Claude Code is running on the host.
 #
@@ -1042,15 +1067,27 @@ function Update-ScaState {
 #             chosen destination and stays; a round-robin underneath a user is
 #             not something they can reason about.
 #
-# Residual risk on the paths that no longer refuse: our ~/.claude.json write
-# does not take their lock, so a read-modify-write of ours can still drop a
-# config change Claude Code made in between. That costs a counter or a project
-# flag, never a credential, which is why it does not justify a refusal.
+# Residual risk on the paths that no longer refuse, in both files:
 #
-# The credential-level hazard that DID justify one is now handled in
+#   ~/.claude.json  our write does not take their lock, so a read-modify-write
+#                   of ours can drop a config change Claude Code made in
+#                   between. Costs a counter or a project flag, never a
+#                   credential.
+#   .credentials.json
+#                   a swap writes the destination slot's bytes over whatever
+#                   is there. A Claude Code token refresh landing between the
+#                   caller's reconcile and that write is discarded, leaving the
+#                   OUTGOING slot holding a refresh token the server has
+#                   already rotated. This one does cost a credential, which is
+#                   why both swap callers reconcile immediately beforehand
+#                   (Invoke-SwitchAction, and Invoke-AutoRotationStep's rotate
+#                   branch) rather than relying on an earlier pass.
+#
+# The credential-level hazard that DID justify a refusal is now handled in
 # Invoke-Reconcile rather than by refusing: it adopts a slot whose bytes match
-# the active file instead of mirroring over it, and declines to write at all
-# when it cannot attribute the bytes.
+# the active file instead of mirroring over it, declines to write at all when
+# it cannot attribute the bytes, and asks /api/oauth/profile whose tokens these
+# actually are before overwriting a slot while a client is live.
 #
 # Recovery if a write ever does corrupt the file: Claude Code keeps rolling
 # ~/.claude/backups/.claude.json.backup.<unix-ms> copies.
@@ -2095,6 +2132,65 @@ function New-AutoSaveSlot {
     return $autoName
 }
 
+# Ask the tokens themselves whose account they are, and compare that against
+# what a slot's sidecar says. Returns:
+#
+#   @{ Status = 'match';    Email; AccountUuid }
+#   @{ Status = 'mismatch'; Email; AccountUuid }   # different account, proven
+#   @{ Status = 'unknown';  Reason }               # could not tell
+#
+# This exists because every other identity signal sca has is read from a
+# DIFFERENT file than the one that changed. ~/.claude.json's email is written
+# by a /login as a separate write from .credentials.json, so in the window
+# between the two it still names the previous account while the tokens are
+# already the new one's. /api/oauth/profile is called WITH the tokens under
+# test, so its answer cannot lag them; it is the only probe that settles the
+# question rather than guessing at it.
+#
+# Compares accountUuid, never email. Claude Code fills ~/.claude.json's
+# emailAddress from the profile response on one path and from the access
+# token's own embedded account_email on another, so two records of the same
+# account can legitimately disagree about the email; both paths agree on the
+# uuid. See the $Script:ProfileEndpoint docblock for the extraction evidence.
+#
+# -NoRefresh on the probe is not optional: this runs while a live Claude Code
+# may be mid-request on those exact tokens, and refreshing would rotate the
+# refresh token out from under it to answer a question.
+#
+# 'unknown' is the honest answer for every failure (offline, 429, expired
+# token, sidecar predating uuid capture) and callers must treat it as "no
+# evidence", NOT as a mismatch. Refusing to mirror on no evidence would
+# freeze slot files for anyone whose profile endpoint is unreachable.
+function Test-CredentialAccountMatch {
+    Param (
+        [Parameter(Mandatory)] [string] $CredentialPath,
+        [AllowNull()] [pscustomobject] $Sidecar
+    )
+
+    $expected = if ($Sidecar) { [string]$Sidecar.oauthAccount.accountUuid } else { $null }
+    if ([string]::IsNullOrWhiteSpace($expected)) {
+        return [pscustomobject]@{ Status = 'unknown'; Reason = 'sidecar-has-no-uuid' }
+    }
+
+    $probe = Get-SlotProfile -SlotPath $CredentialPath -NoRefresh
+    if ($probe.Status -ne 'ok') {
+        return [pscustomobject]@{ Status = 'unknown'; Reason = $probe.Status }
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$probe.AccountUuid)) {
+        return [pscustomobject]@{ Status = 'unknown'; Reason = 'profile-has-no-uuid' }
+    }
+
+    # Case-insensitive by PowerShell's default -eq, deliberately: Claude Code
+    # lowercases uuids on some of its own comparison paths, so two records of
+    # one account can differ in case alone.
+    $status = if ($probe.AccountUuid -eq $expected) { 'match' } else { 'mismatch' }
+    return [pscustomobject]@{
+        Status      = $status
+        Email       = $probe.Email
+        AccountUuid = $probe.AccountUuid
+    }
+}
+
 # Reconcile .credentials.json with the saved slot tracked in $StateFile.
 # Called at the start of every credentials-touching action that needs the
 # tracked slot to reflect Claude Code's most recent token refresh (sca
@@ -2103,8 +2199,8 @@ function New-AutoSaveSlot {
 # Algorithm (7 outcomes; never throws unless an atomic write itself fails):
 #   1. .credentials.json missing                   -> noop
 #   2. hash matches state.last_sync_hash           -> noop
-#   3. bytes are byte-identical to ANOTHER saved   -> adopt that slot as active
-#      slot                                           (state + ~/.claude.json;
+#   3. bytes are byte-identical to a saved slot    -> adopt that slot as active
+#      other than the tracked one, if any             (state + ~/.claude.json;
 #                                                      no slot file is written)
 #   4. identity unresolvable                       -> noop, nothing written
 #   5. tracked slot exists, identity matches       -> mirror bytes -> slot
@@ -2115,20 +2211,30 @@ function New-AutoSaveSlot {
 #
 # Outcomes 3 and 4 exist because outcome 5 is the only destructive one: it
 # overwrites a slot file, the single artifact a login cannot be recovered
-# from. Both guard it, and both are ordered ahead of it.
+# from. Both guard it, and both are ordered ahead of it. Outcome 5 then guards
+# itself once more, against the one case the other two cannot see, by asking
+# the tokens whose account they are before it writes.
 #
 # Identity probe: ~/.claude.json's oauthAccount.emailAddress. This is the
 # same source Claude Code uses for /status, so reconcile and Claude Code can
 # never disagree about the active identity, and it is offline. Preferred over
-# /api/oauth/profile, which can return a different email for the same
-# account. When ~/.claude.json has no
-# oauthAccount yet (rare: fresh install, never logged into Claude Code),
-# we fall back to /api/oauth/profile.
+# /api/oauth/profile's email, which is not interchangeable with it: Claude Code
+# fills emailAddress from the profile response on one login path and from the
+# access token's own embedded account_email on another, so two records of one
+# account can disagree. When ~/.claude.json has no oauthAccount yet (rare:
+# fresh install, never logged into Claude Code), we fall back to the profile
+# endpoint anyway, because some identity beats none for LABELLING a new slot.
 #
-# The probe reads a DIFFERENT file than the one that changed, which is why
-# outcome 3 leads: the email can lag the tokens (a /login writes the two files
-# separately), and during that lag "same email" does not mean "same account".
-# Byte equality with a saved slot settles it without consulting either email.
+# The probe reads a DIFFERENT file than the one that changed, and that is the
+# weakness outcomes 3 and 5 are both built around: a /login writes the two
+# files separately, so between them the email still names the previous account
+# while the tokens are already the new one's, and "same email" does not mean
+# "same account". Outcome 3 settles the case where the incoming account is
+# already saved, by byte equality, offline and without consulting any email.
+# Outcome 5 settles the rest by asking /api/oauth/profile whose tokens these
+# are, but only while a client is running and therefore able to be mid-login;
+# see Test-CredentialAccountMatch for why that answer cannot lag, and why it
+# compares uuids rather than emails.
 #
 # Tracked slot's identity comes from the slot's sidecar (which was
 # captured at save time from ~/.claude.json or /api/oauth/profile). This
@@ -2184,52 +2290,66 @@ function Invoke-Reconcile {
     }
     $sourceLabel = if ($newAccount -and $newAccount.accountUuid) { 'claude_json' } else { 'api_profile' }
 
+    # A saved slot moved into place behind our back: another writer (a
+    # `claude` /login, a second sca, a hand-edit) already activated it.
+    # Mirroring would copy its tokens over the slot state still names and
+    # destroy that login, so adopt the slot instead of writing.
+    #
+    # Ahead of the tracked-slot block, not inside it, because both paths below
+    # can destroy or duplicate: the mirror overwrites the tracked slot, and the
+    # auto-save fallback would write a second copy of an account already saved
+    # whenever there is no tracked slot to compare against (a corrupt state file
+    # reaches Read-ScaState's catch, which returns $null without running the
+    # hash bootstrap). Byte equality answers both without consulting an email.
+    #
+    # Checked BEFORE the email comparison because byte equality is proof where
+    # the email is only evidence. A /login writes .credentials.json and
+    # ~/.claude.json as two separate writes, so between them the tokens are
+    # already the new account's while the email still reads as the old one;
+    # that window is precisely when the email says "same account, just
+    # refreshed" and is wrong.
+    $activeName = if ($state) { $state.active_slot } else { $null }
+    $twin = Find-SlotByHash -Hash $hash -ExcludeName $activeName
+    if ($twin) {
+        Update-ScaState -ActiveSlot $twin.Name -LastSyncHash $hash | Out-Null
+
+        # Success line first: the adoption is already committed by the state
+        # write above, so it is the cause and any identity-write failure below
+        # is the consequence. Printed the other way round the user reads the
+        # complaint before the thing it is about.
+        $twinIdent = Format-SlotIdentity -Name $twin.Name -Email $twin.Email
+        Write-Color "[Sync] Active credentials match saved slot $twinIdent; tracking it as active." 'Yellow'
+
+        # Carry the identity across too, the one branch that must. The other
+        # outcomes leave ~/.claude.json alone because they do not change WHICH
+        # account is active; this one does. Leaving it stale would make the next
+        # reconcile read the old email, find it differs from the adopted slot's,
+        # and auto-save a duplicate of an account already saved. Non-fatal for
+        # the same reason as in Invoke-SlotSwap: the credentials are already in
+        # place, so a failed display update must not undo the adoption. The
+        # advisory names the recovery because nothing retries this on its own --
+        # the next reconcile hash-matches and returns before reaching here.
+        try {
+            Set-OAuthAccountInClaudeJson -OAuthAccount $twin.Sidecar.oauthAccount
+        }
+        catch {
+            Write-Color "[Sync] ~/.claude.json still names the previous account: $($_.Exception.Message). Run 'sca switch $($twin.Name)' to write it from the same sidecar; until then the next token refresh will auto-save a duplicate of this account." 'Yellow'
+        }
+
+        return [pscustomobject]@{
+            Action       = 'adopt'
+            Slot         = $twin.Name
+            PreviousSlot = $activeName
+            Email        = $twin.Email
+        }
+    }
+
     if ($state -and $state.active_slot) {
         $slot = Find-SlotByName -Name $state.active_slot
         if ($slot) {
             # Tracked slot's email comes from its sidecar (Get-Slots always
             # populates this on the slot object).
             $slotEmail = if ($slot.Sidecar) { [string]$slot.Sidecar.oauthAccount.emailAddress } else { $slot.Email }
-
-            # A saved slot moved into place behind our back: another writer (a
-            # `claude` /login, a second sca, a hand-edit) already activated it.
-            # Mirroring would copy its tokens over the slot state still names
-            # and destroy that login, so adopt the slot instead of writing.
-            #
-            # Checked BEFORE the email comparison because byte equality is
-            # proof where the email is only evidence. A /login writes
-            # .credentials.json and ~/.claude.json as two separate writes, so
-            # between them the tokens are already the new account's while the
-            # email still reads as the old one; that window is precisely when
-            # the email says "same account, just refreshed" and is wrong.
-            $twin = Find-SlotByHash -Hash $hash -ExcludeName $state.active_slot
-            if ($twin) {
-                Update-ScaState -ActiveSlot $twin.Name -LastSyncHash $hash | Out-Null
-
-                # Carry the identity across too, the one branch that must. The
-                # other outcomes leave ~/.claude.json alone because they do not
-                # change WHICH account is active; this one does. Leaving it
-                # stale would make the next reconcile read the old email, find
-                # it differs from the adopted slot's, and auto-save a duplicate
-                # of an account already saved. Non-fatal for the same reason as
-                # in Invoke-SlotSwap: the credentials are already in place, so
-                # a failed display update must not undo the adoption.
-                try {
-                    Set-OAuthAccountInClaudeJson -OAuthAccount $twin.Sidecar.oauthAccount
-                }
-                catch {
-                    Write-Color "[Sync] Tracking '$($twin.Name)' as active, but the ~/.claude.json identity update failed: $($_.Exception.Message)" 'Yellow'
-                }
-
-                $twinIdent = Format-SlotIdentity -Name $twin.Name -Email $twin.Email
-                Write-Color "[Sync] Active credentials match saved slot $twinIdent; tracking it as active." 'Yellow'
-                return [pscustomobject]@{
-                    Action       = 'adopt'
-                    Slot         = $twin.Name
-                    PreviousSlot = $state.active_slot
-                    Email        = $twin.Email
-                }
-            }
 
             # Unattributable bytes, because ~/.claude.json carries no email and
             # the profile endpoint did not answer either (offline, 429). Both
@@ -2247,12 +2367,52 @@ function Invoke-Reconcile {
             }
 
             if ($newEmail -eq $slotEmail) {
-                Set-CredentialFileAtomic -Path $slot.Path -Bytes $bytes
-                Update-ScaState -LastSyncHash $hash | Out-Null
-                return [pscustomobject]@{
-                    Action = 'mirror'
-                    Slot   = $state.active_slot
-                    Email  = $slotEmail
+                # The email just said "same account, only the tokens moved". It
+                # was read from ~/.claude.json, a different file than the one
+                # that changed, so it is only trustworthy while nothing can be
+                # sitting between a /login's two writes. With no client running
+                # nothing can be, and the offline answer stands. With one
+                # running, ask the tokens themselves first: this is the last
+                # moment at which the login in that slot file still exists.
+                #
+                # Gated rather than unconditional because the probe is a network
+                # round-trip on a path `sca list` also takes, and the closed-
+                # client case is both the common one and the one that cannot be
+                # wrong. A byte-identical twin was already ruled out above, so
+                # what remains here is a /login to an account with no slot.
+                $identity = if (Test-ClaudeRunning) {
+                    Test-CredentialAccountMatch -CredentialPath $CredFile -Sidecar $slot.Sidecar
+                } else {
+                    [pscustomobject]@{ Status = 'unknown'; Reason = 'no-client-running' }
+                }
+
+                # Only a PROVEN mismatch blocks the mirror. 'unknown' keeps
+                # today's behaviour on purpose: treating "could not ask" as
+                # "different account" would freeze every slot file behind an
+                # unreachable profile endpoint, and a slot that stops tracking
+                # refreshes is dead within two of them.
+                if ($identity.Status -ne 'mismatch') {
+                    Set-CredentialFileAtomic -Path $slot.Path -Bytes $bytes
+                    Update-ScaState -LastSyncHash $hash | Out-Null
+                    return [pscustomobject]@{
+                        Action = 'mirror'
+                        Slot   = $state.active_slot
+                        Email  = $slotEmail
+                    }
+                }
+
+                # A different account wearing the old email: a /login caught
+                # between its two writes. Re-point the identity at what the
+                # tokens actually say and fall through to the preserve-both
+                # path, which writes a new slot and leaves this one alone.
+                $newEmail    = $identity.Email
+                $sourceLabel = 'api_profile'
+                $newAccount  = [pscustomobject]@{
+                    accountUuid      = $identity.AccountUuid
+                    emailAddress     = $identity.Email
+                    organizationUuid = $null
+                    displayName      = $null
+                    organizationName = $null
                 }
             }
 
@@ -2511,13 +2671,12 @@ function Invoke-SlotSwap {
         [Parameter(Mandatory)] [pscustomobject] $Slot
     )
 
-    # Atomic-rename copy: works even if Claude Code has .credentials.json
-    # open (it grants share-delete); but with the running guard enforced
-    # by the caller, this path normally only executes when Claude Code
-    # is closed. Bytes are read from the slot file once and reused for
-    # both the write and the state hash so the post-swap state.hash
-    # matches the bytes we just wrote (not a re-read that could race a
-    # concurrent refresh from another tool).
+    # Atomic-rename copy: works even if Claude Code has .credentials.json open
+    # (it grants share-delete), which is the normal case here rather than the
+    # exception -- switch and rotation both run beside a live client. Bytes are
+    # read from the slot file once and reused for both the write and the state
+    # hash so the post-swap state.hash matches the bytes we just wrote (not a
+    # re-read that could race a concurrent refresh from another tool).
     $slotBytes = [System.IO.File]::ReadAllBytes($Slot.Path)
     Set-CredentialFileAtomic -Path $CredFile -Bytes $slotBytes
 
@@ -2863,8 +3022,8 @@ function Get-SlotOAuth {
 # message on failure.
 #
 # Race with a running Claude Code: `sca usage` does NOT refuse while
-# Claude Code is running (only `save` / `switch` do; see
-# Test-ClaudeRunning callers), so an active-slot refresh triggered here
+# Claude Code is running (only `save`, `warmup` and `monitor -KeepWarm` do;
+# see Test-ClaudeRunning callers), so an active-slot refresh triggered here
 # can race against Claude Code's own refresh. Anthropic rotates the
 # refresh_token on every successful /v1/oauth/token call: whichever
 # party (sca or Claude Code) calls second presents the now-rotated old
@@ -3165,10 +3324,20 @@ function Clear-SlotRateLimitBackoff {
 # fresh entry before returning 'rate-limited' (the cache-fallback path); the
 # other two callers have no cache and read Status / Error only.
 #
+# -NoRefresh returns 'expired' instead of refreshing. For callers that are
+# only ASKING something about a slot, refreshing is not a free upgrade: it
+# rotates the refresh token server-side, so doing it as a side effect of a
+# check would invalidate the copy a live Claude Code still holds. The identity
+# guard in Invoke-Reconcile uses it for exactly that reason -- it probes
+# .credentials.json while a client may be mid-request on those very tokens.
+#
 # Does NOT set $ProgressPreference: Get-SlotOAuth performs no HTTP, and
 # Update-SlotTokens sets it inside its own scope.
 function Resolve-SlotAccessToken {
-    Param ([String] $SlotPath)
+    Param (
+        [String] $SlotPath,
+        [switch] $NoRefresh
+    )
 
     try {
         $info = Get-SlotOAuth -SlotPath $SlotPath
@@ -3188,6 +3357,17 @@ function Resolve-SlotAccessToken {
     # expire mid-call.
     $threshold = [DateTime]::UtcNow.AddSeconds(60)
     if ($info.ExpiresAt -and $info.ExpiresAt -lt $threshold) {
+        if ($NoRefresh) {
+            # Same label the failed-refresh path uses, because the caller's
+            # situation is identical: no usable token. Transport=$false, since
+            # nothing was attempted and a retry would not differ.
+            return [pscustomobject]@{
+                Status     = 'expired'
+                Error      = 'access token expired and -NoRefresh was requested'
+                HttpStatus = $null
+                Transport  = $false
+            }
+        }
         try {
             $accessToken = Update-SlotTokens -SlotPath $SlotPath
         }
@@ -3528,8 +3708,8 @@ function Get-ExceptionHttpStatus {
     return $null
 }
 
-# Resolve the OAuth account email for a slot. Returns one of:
-#   @{ Status = 'ok';           Email = <string> }
+# Resolve the OAuth account identity for a slot. Returns one of:
+#   @{ Status = 'ok';           Email = <string>; AccountUuid = <string> }
 #   @{ Status = 'no-oauth' }                        # slot has no claudeAiOauth
 #   @{ Status = 'expired' }                         # token expired + refresh failed (non-429)
 #   @{ Status = 'rate-limited' }                    # 429 from refresh endpoint OR profile endpoint
@@ -3553,7 +3733,10 @@ function Get-ExceptionHttpStatus {
 # endpoint without an emergency patch.
 function Get-SlotProfile {
     Param (
-        [String] $SlotPath
+        [String] $SlotPath,
+        # Threaded to Resolve-SlotAccessToken; see its docblock for why a
+        # caller that is only asking a question must not rotate tokens.
+        [switch] $NoRefresh
     )
 
     # See Get-SlotUsage for the $ProgressPreference rationale; same
@@ -3564,7 +3747,7 @@ function Get-SlotProfile {
     # 429-as-rate-limited from the token endpoint) return verbatim. No
     # profile cache to fall back on (Get-SlotProfile is no-cache by
     # design; see the function docstring above).
-    $tok = Resolve-SlotAccessToken -SlotPath $SlotPath
+    $tok = Resolve-SlotAccessToken -SlotPath $SlotPath -NoRefresh:$NoRefresh
     if ($tok.Status -ne 'ok') { return $tok }
     $accessToken = $tok.AccessToken
 
@@ -3602,7 +3785,16 @@ function Get-SlotProfile {
         return [pscustomobject]@{ Status = 'error'; Error = 'profile response missing account.email' }
     }
 
-    return [pscustomobject]@{ Status = 'ok'; Email = $email }
+    # account.uuid is required by the client's own schema (see the
+    # $Script:ProfileEndpoint docblock), but it is carried as optional here
+    # rather than failing the call: the email is what every existing caller
+    # needs, and only the identity guard reads the uuid. A response that
+    # somehow lacks it degrades that guard to "cannot confirm", which is
+    # already a case it handles, instead of breaking `sca save`.
+    $accountUuid = $null
+    if ($resp.account.uuid) { $accountUuid = [string]$resp.account.uuid }
+
+    return [pscustomobject]@{ Status = 'ok'; Email = $email; AccountUuid = $accountUuid }
 }
 
 # Run the Claude Code CLI (`claude`) as a child process and return its raw
@@ -5464,7 +5656,8 @@ function Format-AutoCooldownDelta {
 #
 #   1. Get-AutoRotationDecision (pure) to classify the active slot's
 #      state against -Threshold.
-#   2. Find-SlotByName + Invoke-SlotSwap when a peer is eligible.
+#   2. Invoke-Reconcile, then Find-SlotByName + Invoke-SlotSwap when a
+#      peer is eligible.
 #   3. Map the outcome to a single-line latched footer string that
 #      Invoke-UsageWatch appends to every subsequent frame until the
 #      next state change.
@@ -5543,6 +5736,19 @@ function Invoke-AutoRotationStep {
 
         'rotate' {
             try {
+                # Re-capture before the swap. The poll reconciled before
+                # Get-UsageSnapshot, which then spends a full serial HTTP pass
+                # across every slot; a Claude Code refresh landing in that
+                # window would otherwise be overwritten by the swap below and
+                # never mirrored, leaving the outgoing slot holding a refresh
+                # token Anthropic has already rotated (see Update-SlotTokens on
+                # what losing that rotation costs). Only on the rotate branch:
+                # the polls that do not rotate write nothing and pay nothing.
+                # A throw here is caught below and reported as a rotation
+                # failure, which is correct -- rotating away from a slot we
+                # could not capture is the loss this call exists to prevent.
+                Invoke-Reconcile 6>$null | Out-Null
+
                 $slot = Find-SlotByName -Name $decision.ToName
                 if (-not $slot) {
                     # Sidecar disappeared between snapshot and lookup.

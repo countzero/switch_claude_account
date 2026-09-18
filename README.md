@@ -28,7 +28,7 @@ A zero-dependency PowerShell utility for Claude Code on Windows, Linux, and macO
 
 **Reliability & footprint**
 
-- **Atomic-safe writes**: slot-file updates use an atomic rename (`MoveFileEx` on Windows, `rename(2)` on Unix) with retry so they survive a running Claude Code on `.credentials.json`; only `save` and `warmup` still need it closed, see [which actions](#which-actions-still-need-claude-code-closed)
+- **Atomic-safe writes**: slot-file updates use an atomic rename (`MoveFileEx` on Windows, `rename(2)` on Unix) with retry so they survive a running Claude Code on `.credentials.json`; see [which actions still need it closed](#which-actions-still-need-claude-code-closed)
 - **Zero dependencies**: pure PowerShell 7.4+, no external packages, no companion assets
 
 ## Installation
@@ -242,7 +242,7 @@ sca help         # Show usage info
 5. **Close Claude Code**
 6. Run `sca save personal`
 
-`save` is the one action that still needs Claude Code closed. It exits immediately with a clear message if you forget; no partial writes occur. See [Which actions still need Claude Code closed](#which-actions-still-need-claude-code-closed).
+`save` refuses while Claude Code is running. It exits immediately with a clear message if you forget; no partial writes occur. See [Which actions still need Claude Code closed](#which-actions-still-need-claude-code-closed) for the full list.
 
 ### Switching between accounts
 
@@ -258,6 +258,8 @@ Claude Code 2.1.274 follows both files on its own: it polls `~/.claude.json` onc
 That makes Claude Code equivalent to [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4** for this purpose, so `sca monitor` is no longer OpenCode-scoped.
 
 One residual difference from closing the app: `sca` does not take Claude Code's `~/.claude.json.lock`, so an `sca` read-modify-write can drop a config change Claude Code made in the same instant. That costs a counter or a project flag, never a credential.
+
+Credentials get a stronger guarantee, because losing one is not recoverable. Before overwriting a saved slot, `sca` checks that the active tokens really are that slot's account: byte-identical tokens are recognised as a slot that is already saved, and anything else is confirmed against `/api/oauth/profile` using those very tokens rather than against the email cached in `~/.claude.json`, which a `/login` updates a moment later than the tokens themselves.
 
 ### Which actions still need Claude Code closed
 

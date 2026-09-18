@@ -189,8 +189,21 @@ Describe 'switch_claude_account' {
             # The credentials are already in place, so a failed display update
             # must not undo the adoption; it downgrades to an advisory.
             (Read-ScaState).active_slot | Should -Be 'personal'
-            $out | Should -Match 'identity update failed'
+            $out | Should -Match 'still names the previous account'
             $out | Should -Match 'claude.json is locked'
+
+            # Nothing retries this on its own: the next reconcile hash-matches
+            # and returns before reaching the adopt branch, so the advisory has
+            # to carry the recovery command and say what it costs to ignore.
+            $out | Should -Match "Run 'sca switch personal'"
+            $out | Should -Match 'auto-save a duplicate'
+
+            # Cause before consequence: the adoption line is the event, the
+            # failure is a footnote to it.
+            $adoptAt = $out.IndexOf('Active credentials match saved slot')
+            $failAt  = $out.IndexOf('still names the previous account')
+            $adoptAt | Should -BeGreaterThan -1
+            $failAt  | Should -BeGreaterThan $adoptAt
         }
 
         It 'prints a yellow advisory naming the adopted slot' {
@@ -220,6 +233,51 @@ Describe 'switch_claude_account' {
             $r = Invoke-Reconcile 6>$null
             $r.Action | Should -Be 'mirror'
             $r.Slot   | Should -Be 'work'
+        }
+
+        # The adopt check sits ahead of the tracked-slot block, not inside it,
+        # because the auto-save fallback is destructive in its own way: it
+        # writes a SECOND copy of an account already saved and moves active
+        # tracking onto the copy. Byte equality answers that case too, and it
+        # needs no tracked slot to compare against.
+        It 'adopts rather than auto-saving a duplicate when no slot is tracked' {
+            $credFile = Join-Path $script:CD '.credentials.json'
+            $slotFile = New-SlotPair -CredDir $script:CD -Name 'personal' -Email 'bob@example.com' -Content $script:CredsBody
+            Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
+            Set-SandboxClaudeJson -Email 'bob@example.com'
+
+            # Written directly, not via Update-ScaState: that would call
+            # Read-ScaState, whose no-state-file hash bootstrap would itself
+            # identify 'personal' and defeat the setup. A state file that
+            # EXISTS with a null active_slot skips the bootstrap, which is the
+            # shape this branch has to handle.
+            Set-Content -LiteralPath $StateFile -NoNewline `
+                -Value '{"schema":1,"active_slot":null,"last_sync_hash":"STALE_HASH"}'
+
+            $r = Invoke-Reconcile 6>$null
+            $r.Action       | Should -Be 'adopt'
+            $r.Slot         | Should -Be 'personal'
+            $r.PreviousSlot | Should -BeNullOrEmpty
+
+            (Read-ScaState).active_slot | Should -Be 'personal'
+            Get-Content -LiteralPath $slotFile -Raw | Should -Be $script:CredsBody
+            @(Get-Slots).Count | Should -Be 1 -Because 'no duplicate slot may be created for an account already saved'
+        }
+
+        # Read-ScaState's hash bootstrap only runs when the state file is
+        # ABSENT. A corrupt one takes the catch and returns $null, so this is
+        # the reachable path to "no tracked slot while a matching slot exists".
+        It 'adopts rather than auto-saving a duplicate when the state file is corrupt' {
+            $credFile = Join-Path $script:CD '.credentials.json'
+            New-SlotPair -CredDir $script:CD -Name 'personal' -Email 'bob@example.com' -Content $script:CredsBody | Out-Null
+            Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
+            Set-SandboxClaudeJson -Email 'bob@example.com'
+            Set-Content -LiteralPath $StateFile -Value '{ this is not json' -NoNewline
+
+            $r = Invoke-Reconcile 6>$null
+            $r.Action | Should -Be 'adopt'
+            $r.Slot   | Should -Be 'personal'
+            @(Get-Slots).Count | Should -Be 1
         }
     }
 
@@ -252,6 +310,108 @@ Describe 'switch_claude_account' {
         It 'returns $null when no slots are saved' {
             $hash = Get-SHA256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes('AAA'))
             Find-SlotByHash -Hash $hash | Should -BeNullOrEmpty
+        }
+    }
+
+    # ----- the /login window ---------------------------------------------
+    #
+    # Byte equality (adopt) closes the case where the incoming account is
+    # already saved. This is the rest of it: a /login to an account with NO
+    # slot produces bytes matching nothing, while ~/.claude.json still carries
+    # the previous account's email, so the email probe says "same account,
+    # just refreshed" and the mirror overwrites the only copy of that login.
+    # Asking /api/oauth/profile with the incoming tokens is the one probe that
+    # cannot lag them.
+    Context 'Invoke-Reconcile (identity guard on the mirror branch)' {
+        BeforeEach {
+            $script:GuardCred  = Join-Path $script:CD '.credentials.json'
+            $script:GuardOther = '{"claudeAiOauth":{"accessToken":"sk-ant-oat-NEW","refreshToken":"sk-ant-ort-NEW","expiresAt":9999999999999}}'
+
+            # 'work' is tracked and holds its own tokens; .credentials.json now
+            # holds tokens matching NO slot; ~/.claude.json still says alice.
+            $script:GuardSlot = New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content $script:CredsBody
+            Set-Content -LiteralPath $script:GuardCred -Value $script:GuardOther -NoNewline
+            Set-SandboxClaudeJson -Email 'alice@example.com'
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE_HASH' | Out-Null
+        }
+
+        # New-SlotPair's sidecar uuid is "test-acct-uuid-<name>".
+        function script:MockProfileUuid {
+            Param ([string] $Uuid, [string] $Email = 'someone@example.com')
+            Mock Invoke-RestMethod -ParameterFilter {
+                $Uri -eq 'https://api.anthropic.com/api/oauth/profile'
+            } -MockWith {
+                return [pscustomobject]@{
+                    account      = [pscustomobject]@{ uuid = $Uuid; email = $Email }
+                    organization = [pscustomobject]@{ uuid = 'org-uuid' }
+                }
+            }.GetNewClosure()
+        }
+
+        It 'refuses the mirror when the tokens prove a different account' {
+            Mock Test-ClaudeRunning { $true }
+            MockProfileUuid -Uuid 'test-acct-uuid-INTRUDER' -Email 'intruder@example.com'
+
+            $r = Invoke-Reconcile 6>$null
+
+            # Preserve-both, not overwrite.
+            $r.Action | Should -Be 'identity-change'
+            $r.Email  | Should -Be 'intruder@example.com'
+            Get-Content -LiteralPath $script:GuardSlot -Raw |
+                Should -Be $script:CredsBody -Because 'the tracked login is the artifact that cannot be recovered'
+        }
+
+        It 'mirrors when the tokens confirm the same account despite a new token pair' {
+            Mock Test-ClaudeRunning { $true }
+            MockProfileUuid -Uuid 'test-acct-uuid-work' -Email 'alice@example.com'
+
+            $r = Invoke-Reconcile 6>$null
+            $r.Action | Should -Be 'mirror'
+            Get-Content -LiteralPath $script:GuardSlot -Raw | Should -Be $script:GuardOther
+        }
+
+        # 'unknown' must not behave like 'mismatch'. Treating "could not ask"
+        # as "different account" would freeze every slot file behind an
+        # unreachable profile endpoint, and a slot that stops tracking
+        # refreshes is dead after two of them.
+        It 'mirrors when the probe cannot answer' {
+            Mock Test-ClaudeRunning { $true }
+            # Common.ps1's default profile mock throws.
+            $r = Invoke-Reconcile 6>$null
+            $r.Action | Should -Be 'mirror'
+            Get-Content -LiteralPath $script:GuardSlot -Raw | Should -Be $script:GuardOther
+        }
+
+        # With no client running, nothing can be between a /login's two writes,
+        # so the offline answer stands and `sca list` stays network-free.
+        It 'does not probe at all when no client is running' {
+            Mock Test-ClaudeRunning { $false }
+            Mock Invoke-RestMethod -ParameterFilter {
+                $Uri -eq 'https://api.anthropic.com/api/oauth/profile'
+            } -MockWith { throw 'profile must not be called' }
+
+            $r = Invoke-Reconcile 6>$null
+            $r.Action | Should -Be 'mirror'
+            Should -Invoke Invoke-RestMethod -Times 0 -ParameterFilter {
+                $Uri -eq 'https://api.anthropic.com/api/oauth/profile'
+            }
+        }
+
+        # The probe runs against tokens a live client may be mid-request on.
+        # Refreshing them to answer a question would rotate the refresh token
+        # out from under it, which is the loss the guard exists to prevent.
+        It 'never refreshes the tokens it is probing' {
+            Mock Test-ClaudeRunning { $true }
+            Mock Update-SlotTokens { throw 'the identity probe must not rotate tokens' }
+
+            $expired = '{"claudeAiOauth":{"accessToken":"sk-ant-oat-OLD","refreshToken":"sk-ant-ort-OLD","expiresAt":1}}'
+            Set-Content -LiteralPath $script:GuardCred -Value $expired -NoNewline
+
+            $r = Invoke-Reconcile 6>$null
+
+            Should -Invoke Update-SlotTokens -Times 0
+            # Unresolvable identity is 'unknown', so the mirror still happens.
+            $r.Action | Should -Be 'mirror'
         }
     }
 
