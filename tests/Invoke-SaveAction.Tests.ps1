@@ -117,6 +117,30 @@ Describe 'switch_claude_account' {
             (Get-Content -LiteralPath $sidecar -Raw | ConvertFrom-Json).source | Should -Be 'api_profile'
         }
 
+        # accountUuid is the only field Test-CredentialAccountMatch compares.
+        # A fallback sidecar that drops it leaves the slot permanently exempt
+        # from the mirror-overwrite guard while still passing Read-Sidecar.
+        It 'carries the profile account uuid into the fallback sidecar' {
+            $minimal = [ordered]@{ numStartups = 1; autoUpdates = $true } | ConvertTo-Json
+            Set-Content -LiteralPath $ClaudeJsonPath -Value $minimal -NoNewline
+
+            Set-Content -LiteralPath $script:CredFilePath -Value '{"claudeAiOauth":{"accessToken":"sk-ant-oat-x","refreshToken":"sk-ant-ort-x","expiresAt":9999999999999}}' -NoNewline
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
+                return [pscustomobject]@{
+                    account      = [pscustomobject]@{ uuid = 'acct-uuid-fallback'; email = 'fallback@example.com' }
+                    organization = [pscustomobject]@{ uuid = 'org-uuid' }
+                }
+            }
+
+            Invoke-SaveAction -Name 'work' 6>$null
+
+            $sidecar = Join-Path $script:CredDirPath '.credentials.work(fallback@example.com).account.json'
+            $parsed  = Get-Content -LiteralPath $sidecar -Raw | ConvertFrom-Json
+            $parsed.oauthAccount.accountUuid | Should -Be 'acct-uuid-fallback'
+            $parsed.source                   | Should -Be 'api_profile'
+        }
+
         It 'refuses to save when neither ~/.claude.json nor /api/oauth/profile yields an identity' {
             # No ~/.claude.json at all; Get-OAuthAccountFromClaudeJson
             # returns $null. Common.ps1's default mock makes the profile

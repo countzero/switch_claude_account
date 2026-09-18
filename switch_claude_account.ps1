@@ -2132,6 +2132,31 @@ function New-AutoSaveSlot {
     return $autoName
 }
 
+# Build the oauthAccount block a sidecar stores from an 'ok' Get-SlotProfile
+# result. Both fallback paths (Invoke-SaveAction, Invoke-Reconcile) go through
+# here rather than hand-rolling the object, because accountUuid is the ONLY
+# field Test-CredentialAccountMatch compares: a site that forgets to carry it
+# writes a sidecar that silently exempts its slot from the mirror-overwrite
+# guard forever, and the slot still looks valid to Read-Sidecar.
+#
+# The three remaining fields stay $null because the endpoint does not carry
+# them. Set-OAuthAccountInClaudeJson skips nulls, so a later switch to this
+# slot preserves whatever ~/.claude.json already had for them.
+#
+# Parameter is $ProfileResult, not $Profile: the latter shadows PowerShell's
+# automatic $PROFILE inside this scope.
+function New-OAuthAccountFromProfile {
+    Param ([Parameter(Mandatory)] [pscustomobject] $ProfileResult)
+
+    return [pscustomobject]@{
+        accountUuid      = $ProfileResult.AccountUuid
+        emailAddress     = $ProfileResult.Email
+        organizationUuid = $null
+        displayName      = $null
+        organizationName = $null
+    }
+}
+
 # Ask the tokens themselves whose account they are, and compare that against
 # what a slot's sidecar says. Returns:
 #
@@ -2272,23 +2297,21 @@ function Invoke-Reconcile {
     # ~/.claude.json's oauthAccount.emailAddress (offline; same source
     # Claude Code uses). Fallback: /api/oauth/profile (network) when
     # ~/.claude.json has no oauthAccount populated yet.
-    $newAccount = Get-OAuthAccountFromClaudeJson
-    $newEmail   = if ($newAccount) { $newAccount.emailAddress } else { $null }
+    # $sourceLabel is set per branch rather than inferred from the resolved
+    # account, because every field it could be inferred from is one both
+    # sources can populate. It is informational only (it lands in the
+    # sidecar's `source`), so a wrong value costs diagnosis, not behaviour.
+    $newAccount  = Get-OAuthAccountFromClaudeJson
+    $newEmail    = if ($newAccount) { $newAccount.emailAddress } else { $null }
+    $sourceLabel = 'claude_json'
     if (-not $newEmail) {
         $profileResult = Get-SlotProfile -SlotPath $CredFile
         if ($profileResult.Status -eq 'ok') {
-            $newEmail = $profileResult.Email
-            # Synthesize a minimal accountInfo for the auto-save sidecar.
-            $newAccount = [pscustomobject]@{
-                accountUuid      = $null
-                emailAddress     = $newEmail
-                organizationUuid = $null
-                displayName      = $null
-                organizationName = $null
-            }
+            $newEmail    = $profileResult.Email
+            $newAccount  = New-OAuthAccountFromProfile -ProfileResult $profileResult
+            $sourceLabel = 'api_profile'
         }
     }
-    $sourceLabel = if ($newAccount -and $newAccount.accountUuid) { 'claude_json' } else { 'api_profile' }
 
     # A saved slot moved into place behind our back: another writer (a
     # `claude` /login, a second sca, a hand-edit) already activated it.
@@ -2407,13 +2430,10 @@ function Invoke-Reconcile {
                 # path, which writes a new slot and leaves this one alone.
                 $newEmail    = $identity.Email
                 $sourceLabel = 'api_profile'
-                $newAccount  = [pscustomobject]@{
-                    accountUuid      = $identity.AccountUuid
-                    emailAddress     = $identity.Email
-                    organizationUuid = $null
-                    displayName      = $null
-                    organizationName = $null
-                }
+                # Same two fields, same endpoint: Test-CredentialAccountMatch
+                # carries Get-SlotProfile's Email / AccountUuid through
+                # unchanged, so the sidecar is built by the same constructor.
+                $newAccount  = New-OAuthAccountFromProfile -ProfileResult $identity
             }
 
             # Cross-account swap detected. DON'T overwrite; auto-save the
@@ -2487,22 +2507,15 @@ function Invoke-SaveAction {
     $accountInfo = Get-OAuthAccountFromClaudeJson
     $sourceLabel = 'claude_json'
     if (-not $accountInfo) {
-        # Fallback path: live /api/oauth/profile. Returns only the email,
-        # so the rest of the oauthAccount fields default to $null. The
-        # slot is still usable (Claude Code re-derives missing fields
-        # from the next refresh response). Use a non-automatic-variable
-        # name (`$profileResult` rather than `$profile`); `$profile` is
-        # PowerShell's automatic for the running profile path and a
-        # collision could surprise downstream code.
+        # Fallback path: live /api/oauth/profile. Carries the account uuid
+        # and email; the rest of the oauthAccount fields stay $null and
+        # Claude Code re-derives them from the next refresh response. Use a
+        # non-automatic-variable name (`$profileResult` rather than
+        # `$profile`); `$profile` is PowerShell's automatic for the running
+        # profile path and a collision could surprise downstream code.
         $profileResult = Get-SlotProfile -SlotPath $CredFile
         if ($profileResult.Status -eq 'ok' -and $profileResult.Email) {
-            $accountInfo = [pscustomobject]@{
-                accountUuid      = $null
-                emailAddress     = $profileResult.Email
-                organizationUuid = $null
-                displayName      = $null
-                organizationName = $null
-            }
+            $accountInfo = New-OAuthAccountFromProfile -ProfileResult $profileResult
             $sourceLabel = 'api_profile'
         } else {
             $reason = if ($profileResult.Error) {

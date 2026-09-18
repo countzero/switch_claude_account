@@ -556,10 +556,10 @@ Describe 'switch_claude_account' {
     #
     # When ~/.claude.json has no oauthAccount block (Get-OAuthAccountFromClaudeJson
     # returns $null), reconcile falls back to /api/oauth/profile to learn
-    # the current identity. The synthesized accountInfo has only
-    # emailAddress populated; the other four fields default to $null.
-    # Exercises the lines 1362-1382 branch that the claude.json-only
-    # tests above cannot reach.
+    # the current identity. The synthesized accountInfo carries the uuid and
+    # the email; the other three fields are not in the response and stay
+    # $null. Exercises the branch the claude.json-only tests above cannot
+    # reach.
 
     Context 'Invoke-Reconcile (profile-endpoint fallback identity)' {
         It 'auto-saves using the /api/oauth/profile email when claude.json has no oauthAccount' {
@@ -589,14 +589,43 @@ Describe 'switch_claude_account' {
             Test-Path -LiteralPath $autoPath    | Should -BeTrue
             Test-Path -LiteralPath $autoSidecar | Should -BeTrue
 
-            # Sidecar source is 'api_profile' (not 'claude_json') because
-            # the synthesized accountInfo has no accountUuid.
+            # Sidecar source is 'api_profile' (not 'claude_json'): the label
+            # records which branch resolved the identity, and is set there
+            # rather than inferred from a field both branches can populate.
             $sidecar = Get-Content -LiteralPath $autoSidecar -Raw | ConvertFrom-Json
             $sidecar.source | Should -Be 'api_profile'
             $sidecar.oauthAccount.emailAddress | Should -Be 'fallback@example.com'
-            # The four optional fields default to $null in the fallback path.
+            # A response without account.uuid still saves; the uuid is optional
+            # on the wire (Get-SlotProfile carries it as such) and its absence
+            # only degrades the identity guard to 'cannot confirm'.
             $sidecar.oauthAccount.accountUuid      | Should -BeNullOrEmpty
             $sidecar.oauthAccount.organizationUuid | Should -BeNullOrEmpty
+        }
+
+        # The regression this guards. accountUuid is the ONLY field
+        # Test-CredentialAccountMatch compares, so a fallback sidecar that
+        # drops it exempts its slot from the mirror-overwrite guard for good,
+        # while still looking valid to Read-Sidecar.
+        It 'carries the profile account uuid into the sidecar' {
+            $credFile = Join-Path $script:CD '.credentials.json'
+            Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
+            Set-Content -LiteralPath $ClaudeJsonPath -Value '{"numStartups":1}' -NoNewline -Encoding utf8NoBOM
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
+                return [pscustomobject]@{
+                    account      = [pscustomobject]@{ uuid = 'acct-uuid-fallback'; email = 'fallback@example.com' }
+                    organization = [pscustomobject]@{ uuid = 'org-uuid' }
+                }
+            }
+
+            $r = Invoke-Reconcile 6>$null
+            $r.Action | Should -Be 'auto-save'
+
+            $autoSidecar = Join-Path $script:CD ".credentials.$($r.Slot)(fallback@example.com).account.json"
+            $sidecar = Get-Content -LiteralPath $autoSidecar -Raw | ConvertFrom-Json
+            $sidecar.oauthAccount.accountUuid | Should -Be 'acct-uuid-fallback'
+            # The label still records the branch, not the shape of the result.
+            $sidecar.source | Should -Be 'api_profile'
         }
 
         # When state.active_slot points at a slot whose sidecar email
