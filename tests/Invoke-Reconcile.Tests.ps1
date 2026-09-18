@@ -128,6 +128,53 @@ Describe 'switch_claude_account' {
             $out | Should -Match "slot 'work' is left untouched"
             $out | Should -Match "re-run 'sca save work'"
         }
+
+        # The no-tracked-slot path is not the harmless one, which is why the
+        # guard sits ahead of it rather than inside the tracked-slot branch.
+        # Auto-saving here writes a credential file with no sidecar, because
+        # there is no account to write one from; Get-Slots then hides it and
+        # `sca remove` cannot reach it by name, while state.active_slot points
+        # at that invisible slot.
+        It 'writes nothing when identity is unresolvable and no slot is tracked' {
+            $credFile = Join-Path $script:CD '.credentials.json'
+            Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
+
+            # A different account's bytes, so the adopt branch cannot fire and
+            # the unattributable case is what gets reached.
+            New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content 'OTHER' | Out-Null
+
+            # Written directly: Update-ScaState reads first, and the no-state-
+            # file hash bootstrap would supply a tracked slot.
+            Set-Content -LiteralPath $StateFile -NoNewline `
+                -Value '{"schema":1,"active_slot":null,"last_sync_hash":"STALE_HASH"}'
+
+            $before = @(Get-CredentialSlotFiles).Count
+
+            $r = Invoke-Reconcile 6>$null
+            $r.Action | Should -Be 'noop'
+            $r.Reason | Should -Be 'identity-unresolved'
+            $r.Slot   | Should -BeNullOrEmpty
+
+            @(Get-CredentialSlotFiles).Count | Should -Be $before -Because 'no slot file may be minted for bytes nobody can attribute'
+            (Read-ScaState).active_slot    | Should -BeNullOrEmpty
+            (Read-ScaState).last_sync_hash | Should -Be 'STALE_HASH'
+        }
+
+        It 'does not name a slot in the advisory when none is tracked' {
+            $credFile = Join-Path $script:CD '.credentials.json'
+            Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
+            New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content 'OTHER' | Out-Null
+            Set-Content -LiteralPath $StateFile -NoNewline `
+                -Value '{"schema":1,"active_slot":null,"last_sync_hash":"STALE_HASH"}'
+
+            $out = Invoke-Reconcile 6>&1 | Out-String
+            $out | Should -Match 'no account could be read'
+            $out | Should -Match 'nothing was written'
+            # The recovery differs from the tracked case: there is no slot to
+            # re-save, so the user is told to name one.
+            $out | Should -Match "run 'sca save <name>'"
+            $out | Should -Not -Match 'is left untouched'
+        }
     }
 
     # ----- adopt branch --------------------------------------------------
@@ -476,30 +523,35 @@ Describe 'switch_claude_account' {
             (Read-ScaState).active_slot | Should -Be $r.Slot
         }
 
-        It 'auto-saves with unlabeled form (no sidecar) when both identity sources fail' {
+        # The auto-save fallback used to run on no identity at all, writing an
+        # unlabeled slot file with no sidecar. Get-Slots hides such a slot and
+        # `sca remove` cannot reach it by name, so the bytes were preserved in
+        # a place the user could not act on, and state.active_slot pointed at
+        # it. Not writing is the better answer; the next resolvable run
+        # captures the same bytes properly.
+        It 'writes nothing when both identity sources fail and no state file exists' {
             $credFile = Join-Path $script:CD '.credentials.json'
             Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
 
             # No ~/.claude.json, default mock for profile endpoint throws.
             $r = Invoke-Reconcile 6>$null
-            $r.Action | Should -Be 'auto-save'
-            $r.Email  | Should -BeNullOrEmpty
+            $r.Action | Should -Be 'noop'
+            $r.Reason | Should -Be 'identity-unresolved'
 
-            # Slot file exists but no sidecar -> Get-Slots will hide it.
-            # Bytes are preserved on disk; user can `sca remove auto-<ts>`
-            # to clean up if they don't want it.
-            $autoPath = Join-Path $script:CD ".credentials.$($r.Slot).json"
-            Test-Path -LiteralPath $autoPath | Should -BeTrue
+            @(Get-CredentialSlotFiles).Count | Should -Be 0
+            (Read-ScaState).active_slot      | Should -BeNullOrEmpty
         }
 
         # state.active_slot was set on a previous run, but the slot file
         # has since been deleted (e.g. user manually rm'd it). Reconcile
         # must not crash; it falls through to auto-save so the new bytes
-        # are still captured under a generated name.
+        # are still captured under a generated name. Identity has to resolve
+        # for that to happen, which is the subject here, not the deletion.
         It 'auto-saves when state.active_slot points at a missing slot file' {
             $credFile = Join-Path $script:CD '.credentials.json'
             Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
 
+            Set-SandboxClaudeJson -Email 'fresh@example.com' -AccountUuid 'fresh-uuid'
             Update-ScaState -ActiveSlot 'gone-slot' -LastSyncHash 'STALE' | Out-Null
 
             $r = Invoke-Reconcile 6>$null
@@ -512,6 +564,8 @@ Describe 'switch_claude_account' {
         It 'prints a yellow advisory line for auto-save' {
             $credFile = Join-Path $script:CD '.credentials.json'
             Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
+
+            Set-SandboxClaudeJson -Email 'fresh@example.com' -AccountUuid 'fresh-uuid'
 
             $out = Invoke-Reconcile 6>&1 | Out-String
             $out | Should -Match '\[Sync\] Auto-saved unknown active credentials as'

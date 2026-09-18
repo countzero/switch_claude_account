@@ -2234,11 +2234,13 @@ function Test-CredentialAccountMatch {
 #                                                      old slot file preserved)
 #   7. no tracked slot, OR slot file is gone       -> auto-save under new name
 #
-# Outcomes 3 and 4 exist because outcome 5 is the only destructive one: it
+# Outcomes 3 and 4 exist to guard the three that write, and both are ordered
+# ahead of all of them. Outcome 5 is the worst of the three, because it
 # overwrites a slot file, the single artifact a login cannot be recovered
-# from. Both guard it, and both are ordered ahead of it. Outcome 5 then guards
-# itself once more, against the one case the other two cannot see, by asking
-# the tokens whose account they are before it writes.
+# from; but 6 and 7 are not free either, since each moves active tracking onto
+# a slot they just minted. Outcome 5 then guards itself once more, against the
+# one case the other two cannot see, by asking the tokens whose account they
+# are before it writes.
 #
 # Identity probe: ~/.claude.json's oauthAccount.emailAddress. This is the
 # same source Claude Code uses for /status, so reconcile and Claude Code can
@@ -2367,27 +2369,41 @@ function Invoke-Reconcile {
         }
     }
 
+    # Unattributable bytes: ~/.claude.json carries no email and the profile
+    # endpoint did not answer either (offline, 429, expired token). Every
+    # outcome below writes something that claims to know whose tokens these
+    # are, so none of them may run on a guess. Do nothing and let a later
+    # reconcile retry with a resolvable identity.
+    #
+    # Ahead of the tracked-slot block, not inside it, because the no-tracked-
+    # slot path is not the harmless one. It mints a credential file with no
+    # sidecar (New-AutoSaveSlot skips the sidecar when it has no account),
+    # which Get-Slots hides and `sca remove` cannot reach by name, and then
+    # points state.active_slot at that invisible slot -- so whatever WAS
+    # tracked silently stops receiving refreshes.
+    if (-not $newEmail) {
+        $tail = if ($activeName) {
+            "so slot '$activeName' is left untouched rather than risk overwriting it. It will catch up on the next run that can resolve an identity; if this persists while online, re-run 'sca save $activeName' to recapture the slot."
+        } else {
+            "so nothing was written. The next run that can resolve an identity will capture these credentials; if this persists while online, run 'sca save <name>' to capture them under a name you choose."
+        }
+        Write-Color "[Sync] Active credentials changed but no account could be read from ~/.claude.json or /api/oauth/profile, $tail" 'Yellow'
+        return [pscustomobject]@{
+            Action = 'noop'
+            Reason = 'identity-unresolved'
+            Slot   = $activeName
+        }
+    }
+
     if ($state -and $state.active_slot) {
         $slot = Find-SlotByName -Name $state.active_slot
         if ($slot) {
             # Tracked slot's email comes from its sidecar (Get-Slots always
-            # populates this on the slot object).
+            # populates this on the slot object). Never empty: Read-Sidecar
+            # rejects a sidecar without an emailAddress, which is what keeps
+            # the equality test below from degenerating into empty-equals-
+            # empty and mirroring one account over another.
             $slotEmail = if ($slot.Sidecar) { [string]$slot.Sidecar.oauthAccount.emailAddress } else { $slot.Email }
-
-            # Unattributable bytes, because ~/.claude.json carries no email and
-            # the profile endpoint did not answer either (offline, 429). Both
-            # remaining branches need to know whose tokens these are, and the
-            # mirror branch overwrites a slot file, which is the one artifact
-            # the login cannot be recovered from once gone. Do nothing and let
-            # a later reconcile retry with a resolvable identity.
-            if (-not $newEmail -or -not $slotEmail) {
-                Write-Color "[Sync] Active credentials changed but no account could be read from ~/.claude.json or /api/oauth/profile, so slot '$($state.active_slot)' is left untouched rather than risk overwriting it. It will catch up on the next run that can resolve an identity; if this persists while online, re-run 'sca save $($state.active_slot)' to recapture the slot." 'Yellow'
-                return [pscustomobject]@{
-                    Action = 'noop'
-                    Reason = 'identity-unresolved'
-                    Slot   = $state.active_slot
-                }
-            }
 
             if ($newEmail -eq $slotEmail) {
                 # The email just said "same account, only the tokens moved". It
