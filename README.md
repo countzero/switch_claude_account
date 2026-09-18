@@ -259,7 +259,17 @@ That makes Claude Code equivalent to [`opencode-claude-auth`](https://github.com
 
 One residual difference from closing the app: `sca` does not take Claude Code's `~/.claude.json.lock`, so an `sca` read-modify-write can drop a config change Claude Code made in the same instant. That costs a counter or a project flag, never a credential.
 
-Credentials get a stronger guarantee, because losing one is not recoverable. Before overwriting a saved slot, `sca` checks that the active tokens really are that slot's account: byte-identical tokens are recognised as a slot that is already saved, and anything else is confirmed against `/api/oauth/profile` using those very tokens rather than against the email cached in `~/.claude.json`, which a `/login` updates a moment later than the tokens themselves.
+Credentials get a stronger guarantee, because losing one is not recoverable. Before overwriting a saved slot, `sca` checks that the active tokens really are that slot's account: byte-identical tokens are recognised as a slot that is already saved, accounts are matched on their uuid rather than their email (Claude Code records the same account under either of two email forms), and anything still in doubt is confirmed against `/api/oauth/profile` using those very tokens rather than against the email cached in `~/.claude.json`, which a `/login` updates a moment later than the tokens themselves.
+
+If none of that can attribute the active tokens, `sca` writes nothing rather than guess, and any command that was about to overwrite them stops and says so:
+
+```console
+$ sca switch personal
+The active credentials could not be attributed to an account, so nothing captured them.
+'sca switch' overwrites them, so the token refresh they carry would be lost and slot
+'work' left holding a refresh token the server has already rotated. Re-run once an
+account can be resolved, or run 'sca save work' to capture them now.
+```
 
 ### Which actions still need Claude Code closed
 
