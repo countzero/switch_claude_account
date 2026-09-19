@@ -3,8 +3,9 @@
 
 # Pester 5 tests for Invoke-SwitchAction in switch_claude_account.ps1.
 #
-# Post-v2.1.0 contract:
-#   * Refuses to operate while Claude Code is running.
+# Contract:
+#   * Runs with Claude Code open; it follows the swap.
+#   * Refuses when reconcile could not capture the active credentials.
 #   * Refuses to switch to a slot that has no sidecar.
 #   * Restores the destination slot's captured oauthAccount into
 #     ~/.claude.json so /status displays the active slot's email.
@@ -68,13 +69,17 @@ Describe 'switch_claude_account' {
             { Invoke-SwitchAction -Name 'legacy' 6>$null } | Should -Throw -ExpectedMessage "*Slot 'legacy' not found*"
         }
 
-        It 'refuses to operate while Claude Code is running' {
+        # Switching under a live Claude Code is supported as of 2.1.274, which
+        # re-reads .credentials.json on its next token-refresh check. Refusing
+        # here would block the feature the guard used to protect.
+        It 'switches while Claude Code is running' {
             Mock Test-ClaudeRunning -MockWith { $true }
-            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Content 'X' | Out-Null
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'work@test.local' -Content 'X' | Out-Null
 
-            { Invoke-SwitchAction -Name 'work' 6>$null } | Should -Throw -ExpectedMessage '*Claude Code is running*'
-            # .credentials.json untouched.
-            Test-Path -LiteralPath $script:CredFilePath | Should -BeFalse
+            Invoke-SwitchAction -Name 'work' 6>$null
+
+            Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be 'X'
+            (Read-ScaState).active_slot | Should -Be 'work'
         }
 
         It 'overwrites an existing active credentials file' {
@@ -276,9 +281,9 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-SwitchAction -Name 'alpha' 6>&1 | Out-String
 
-            # The retired [Info] apply hint must not reappear; the previous
-            # "Restart Claude Code…running sessions" wording from before
-            # the refuse-while-running guard is also gone.
+            # Switch output carries no apply hint: Claude Code follows the
+            # swap on its own, so telling the user to restart it would be
+            # wrong advice rather than merely redundant.
             $out | Should -Not -Match '\[Info\] Start'
             $out | Should -Not -Match 'running sessions may continue'
 
@@ -338,7 +343,6 @@ Describe 'switch_claude_account' {
                 mcpServers      = @{ memory = @{ command = 'mcp-memory' } }
                 customSomething = 'sentinel-value-xyz'
             }
-            $beforeRaw = Get-Content -LiteralPath $ClaudeJsonPath -Raw
 
             New-SlotPair -CredDir $script:CredDirPath -Name 'slot' -Email 'new@example.com' -Content 'X' | Out-Null
 
@@ -497,14 +501,16 @@ Describe 'switch_claude_account' {
         # captured into its saved-slot file BEFORE we overwrite
         # .credentials.json with the destination slot.
         It 'reconciles before switching: outgoing slot bytes match the active file' {
+            # Same account as the BeforeEach's ~/.claude.json, uuid included, so
+            # reconcile mirrors rather than reading a cross-account swap.
             $oldSlot = New-SlotPair -CredDir $script:CredDirPath -Name 'old' -Content 'STALE_OLD'  -OAuthAccount ([pscustomobject]@{
-                accountUuid      = 'old-uuid'
+                accountUuid      = (Get-TestAccountUuid -Email 'baseline@example.com')
                 emailAddress     = 'baseline@example.com'
                 organizationUuid = 'old-org-uuid'
                 displayName      = 'Old'
                 organizationName = 'old-org'
             })
-            $newSlot = New-SlotPair -CredDir $script:CredDirPath -Name 'new' -Content 'NEW_TARGET'
+            New-SlotPair -CredDir $script:CredDirPath -Name 'new' -Content 'NEW_TARGET' | Out-Null
 
             Set-Content -LiteralPath $script:CredFilePath -Value 'REFRESHED' -NoNewline
             Update-ScaState -ActiveSlot 'old' -LastSyncHash 'STALE_HASH' | Out-Null
@@ -514,6 +520,76 @@ Describe 'switch_claude_account' {
             Get-Content -LiteralPath $oldSlot              -Raw | Should -Be 'REFRESHED'
             Get-Content -LiteralPath $script:CredFilePath  -Raw | Should -Be 'NEW_TARGET'
             (Read-ScaState).active_slot | Should -Be 'new'
+        }
+
+        # Reconciling first is only worth anything if a reconcile that captured
+        # nothing stops the switch. Proceeding would overwrite the very bytes it
+        # failed to save, leaving the outgoing slot holding a refresh token the
+        # server has already rotated: a dead login, and nothing later repairs it.
+        It 'refuses to switch when reconcile could not capture the active credentials' {
+            $oldSlot = New-SlotPair -CredDir $script:CredDirPath -Name 'old' -Content 'STALE_OLD'
+            New-SlotPair -CredDir $script:CredDirPath -Name 'new' -Content 'NEW_TARGET' | Out-Null
+
+            # No oauthAccount in ~/.claude.json and Common.ps1's profile mock
+            # throws, so reconcile cannot attribute the changed bytes.
+            Set-Content -LiteralPath $ClaudeJsonPath -Value '{"numStartups":1}' -NoNewline -Encoding utf8NoBOM
+            Set-Content -LiteralPath $script:CredFilePath -Value 'REFRESHED' -NoNewline
+            Update-ScaState -ActiveSlot 'old' -LastSyncHash 'STALE_HASH' | Out-Null
+
+            { Invoke-SwitchAction -Name 'new' 6>$null } |
+                Should -Throw "*could not be attributed to an account*"
+
+            Get-Content -LiteralPath $script:CredFilePath -Raw |
+                Should -Be 'REFRESHED' -Because 'the uncaptured bytes must survive the refusal'
+            Get-Content -LiteralPath $oldSlot -Raw | Should -Be 'STALE_OLD'
+            (Read-ScaState).active_slot | Should -Be 'old'
+        }
+
+        # The recovery has to name the slot at stake; two of the three callers
+        # suppress reconcile's own advisory, so this string is all the user gets.
+        It 'names the outgoing slot and its recovery in the refusal' {
+            $sync = [pscustomobject]@{ Action = 'noop'; Reason = 'identity-unresolved'; Slot = 'work'; Captured = $false }
+
+            $msg = Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca switch'
+
+            $msg | Should -BeLike "*'sca switch'*"
+            $msg | Should -BeLike "*slot 'work'*"
+            $msg | Should -BeLike "*'sca save work'*"
+        }
+
+        It 'offers a name of the user''s choosing when no slot is tracked' {
+            $sync = [pscustomobject]@{ Action = 'noop'; Reason = 'identity-unresolved'; Slot = $null; Captured = $false }
+
+            $msg = Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca warmup'
+
+            $msg | Should -BeLike "*'sca save <name>'*"
+            $msg | Should -Not -BeLike '*slot ''''*'
+        }
+
+        # 'sca save' resolves identity from the same two sources reconcile just
+        # failed on, and refuses outright while Claude Code is open, so naming
+        # it without its precondition sends the user to a command that will
+        # refuse them for the reason they are already stuck on.
+        It 'names the precondition on the save it recommends' {
+            $sync = [pscustomobject]@{ Action = 'noop'; Reason = 'identity-unresolved'; Slot = 'work'; Captured = $false }
+
+            $msg = Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca switch'
+
+            $msg | Should -BeLike '*close Claude Code*'
+        }
+
+        # The account WAS resolved on this path; the file moved under the
+        # probe. Saying "could not be attributed" would describe neither the
+        # cause nor the fix, and there is nothing to resolve before retrying.
+        It 'describes a mid-probe move as a move, not an unresolved identity' {
+            $sync = [pscustomobject]@{ Action = 'noop'; Reason = 'credentials-changed-mid-probe'; Slot = 'work'; Captured = $false }
+
+            $msg = Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca switch'
+
+            $msg | Should -BeLike '*changed while their account was being verified*'
+            $msg | Should -BeLike "*slot 'work'*"
+            $msg | Should -Not -BeLike '*could not be attributed to an account*'
+            $msg | Should -Not -BeLike '*sca save*'
         }
     }
 

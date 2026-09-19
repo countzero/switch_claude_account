@@ -10,7 +10,8 @@
 # contexts in Invoke-UsageAction.Tests.ps1. Here we cover the action-level
 # contract: that monitor maps to the engine with -Auto set, threads -Threshold
 # and -KeepWarm through, ignores a positional name, and surfaces the
-# watch-engine guards (Claude-Code refusal, interactive-terminal requirement).
+# watch-engine guards. Plain `monitor` runs beside a live Claude Code; only
+# -KeepWarm refuses it, so the Claude-Code guard here is -KeepWarm's alone.
 # Per-test sandbox setup lives in tests/Common.ps1.
 
 BeforeAll {
@@ -72,14 +73,30 @@ Describe 'switch_claude_account' {
     Context 'Invoke-MonitorAction watch-engine guards' {
         # The engine is NOT mocked here, so its pre-loop guards run for real.
 
-        It 'refuses at startup when Claude Code is running, naming sca monitor' {
-            # The Claude-Code guard runs BEFORE the IsOutputRedirected guard
-            # inside Invoke-UsageWatch, so this is safe on an interactive
-            # terminal: the $true mock short-circuits before any alt-screen
-            # Write-VTSequence fires.
+        It 'does NOT refuse at startup when Claude Code is running' {
+            # Rotation beside a live Claude Code is the supported case as of
+            # 2.1.274. With the Claude-Code guard gone for plain `monitor`,
+            # the next guard reached is IsOutputRedirected, so that is what
+            # this must now throw. Skipped on an interactive terminal, where
+            # IsOutputRedirected is $false and the alt-screen would blank it.
             Mock Test-ClaudeRunning -MockWith { $true }
 
-            { Invoke-MonitorAction 6>$null } | Should -Throw -ExpectedMessage '*Claude Code is running*sca monitor*'
+            if (-not [Console]::IsOutputRedirected) {
+                Set-ItResult -Skipped -Because 'Console stdout is not redirected; running this test would enter the alt-screen buffer and blank the terminal.'
+                return
+            }
+
+            { Invoke-MonitorAction 6>$null } | Should -Throw -ExpectedMessage '*requires an interactive terminal*'
+        }
+
+        It 'still refuses -KeepWarm when Claude Code is running, naming the flag' {
+            # Keep-warm makes every slot active in turn, so a live session
+            # would be dragged across every account. That guard stays, and it
+            # runs BEFORE IsOutputRedirected so this is safe interactively.
+            Mock Test-ClaudeRunning -MockWith { $true }
+
+            { Invoke-MonitorAction -KeepWarm 6>$null } |
+                Should -Throw -ExpectedMessage '*Claude Code is running*sca monitor -KeepWarm*'
         }
 
         It 'passes the Claude-Code guard then short-circuits on IsOutputRedirected' {

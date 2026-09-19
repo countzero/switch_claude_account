@@ -58,7 +58,7 @@ Describe 'switch_claude_account' {
             $obj.schema                       | Should -Be 1
             $obj.source                       | Should -Be 'claude_json'
             $obj.oauthAccount.emailAddress    | Should -Be 'alice@example.com'
-            $obj.oauthAccount.accountUuid     | Should -Be '11111111-1111-1111-1111-111111111111'
+            $obj.oauthAccount.accountUuid     | Should -Be (Get-TestAccountUuid -Email 'alice@example.com')
             $obj.oauthAccount.organizationUuid| Should -Be '22222222-2222-2222-2222-222222222222'
         }
 
@@ -115,6 +115,30 @@ Describe 'switch_claude_account' {
             $sidecar = Join-Path $script:CredDirPath '.credentials.work(fallback@example.com).account.json'
             Test-Path -LiteralPath $sidecar | Should -BeTrue
             (Get-Content -LiteralPath $sidecar -Raw | ConvertFrom-Json).source | Should -Be 'api_profile'
+        }
+
+        # accountUuid is the only field Test-CredentialAccountMatch compares.
+        # A fallback sidecar that drops it leaves the slot permanently exempt
+        # from the mirror-overwrite guard while still passing Read-Sidecar.
+        It 'carries the profile account uuid into the fallback sidecar' {
+            $minimal = [ordered]@{ numStartups = 1; autoUpdates = $true } | ConvertTo-Json
+            Set-Content -LiteralPath $ClaudeJsonPath -Value $minimal -NoNewline
+
+            Set-Content -LiteralPath $script:CredFilePath -Value '{"claudeAiOauth":{"accessToken":"sk-ant-oat-x","refreshToken":"sk-ant-ort-x","expiresAt":9999999999999}}' -NoNewline
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
+                return [pscustomobject]@{
+                    account      = [pscustomobject]@{ uuid = 'acct-uuid-fallback'; email = 'fallback@example.com' }
+                    organization = [pscustomobject]@{ uuid = 'org-uuid' }
+                }
+            }
+
+            Invoke-SaveAction -Name 'work' 6>$null
+
+            $sidecar = Join-Path $script:CredDirPath '.credentials.work(fallback@example.com).account.json'
+            $parsed  = Get-Content -LiteralPath $sidecar -Raw | ConvertFrom-Json
+            $parsed.oauthAccount.accountUuid | Should -Be 'acct-uuid-fallback'
+            $parsed.source                   | Should -Be 'api_profile'
         }
 
         It 'refuses to save when neither ~/.claude.json nor /api/oauth/profile yields an identity' {

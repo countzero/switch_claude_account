@@ -1,41 +1,32 @@
 # AGENTS.md
 
-This file is the canonical agent-instructions source for this repository, read natively by OpenCode and loaded by Claude Code through the `CLAUDE.md` import shim. Single-file PowerShell tool: core logic lives in `switch_claude_account.ps1`; tests live in `tests/` and use Pester 5.
+This file is the canonical agent-instructions source for this repository, read natively by OpenCode and loaded by Claude Code through the `CLAUDE.md` import shim. Single-file PowerShell tool: core logic lives in `switch_claude_account.ps1`; tests live in `tests/` and use Pester 5. It carries the always-on rules as one invariant per area; the contracts behind them are the documents under `docs/`, read on demand through *Reference* at the end.
 
-## Editing this file
+## Security Rules
 
-- Hard ceiling: 18,500 bytes, about 4,600 tokens, measured with `(Get-Item AGENTS.md).Length`. Cut content to stay under it. Bytes rather than lines because the lines here run past 300 characters, so a line count measures nothing and a long paragraph joined onto one line reads as a saving.
-- This file is for **orientation and repo-global rules only**. How a function works belongs in a comment on that function, never here: a second copy in a separate file drifts silently, and this repo has already shipped documentation describing behaviour the code never had.
-- A rule whose full form lives under `docs/` appears here only as a pointer, written `` `docs/<file>.md` → *Section* ``, or as the file alone when the whole document is that rule. A pointed-at heading is an interface: renaming one means re-pointing its callers.
-- Describe the **current** shape only. Rationale, design history, and "why not the alternative" prose belong in commit messages.
-- When you remove a design from the code, remove its references here too.
+This repository's subject is live OAuth credentials. Three rules, in force in every session:
+
+- **Never surface a token.** Do not read, print, or copy `.credentials.json`, a `.credentials.<name>(<email>).json` slot file, or an `accessToken` / `refreshToken` value into a transcript, a scratch file, a test fixture, or a commit. Inspect such a file from the outside only: its length, its mode, its mtime, whether a hash matches. A masked or partial read is still a read.
+- **Never commit an identity.** Slot filenames carry account email addresses and sidecars carry account uuids. Neither goes into a commit message, a changelog entry, a pull request body, or a pasted `sca usage` / `sca list` output. Examples use `alice` / `bob` and an all-zero uuid.
+- **Never run a side-effecting action against the real `~/.claude`.** `save`, `switch`, `remove`, `warmup` and `monitor` write the user's live login, and `warmup` and `monitor -KeepWarm` additionally spend money (~$0.004/slot). Verify through `tests/`, which sandboxes both home variables and `CLAUDE_CONFIG_DIR` into `$TestDrive`. Ask before running any of them for real.
+
+## Documentation
+
+`AGENTS.md` carries orientation and repo-global rules only, one invariant per area, each ending in a pointer. A contract, a procedure, or the reasoning behind a decision lives in the reference document of that task; how a function works lives in a comment on that function, never here. A rule stated elsewhere appears here only as `` `docs/<file>.md` → *Section* ``, and a pointed-at heading is an interface: renaming one means re-pointing its callers. Describe the **current** shape only, and when you remove a design from the code remove its references here too. Budgets, measured with `(Get-Item <file>).Length`: this file about 12,000 bytes and never over 18,500; a reference document about 12,000 and never over 24,000. The routing table, the `AGENTS.md` / `README.md` split and the review checklist are `docs/documentation.md`.
 
 ## Key facts
 
-- **Supported platforms**: Windows, Linux, and macOS, all three covered by the CI matrix. The block comment under `# --- Where Claude Code actually keeps the active login ---` records where Claude Code keeps credentials on each, why macOS is not a Keychain platform, and the one flag that could change it.
-- **Credential directory**: `$CredDir`, resolved once at the top of the script. `$env:CLAUDE_CONFIG_DIR` when set, else `<home>/.claude`, else **`$null`** when neither is set: every path derived from it is left `$null` rather than throwing at load time, so `help` and `-Version` still work, and `Assert-CredentialDir` refuses the other actions. Home is the platform's environment variable (`$env:USERPROFILE` / `$env:HOME`) **first**, then the `$HOME` automatic variable. The environment leads because `$HOME` binds at session start and never re-reads it, so the test sandbox could not redirect it; `$HOME` is kept as the fallback because it is the only getpwuid path we have, and `claude` keeps working without the variable.
-- **`CLAUDE_CONFIG_DIR`**: no `~` expansion, because Claude Code does none (anthropics/claude-code#78988). A relative value is bound to `$PWD` once at load by `Resolve-ScaConfigDir`, which keeps the parity (a `claude` launched in the same directory resolves it the same way) while removing the split between provider cmdlets resolving against `$PWD` and .NET resolving against `[Environment]::CurrentDirectory`. `Get-ConfigDirAdvisory` prints one line when the relocation strands slots in the default directory, and stays silent otherwise, because the variable is a permanent setting and an unconditional line would train the user to ignore it.
-- **Active credentials**: `.credentials.json`, written by Claude Code via atomic rename on every OAuth refresh. `sca` writes it through the same primitive (`Set-CredentialFileAtomic`) so the file is byte-equal to the tracked slot file after every `sca save` / `sca switch` / reconcile pass.
-- **Claude Code config**: `$ClaudeJsonPath`. `<home>/.claude.json` by default, a **sibling** of `.claude/` rather than a file inside it, but it moves inside `CLAUDE_CONFIG_DIR` when that is set (verified against Claude Code 2.1.263). Its top-level `oauthAccount` block is what `/status` displays as "Email:". `sca` reads it at save time and writes the destination slot's captured block back on `sca switch`; see `Get-OAuthAccountFromClaudeJson` / `Set-OAuthAccountInClaudeJson`.
-- **State file**: `$CredDir/.sca-state.json`, schema v1: `{ schema, active_slot, last_sync_hash }`. Single source of truth for "which slot is active." See `Read-ScaState` / `Update-ScaState`.
-- **Slot files**: `.credentials.<name>(<email>).json` plus a paired `.credentials.<name>(<email>).account.json` identity sidecar. **Slots without a valid sidecar are hidden from `list` / `usage` / rotation and refused by `switch`**; re-run `sca save <name>` while that slot is active to recapture it. Details on `Get-Slots` and `Invoke-SaveAction`. Enumerate them **only** via `Get-CredentialSlotFiles`, which centralizes the `-Force` that dotfiles need on Unix and the sidecar exclusion.
-- **File modes**: every credential-shaped file is created 0600 by `open(2)` itself, in `Write-PrivateFileBytes`, before any byte is written. On Unix `::Replace` is a bare `rename(2)`, so the destination inherits the temp file's mode; a chmod after the write would leave the tokens world-readable for its duration, and not setting the mode at all silently downgrades Claude Code's 0600 to 0644. `Repair-CredentialFileModes` (Unix only, from `Invoke-Main`) tightens only files `sca` itself creates, skipping symlinks and `~/.claude.json`; `New-CredentialDirectory` creates a missing `$CredDir` 0700 and never re-permissions an existing one. Neither re-permissions another tool's file, which leaves the email-in-filenames exposure open wherever Claude Code created `~/.claude` first.
-- **PS version**: requires PowerShell 7.4+ (`#Requires -Version 7.4`), the lowest LTS carrying `FileStreamOptions.UnixCreateMode` (.NET 7). 7.2 and 7.3 are both EOL. Install target is `$PROFILE.CurrentUserAllHosts` (`~/.config/powershell/profile.ps1` on Linux and macOS alike).
-- **Alias installer**: `sca` and `switch-claude-account` added to the PowerShell profile inside a marker-delimited block (`# === Switch Claude Account ===`). Keep the markers intact when touching `Add-To-Profile` / `Remove-From-Profile`.
+- **Supported platforms**: Windows, Linux, and macOS, all three covered by the CI matrix.
+- **Requires PowerShell 7.4+** (`#Requires -Version 7.4`), the lowest LTS carrying `FileStreamOptions.UnixCreateMode`. Install target is `$PROFILE.CurrentUserAllHosts`.
+- **Four artifacts**: `.credentials.json` (the active login, Claude Code's own), a slot as `.credentials.<name>(<email>).json` plus its `.account.json` identity sidecar, `.sca-state.json` (which slot is active), and `~/.claude.json` (Claude Code's config, whose `oauthAccount` block is the "Email:" in `/status`).
+- **`$CredDir` may be `$null`.** When neither `CLAUDE_CONFIG_DIR` nor a home directory resolves, every derived path stays `$null` rather than throwing at load, so `help` and `-Version` still work; `Assert-CredentialDir` refuses the rest.
+- **Enumerate slots only via `Get-CredentialSlotFiles`**, which centralizes the `-Force` that dotfiles need on Unix and the sidecar exclusion. A slot without a valid sidecar is hidden from `list` / `usage` / rotation and refused by `switch`.
+- **Every credential-shaped file is created by `Write-PrivateFileBytes` and moved by `Set-CredentialFileAtomic`.** Both are load-bearing, for the 0600 mode and for surviving the handle Claude Code holds. Do not hand-roll a write.
+- What a user sees of the above is `README.md` → *Platform Notes*; the contracts and the reasoning are `docs/architecture.md`.
 
 ## Script actions
 
-| Action | Requires name | What it does |
-|------------|---------------|--------------|
-| `save` | Yes | Refuses if Claude Code is running. Captures `.credentials.json` plus an identity sidecar into a named slot. Refuses if no identity can be resolved. |
-| `switch` | Optional | Refuses if Claude Code is running. Reconciles, swaps slot bytes into `.credentials.json`, writes the slot's `oauthAccount` into `~/.claude.json`. No name rotates to the next slot alphabetically (wraps). |
-| `list` | No | Reconciles, then renders saved slots as `Slot \| Account` with an active-marker column. |
-| `remove` | Yes | Deletes a named slot and its sidecar. Refuses to remove the active slot. |
-| `usage` | Optional | Read-only. Reconciles, then calls the **undocumented** `GET /api/oauth/usage` per slot for 5h / 7d percentages. `-Json` for scripted output, `-Watch` (`-Interval <seconds>`, floor 60) for a live view. With `<name>`, renders a verbose single-slot block. |
-| `monitor` | No | Live, side-effecting supervisor. Auto-rotates to the next eligible slot when the active slot reaches `-Threshold` (default 95, range 1..100). OpenCode-only; refuses if Claude Code is running. `-KeepWarm` also keeps every slot warm for the life of the watch. A positional `<name>` is ignored. |
-| `warmup` | Optional | Refuses if Claude Code is running or the `claude` binary is absent. One-shot warm pass over each slot (swap, `claude -p`, mirror, usage read), then restores the original active slot. Billable, ~$0.004/slot. |
-| `install` / `uninstall` | No | Adds / removes the wrapper function and aliases in the PowerShell profile. Both are exempt from `Assert-CredentialDir` and from the credentials-directory creation: they touch nothing but `$PROFILE`, so they must stay usable on a machine the other actions refuse. |
-| `help` | No | Shows detailed help. |
+`save`, `switch`, `list`, `remove`, `usage`, `monitor`, `warmup`, `install`, `uninstall`, `help`. The list is the `ValidateSet` on `$Action`, each one's contract is its `Invoke-<Action>Action` function, and the user-facing summary is `sca help` and `README.md` → *Usage*. Which of them refuse beside a running Claude Code is `Test-ClaudeRunning`; which reconcile first is below.
 
 ## Editing the script
 
@@ -45,19 +36,15 @@ The top-level dispatcher is wrapped in `Invoke-Main` and guarded by `if ($MyInvo
 
 ## Unofficial endpoints
 
-The `usage` action and the identity-fallback path depend on constants extracted from `claude.exe` 2.1.119, pinned at the top of `switch_claude_account.ps1` under `# --- Unofficial Claude Code OAuth-flow constants ---`. That block also carries the response schema, the per-endpoint HTTP budgets, and the re-extraction recipe.
-
-**Undocumented and unsupported by Anthropic.** When the calls start returning 4xx after a Claude Code upgrade, re-extract using the recipe in that comment, bump the constants, and re-run the suite. The tests mock `Invoke-RestMethod` by `$Uri` and verify shape contract only; they will not catch the constants drifting out of date. Only a live `sca usage` will.
-
-The block below it, `# --- Where Claude Code actually keeps the active login ---`, records the same kind of finding for credential storage: the two backends Claude Code ships, why macOS is not a Keychain platform, and the `tengu_windows_credman` flag that would move Windows credentials into the Credential Manager and delete `.credentials.json`. The Tests workflow re-checks it against the darwin build on `workflow_dispatch`.
+The `usage` action and the identity-fallback path depend on constants extracted from `claude.exe`, pinned in `switch_claude_account.ps1` under `# --- Unofficial Claude Code OAuth-flow constants ---` with the measured HTTP budgets and retry policy. **Undocumented and unsupported by Anthropic**: when the calls start returning 4xx after a Claude Code upgrade, re-extract, bump the constants, and re-run the suite. The tests verify shape contract only and will not catch the constants drifting; only a live `sca usage` will. The provenance, the re-extraction recipe, the response schemas and that file's admission rule are `docs/claude-code-internals.md`.
 
 ## Platform gotchas
 
-- **Atomic-rename writes survive an open Claude Code**, for `.credentials.json` only. `Set-CredentialFileAtomic` uses `MoveFileEx` semantics, which succeed against the `FILE_SHARE_DELETE` handle Claude Code holds. `save` / `switch` still refuse to run while Claude Code is open, for the different reason documented on `Test-ClaudeRunning`.
-- **Execution policy** (Windows): may need `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` on first run.
-- **POSIX has no mandatory locking**: `FileShare` is a Win32 concept, so on Linux and macOS `::Replace` succeeds regardless of open handles and a reader keeps the old inode. Share-mode tests are therefore `-Skip:(-not $IsWindows)`, paired with a Unix test asserting the inode property instead.
-- **Token expiry**: OAuth tokens refresh after roughly an hour of inactivity. Without a daemon a slot file is at most one Claude-Code refresh behind; the next reconciling action captures it. Harmless, because the slot's previous refresh token stays valid until rotated again.
-- **Name sanitization**: `Get-SafeName` replaces invalid filename characters, parentheses, PowerShell wildcard brackets, and spaces with `_`, strips trailing dots, and rejects reserved device names. Windows-strict on **every** platform on purpose, via a hardcoded character class rather than `GetInvalidFileNameChars()`, so one slot name yields one filename everywhere. The reason for each class is on the function; every credential-file operation also passes `-LiteralPath` as defense in depth.
+- **Hot-swapping a live client is supported.** `switch` and `monitor` run with Claude Code open; `save`, `warmup` and `monitor -KeepWarm` refuse. `Test-ClaudeRunning` owns the evidence and the exceptions.
+- **POSIX has no mandatory locking**, so a share-mode test is `-Skip:(-not $IsWindows)` and pairs with a Unix test asserting the inode property instead.
+- **`Get-SafeName` is Windows-strict on every platform**, and every credential-file operation also passes `-LiteralPath` as defense in depth.
+- **Guard every `System.Console` call.** `[Console]::CursorVisible` is Windows-only to read and throws off an attached console to write; a failed capture stays `$null` so the restore is skipped rather than defaulted to a wrong value.
+- The reasoning for each of these, and token expiry, are `docs/architecture.md` → *Platform behavior*.
 
 ## Testing
 
@@ -65,30 +52,11 @@ The block below it, `# --- Where Claude Code actually keeps the active login ---
 pwsh -NoProfile -File tests/Invoke-Tests.ps1
 ```
 
-Single test or context (`-FullNameFilter` is wildcard/regex against the full `Describe > Context > It` path):
-
-```powershell
-pwsh -NoProfile -Command "Import-Module Pester -MinimumVersion 5.5.0; Invoke-Pester -Path tests/ -FullNameFilter '*Get-SafeName*' -Output Detailed"
-```
-
-The runner auto-installs Pester 5 (CurrentUser scope) on first use. PSScriptAnalyzer, if installed, runs in advisory mode. Coverage on `switch_claude_account.ps1` runs by default with a **90% gate** (`-CoverageThreshold <int>` to override, `0` disables the gate but keeps the summary); JaCoCo XML lands in `tests/TestResults/coverage.xml` (gitignored). `-SkipCoverage` for the fastest local loop.
-
-Per-function complexity diagnostic (advisory, on-demand): `pwsh -NoProfile -File tests/Measure-Complexity.ps1`, an AST walker reporting LOC, McCabe CC, and max nesting. Rows with CC >= 10 or nest >= 4 are flagged.
-
-### Test conventions
-
-- **Layout**: one file per action at `tests/Invoke-<Action>Action.Tests.ps1`, plus cross-cutting suites (`Helpers`, `Profile-Install`, `Invoke-Reconcile`, `Invoke-AutoRotation`, `State-File`). Every outer `Describe` is named `'switch_claude_account'` so `-FullNameFilter` recipes work uniformly.
-- **Sandboxing**: `tests/Common.ps1`, dot-sourced from each `BeforeEach`, sandboxes `$env:USERPROFILE`, `$env:HOME`, `$env:CLAUDE_CONFIG_DIR` and `$PROFILE.CurrentUserAllHosts` per test via `$TestDrive` (both home variables, because the script reads whichever its platform uses; each test file restores the originals in its own `AfterAll`); the real profile and real `.claude` directory are never touched. It also sets `$PSStyle.OutputRendering = 'PlainText'` so string assertions see ANSI-stripped output.
-- **Direct-call pattern**: the script is dot-sourced and tests call `Invoke-*Action` directly, bypassing `Invoke-Main`. The `-NoColor` `try/finally` in `Invoke-Main` therefore never fires in tests; `Common.ps1` substitutes for it.
-- **Output capture**: `6>&1 | Out-String` captures `Write-Host` (information stream 6). Stream 4 (`Write-Progress`) is not captured by that pattern; relevant when adding rendering helpers.
+Coverage on `switch_claude_account.ps1` runs by default behind a **90% gate**; `-SkipCoverage` for the fastest local loop. One file per action at `tests/Invoke-<Action>Action.Tests.ps1`, every outer `Describe` named `'switch_claude_account'`, and `tests/Common.ps1` dot-sourced from each `BeforeEach` to sandbox both home variables, `CLAUDE_CONFIG_DIR` and `$PROFILE.CurrentUserAllHosts` into `$TestDrive`. The filter recipes, the direct-call pattern, the output-capture rule and the complexity diagnostic are `docs/testing.md`.
 
 ## README image regeneration
 
-Four SVG terminal-output examples in `docs/images/` are rendered by `tools/Render-ReadmeImages.ps1` via [`charmbracelet/freeze`](https://github.com/charmbracelet/freeze) (`winget install charmbracelet.freeze`). The harness is hand-authored ANSI matching the README literally; it does not call `Format-UsageFrame`. Palette choices, the truecolor rationale, and the README `width` contract are documented in that script. Re-run when README example numbers change, or when `Write-Color` / `Get-StatusColor` / `Get-AggregateBarColor` mappings change:
-
-```powershell
-pwsh -NoProfile -File tools/Render-ReadmeImages.ps1
-```
+`pwsh -NoProfile -File tools/Render-ReadmeImages.ps1` re-renders the four SVGs in `docs/images/` via `charmbracelet/freeze`. Re-run when a README example number changes, or when a `Write-Color` / `Get-StatusColor` / `Get-AggregateBarColor` mapping changes. That script's header owns the palette, the truecolor rationale and the README `width` contract.
 
 ## Default Change Workflow
 
@@ -96,14 +64,7 @@ After any code change, run `pwsh -NoProfile -File tests/Invoke-Tests.ps1` (the i
 
 ## Code Comments
 
-Comments explain **why**, not **what**; the code already states what it does, and a comment that restates it drifts out of sync.
-
-- **Default to no comment.** Prefer a clearer name or a smaller function; comment only when the *reason* is non-obvious from the code.
-- **One source of truth per rationale.** Document a non-obvious decision once at the authoritative place and reference it tersely from other call sites.
-- **History lives in git.** The commit message and `git blame` carry change history, not comments. Do not write "previously X" or "the old behaviour was Y".
-- **No WHAT-comments.** Don't preface a line or block with prose that paraphrases it.
-- **Length is a smell.** A why-comment over ~3 lines usually signals unclear code or naming; fix the code first.
-- **Earn the exception.** A long comment is justified when it records something unrecoverable from the code: a platform or API fact, a reverse-engineered constant, a measured number, or a decision with a real cost if reversed. `Write-Color` and the unofficial-constants block are the reference examples.
+Comments explain **why**, not **what**. Default to no comment; prefer a clearer name or a smaller function. Document a rationale once at its authoritative place and reference it tersely elsewhere. History lives in git: never "previously X". A why-comment over ~3 lines is a smell unless it records something unrecoverable from the code, a platform fact, a reverse-engineered constant, or a measured number. `docs/conventions.md` → *Comments*.
 
 ## Scratch files
 
@@ -113,7 +74,7 @@ Ad-hoc agent artifacts (screenshots, diffs, scratch scripts, traces) go under `.
 
 Multiple agents may share this directory; foreign uncommitted changes and untracked files are untouchable.
 
-1. **Foreign changes off-limits.** Never run `git checkout --`, `restore --`, `reset --hard`, `clean`, `rm`, `mv`, or `git stash pop/apply` on a path another agent modified or an untracked file another agent created. "Commit and push" does NOT authorise destructive cleanup of foreign paths.
+1. **Foreign changes off-limits.** Never run `git checkout --`, `restore --`, `reset --hard`, `clean`, `rm`, `mv`, or `git stash pop/apply` on a path another agent modified or an untracked file another agent created. "Commit and push" does NOT authorize destructive cleanup of foreign paths.
 2. **Preflight.** `git status --porcelain -u` at task start and again before `git commit`.
 3. **Session-scoped scratch.** Use `<session-id>` from your runtime's session metadata if exposed; otherwise mint `YYYYMMDD-HHMMSS-<random6>`.
 4. **Stashes session-scoped.** Only with explicit pathspec and tagged message: `git stash push --message "session-<id>: <reason>" -- <files>`. Bare `git stash`, `-u`, `--all`, and pop/apply of foreign stashes are forbidden.
@@ -124,16 +85,29 @@ When your changes overlap foreign WIP in the same file, stop and ask. Do not res
 
 ## Version Control
 
-- [Semantic Versioning](https://semver.org/).
-- Changelog follows [Common Changelog](https://common-changelog.org).
-- LF line endings enforced via `.gitattributes`.
-- No `Co-Authored-By` trailer in commit messages.
-- A pull request body is English and answers **what** changed and **why**, names the **shortcomings** of the approach, says **which feedback** you want, and lists **what is not done**. A link supplements it and never carries it. A release groups its account by version, newest first. `docs/pull_requests.md`.
+- [Semantic Versioning](https://semver.org/). LF line endings enforced via `.gitattributes`.
+- **Branches**: `main` and `develop` are long-lived. A pull request takes `develop` into `main` and carries a release.
+- **Commits** take the [Conventional Commits](https://www.conventionalcommits.org/) form, `type(scope): imperative summary`, with the *why* in the body and no `Co-Authored-By` trailer. Common Changelog argues against this convention; the reason this repository keeps it anyway is `docs/conventions.md` → *Commit messages*.
+- **Changelog** follows [Common Changelog](https://common-changelog.org) with two deliberate deviations, each recorded with its reason in `docs/conventions.md` → *Changelog*. An entry is one imperative line of around 100 characters saying what changed, never why; the why is the commit body. Edit `CHANGELOG.md` only as a step of a release.
+- A **pull request** body is English and answers **what** changed and **why**, names the **shortcomings** of the approach, says **which feedback** you want, and lists **what is not done**. A link supplements it and never carries it. A release groups its account by version, newest first. `docs/pull_requests.md`.
 
 ## Skills
 
 - `plan-review` / `pr-code-review` (under `.claude/skills/`): second-pass design review before non-trivial plans; multi-pass PR review.
 
-## Punctuation: prefer specific marks over the em dash
+## Output Formatting
 
-The em dash (`—`) is reserved for genuine emphatic interruption or a sudden break in thought. For every other use, prefer the more specific mark (rewriting the sentence is also fine), and do not strip a dash where it is the right mark: a comma for a short aside tightly bound to the sentence; parentheses for a tangential aside; a colon to introduce an explanation, list, or summary; a semicolon or period to join two related independent clauses; a rewrite or period for a rhetorical "not X, Y" contrast; an en dash (`–`) for a numeric or date range; a hyphen (`-`) for a compound modifier. The rule is to stop using `—` as a default joiner where `:`, `;`, `,`, `(...)`, or a period would be clearer.
+The em dash (`—`) is reserved for genuine emphatic interruption or a sudden break in thought. Everywhere else reach for the specific mark: a comma for a short aside, parentheses for a tangential one, a colon to introduce, a semicolon or period to join two independent clauses, an en dash (`–`) for a range, a hyphen for a compound modifier. Do not strip one where it is the right mark. Pad every cell of a markdown table so all cells in a column share one width. American spelling in code, comments and prose. `docs/conventions.md` → *Punctuation*, *Spelling*.
+
+## Reference
+
+All under `docs/`; the sentence is the document's own opening line.
+
+| Document                   | When to read                                                                            |
+| -------------------------- | --------------------------------------------------------------------------------------- |
+| `documentation.md`         | Read before adding or moving a paragraph in `AGENTS.md`, `docs/`, a skill or the README |
+| `conventions.md`           | Read when writing or reviewing code, a comment, a commit message or changelog text      |
+| `architecture.md`          | Read when changing how a credential, slot, sidecar or state file is resolved or written |
+| `testing.md`               | Read when writing or running a Pester test, or when the coverage gate is red            |
+| `claude-code-internals.md` | Read when an unofficial endpoint or constant needs re-verifying against a new build     |
+| `pull_requests.md`         | Read before opening a pull request or writing its description                           |

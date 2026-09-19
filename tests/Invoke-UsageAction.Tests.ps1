@@ -58,7 +58,7 @@ Describe 'switch_claude_account' {
                     captured_at  = '2026-04-26T00:00:00.000Z'
                     source       = 'test'
                     oauthAccount = [ordered]@{
-                        accountUuid      = "test-acct-uuid-$Name"
+                        accountUuid      = (Get-TestAccountUuid -Email "$Name@test.local")
                         emailAddress     = "$Name@test.local"
                         organizationUuid = 'test-org-uuid'
                         displayName      = $Name
@@ -640,6 +640,80 @@ Describe 'switch_claude_account' {
                 Should -Be (Get-FileHash -LiteralPath $script:CredFilePath -Algorithm SHA256).Hash
         }
 
+        # The propagation above is the one write reaching .credentials.json
+        # from a read-only command: `sca usage` and every monitor poll
+        # reconcile without refusing on `Captured = $false`, so bytes a
+        # reconcile deliberately declined to attribute were still overwritten
+        # here, and the last_sync_hash update then erased the evidence that
+        # they had ever been unreconciled. Driven through Update-SlotTokens
+        # directly, as the sidecar-less case below is, because reaching it via
+        # Invoke-UsageAction would reconcile the very bytes under test.
+        It 'refresh does NOT propagate onto active credentials no slot has captured' {
+            $slotPath = New-Slot -Name 'activeStale' -AccessToken 'sk-ant-oat-OLD' -ExpiresAt $script:PastMs
+
+            # Seed state as though a reconcile had captured the slot's bytes...
+            Copy-Item -LiteralPath $slotPath -Destination $script:CredFilePath -Force
+            $hash = (Get-FileHash -LiteralPath $script:CredFilePath -Algorithm SHA256).Hash
+            Update-ScaState -ActiveSlot 'activeStale' -LastSyncHash $hash | Out-Null
+
+            # ...then let another writer land bytes nothing has captured, which
+            # is what an identity-unresolved reconcile leaves behind.
+            $uncaptured = '{"claudeAiOauth":{"accessToken":"sk-ant-oat-UNCAPTURED","refreshToken":"sk-ant-ort-UNCAPTURED","expiresAt":9999999999999}}'
+            Set-Content -LiteralPath $script:CredFilePath -Value $uncaptured -NoNewline
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]@{
+                    access_token  = 'sk-ant-oat-NEW'
+                    refresh_token = 'sk-ant-ort-NEW'
+                    expires_in    = 3600
+                }
+            }
+
+            $out = Update-SlotTokens -SlotPath $slotPath 6>&1 | Out-String
+
+            $out | Should -Match 'no slot has captured'
+            $out | Should -Match 'sca switch activeStale'
+
+            # The slot file still takes the rotation: the refresh happened and
+            # the tokens have to be recorded somewhere.
+            $slotJson = Get-Content -LiteralPath $slotPath -Raw | ConvertFrom-Json
+            $slotJson.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-NEW'
+
+            # The uncaptured bytes survive untouched, and the hash still names
+            # the pre-refresh state, so the next reconcile sees them as changed.
+            Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be $uncaptured
+            (Read-ScaState).last_sync_hash | Should -Be $hash
+        }
+
+        # Only a PROVEN mismatch blocks the propagation. A state with no
+        # last_sync_hash has nothing to compare against, and freezing the
+        # mirror there would strand the active slot on the first refresh after
+        # a state file was rebuilt.
+        It 'refresh still propagates when state carries no sync hash to compare' {
+            $slotPath = New-Slot -Name 'activeStale' -AccessToken 'sk-ant-oat-OLD' -ExpiresAt $script:PastMs
+
+            Copy-Item -LiteralPath $slotPath -Destination $script:CredFilePath -Force
+            # Written directly rather than through Update-ScaState: with no
+            # state file on disk, Read-ScaState auto-migrates by hashing
+            # .credentials.json against the slots, and the match would bootstrap
+            # the very hash this case is about not having.
+            Write-ScaState -State ([pscustomobject]@{ active_slot = 'activeStale'; last_sync_hash = $null })
+            (Read-ScaState).last_sync_hash | Should -BeNullOrEmpty
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]@{
+                    access_token  = 'sk-ant-oat-NEW'
+                    refresh_token = 'sk-ant-ort-NEW'
+                    expires_in    = 3600
+                }
+            }
+
+            Update-SlotTokens -SlotPath $slotPath 6>$null | Out-Null
+
+            $credJson = Get-Content -LiteralPath $script:CredFilePath -Raw | ConvertFrom-Json
+            $credJson.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-NEW'
+        }
+
         # When state.active_slot points at a slot whose sidecar is
         # missing (legacy install, lost sidecar from a failed save's
         # rollback, or a sidecar-less auto-save), Find-SlotByName
@@ -854,8 +928,11 @@ Describe 'switch_claude_account' {
             # Seed state pointing at 'work' so reconcile mirrors there.
             Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE_HASH' | Out-Null
 
-            # Default Common.ps1 mock makes Get-SlotProfile fail -> offline
-            # tolerance branch -> mirror through.
+            # Identity must resolve to the tracked slot's own account, which is
+            # what makes this a refresh rather than a swap. New-Slot writes the
+            # sidecar email as "<name>@test.local". Without this, reconcile
+            # cannot attribute the new bytes and declines to write at all.
+            Set-SandboxClaudeJson -Email 'work@test.local'
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
                 if ($Headers['Authorization'] -ne 'Bearer sk-ant-oat-NEW') {
                     throw "expected new token in Authorization header, got '$($Headers['Authorization'])'"
@@ -1091,7 +1168,11 @@ Describe 'switch_claude_account' {
             # The em-dash data cells stay (no data to show), but the advisory
             # names the throttled slot and states the condition without
             # promising recovery (the renderer is shared with one-shot).
-            $out | Should -Match "'throttled' is currently rate-limited or at a plan limit\."
+            # Never read, so the honest line is the one that names the check
+            # rather than the one asserting a limit sca cannot substantiate.
+            $out | Should -Match "'throttled' could not be read, and sca cannot tell a throttle from an expired login"
+            $out | Should -Match "sca warmup <slot>"
+            $out | Should -Not -Match 'currently rate-limited or at a plan limit'
             # The cached-data wording must NOT fire (no cache here).
             $out | Should -Not -Match 'last known usage'
         }
@@ -1124,8 +1205,8 @@ Describe 'switch_claude_account' {
             # block, leading the [Watch] line (and, when present, [Monitor]).
             # 'throttled' appears first in the table row, then again in the
             # advisory; the advisory-only phrase anchors the ordering check.
-            ($out.IndexOf('throttled')) | Should -BeLessThan ($out.IndexOf('currently rate-limited'))
-            ($out.IndexOf('currently rate-limited')) | Should -BeLessThan ($out.IndexOf('[Watch]'))
+            ($out.IndexOf('throttled')) | Should -BeLessThan ($out.IndexOf('sca warmup'))
+            ($out.IndexOf('sca warmup')) | Should -BeLessThan ($out.IndexOf('[Watch]'))
         }
 
         It 'Invoke-UsageAction -Watch -Json throws (mutually exclusive)' {
@@ -1868,6 +1949,49 @@ Describe 'switch_claude_account' {
             $after.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-NEW'
         }
 
+        # -NoRefresh is what lets the identity guard probe .credentials.json
+        # while a live client may be mid-request on those exact tokens: a
+        # refresh would rotate the refresh token out from under it to answer a
+        # question. The inverse of the test above, on the same fixture.
+        It '-NoRefresh reports expired instead of rotating an expired token' {
+            $slot = New-ProfileSlot -Name 'norefresh' `
+                                    -AccessToken 'sk-ant-oat-OLD' `
+                                    -ExpiresAt   ([DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds())
+            Mock Update-SlotTokens { throw '-NoRefresh must not rotate tokens' }
+
+            $res = Get-SlotProfile -SlotPath $slot -NoRefresh
+
+            $res.Status    | Should -Be 'expired'
+            $res.Error     | Should -Match 'NoRefresh'
+            # Transport=$false: nothing was attempted, so a retry cannot differ.
+            $res.Transport | Should -BeFalse
+            Should -Invoke Update-SlotTokens -Times 0 -Exactly
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter {
+                $Uri -eq 'https://api.anthropic.com/api/oauth/profile'
+            }
+            # The slot file is left byte-identical; nothing was rewritten.
+            (Get-Content -LiteralPath $slot -Raw | ConvertFrom-Json).claudeAiOauth.accessToken |
+                Should -Be 'sk-ant-oat-OLD'
+        }
+
+        It '-NoRefresh still answers normally while the token is valid' {
+            $slot = New-ProfileSlot -Name 'norefresh-ok'
+            Mock Update-SlotTokens { throw '-NoRefresh must not rotate tokens' }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
+                return [pscustomobject]@{
+                    account      = [pscustomobject]@{ email = 'carol@example.com'; uuid = 'acct-uuid-carol' }
+                    organization = [pscustomobject]@{ uuid = 'org-uuid' }
+                }
+            }
+
+            $res = Get-SlotProfile -SlotPath $slot -NoRefresh
+
+            $res.Status      | Should -Be 'ok'
+            $res.Email       | Should -Be 'carol@example.com'
+            $res.AccountUuid | Should -Be 'acct-uuid-carol'
+            Should -Invoke Update-SlotTokens -Times 0 -Exactly
+        }
+
         It 'refresh 429 surfaces as rate-limited (not expired)' {
             $slot = New-ProfileSlot -Name 'rl' -ExpiresAt ([DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds())
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
@@ -2469,9 +2593,121 @@ Describe 'switch_claude_account' {
             $Script:SlotUsageCache[$script:boSlot].Data                            | Should -Be 'D'
         }
 
-        It 'Set-SlotRateLimitBackoff is a no-op when the slot has no cache entry' {
+        It 'Set-SlotRateLimitBackoff creates a throttle-only entry when the slot has none' {
+            # The slots that most need the backoff are the ones that never read
+            # successfully, because they were throttled from the first poll.
+            # Stamping only pre-existing entries excluded exactly those, so each
+            # poll re-ran the three-attempt refresh ladder against an endpoint
+            # already refusing.
             Set-SlotRateLimitBackoff -SlotPath $script:boSlot
-            $Script:SlotUsageCache.ContainsKey($script:boSlot) | Should -BeFalse
+
+            $Script:SlotUsageCache.ContainsKey($script:boSlot)     | Should -BeTrue
+            $Script:SlotUsageCache[$script:boSlot].Data            | Should -BeNullOrEmpty
+            $Script:SlotUsageCache[$script:boSlot].RateLimitedUntil | Should -BeGreaterThan ([DateTime]::UtcNow)
+        }
+
+        It 'short-circuits with ZERO HTTP on a throttle-only entry, claiming no cached numbers' {
+            # The em-dash row must not also claim "showing last known usage":
+            # IsCachedFallback is what routes it to that advisory.
+            $script:rmCount2 = 0
+            Mock Invoke-RestMethod -MockWith { $script:rmCount2++; throw 'HTTP must not be called during backoff' }
+            $Script:SlotUsageCache[$script:boSlot] = @{
+                Data             = $null
+                Timestamp        = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:boSlot
+
+            $r.Status           | Should -Be 'rate-limited'
+            $r.Data             | Should -BeNullOrEmpty
+            $r.IsCachedFallback | Should -BeFalse
+            $script:rmCount2    | Should -Be 0
+        }
+
+        It 'a token-endpoint 429 on an uncached slot silences the NEXT poll entirely' {
+            # End to end for the defect: first poll burns the refresh ladder,
+            # second poll must make no request at all.
+            $expired = [DateTimeOffset]::UtcNow.AddHours(-2).ToUnixTimeMilliseconds()
+            $payload = @{ claudeAiOauth = @{ accessToken='AT'; refreshToken='RT'; expiresAt=$expired } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $script:boSlot -Value $payload -NoNewline
+            $Script:SlotUsageCache.Remove($script:boSlot)
+
+            $script:tokCount = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:tokCount++
+                $resp = [pscustomobject]@{ StatusCode = 429 }
+                $e = [System.Exception]::new('429'); $e | Add-Member -NotePropertyName Response -NotePropertyValue $resp; throw $e
+            }
+
+            $first = Get-SlotUsage -SlotPath $script:boSlot
+            $after = $script:tokCount
+            $second = Get-SlotUsage -SlotPath $script:boSlot
+
+            $first.Status  | Should -Be 'rate-limited'
+            $second.Status | Should -Be 'rate-limited'
+            $after         | Should -BeGreaterThan 0
+            # The whole point: the second poll adds no traffic.
+            $script:tokCount | Should -Be $after
+        }
+
+        # sca's 429 arrives before the server reads the grant, so on its own it
+        # cannot distinguish a throttle from a revoked login, and 'rate-limited'
+        # tells the user to wait for something that will never clear. claude -p
+        # does reach the grant; where it has ruled, that ruling wins.
+        It 'prefers a recorded auth verdict over a rate-limited it cannot substantiate' {
+            $expired = [DateTimeOffset]::UtcNow.AddHours(-2).ToUnixTimeMilliseconds()
+            $payload = @{ claudeAiOauth = @{ accessToken='AT'; refreshToken='RT'; expiresAt=$expired } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $script:boSlot -Value $payload -NoNewline
+            $Script:SlotUsageCache.Remove($script:boSlot)
+
+            Set-SlotAuthVerdict -SlotName 'bo' -SlotPath $script:boSlot `
+                                -Status 'expired' -ErrorMessage 'OAuth session expired and could not be refreshed'
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $resp = [pscustomobject]@{ StatusCode = 429 }
+                $e = [System.Exception]::new('429'); $e | Add-Member -NotePropertyName Response -NotePropertyValue $resp; throw $e
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:boSlot
+
+            $r.Status | Should -Be 'expired'
+            $r.Error  | Should -Match 'could not be refreshed'
+        }
+
+        It 'reports rate-limited again once the verdict no longer matches the slot bytes' {
+            $expired = [DateTimeOffset]::UtcNow.AddHours(-2).ToUnixTimeMilliseconds()
+            $payload = @{ claudeAiOauth = @{ accessToken='AT'; refreshToken='RT'; expiresAt=$expired } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $script:boSlot -Value $payload -NoNewline
+            $Script:SlotUsageCache.Remove($script:boSlot)
+
+            Set-SlotAuthVerdict -SlotName 'bo' -SlotPath $script:boSlot -Status 'expired' -ErrorMessage 'stale'
+            # Stands in for a re-login followed by `sca save`.
+            $fresh = @{ claudeAiOauth = @{ accessToken='NEW'; refreshToken='NEW'; expiresAt=$expired } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $script:boSlot -Value $fresh -NoNewline
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $resp = [pscustomobject]@{ StatusCode = 429 }
+                $e = [System.Exception]::new('429'); $e | Add-Member -NotePropertyName Response -NotePropertyValue $resp; throw $e
+            }
+
+            (Get-SlotUsage -SlotPath $script:boSlot).Status | Should -Be 'rate-limited'
+        }
+
+        It 'prefers the verdict on the backoff short-circuit too (no HTTP at all)' {
+            $script:rmCount3 = 0
+            Mock Invoke-RestMethod -MockWith { $script:rmCount3++; throw 'must not be called' }
+            Set-SlotAuthVerdict -SlotName 'bo' -SlotPath $script:boSlot -Status 'unauthorized' -ErrorMessage 'revoked'
+            $Script:SlotUsageCache[$script:boSlot] = @{
+                Data             = $null
+                Timestamp        = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:boSlot
+
+            $r.Status        | Should -Be 'unauthorized'
+            $script:rmCount3 | Should -Be 0
         }
     }
 
@@ -2582,6 +2818,171 @@ Describe 'switch_claude_account' {
         }
     }
 
+    # The three units Format-UsageTable orchestrates. Asserted directly rather
+    # than through rendered output: a cell rule that only a regex over a whole
+    # table can reach is a rule nothing can pin down when it changes.
+    Context 'Get-UsageStatusLabel' {
+        # BeforeAll, not the Context body: Pester 5 runs Context bodies at
+        # discovery and It bodies at run time, in different scopes.
+        BeforeAll {
+            function New-StatusRow {
+                Param ($Status, $HttpStatus, $Data)
+                $o = [pscustomobject]@{ Name = 's'; IsActive = $false; Status = $Status; Data = $Data; Email = $null }
+                if ($null -ne $HttpStatus) { $o | Add-Member -NotePropertyName HttpStatus -NotePropertyValue $HttpStatus }
+                return $o
+            }
+        }
+
+        It 'maps <Status> to "<Expected>"' -ForEach @(
+            @{ Status = 'no-oauth';     Expected = 'no-oauth' }
+            @{ Status = 'expired';      Expected = 'expired' }
+            @{ Status = 'unauthorized'; Expected = 'unauthorized' }
+            @{ Status = 'rate-limited'; Expected = 'rate-limited' }
+            @{ Status = 'warming-up';   Expected = 'warming up' }
+            @{ Status = 'priming';      Expected = 'priming' }
+        ) {
+            Get-UsageStatusLabel -Row (New-StatusRow -Status $Status) | Should -Be $Expected
+        }
+
+        It 'appends the code on error only when the row carries one' {
+            Get-UsageStatusLabel -Row (New-StatusRow -Status 'error' -HttpStatus 529) | Should -Be 'error 529'
+            Get-UsageStatusLabel -Row (New-StatusRow -Status 'error')                 | Should -Be 'error'
+        }
+
+        # An unrecognised status must still render something: the warmup pass
+        # mutates Status in place, so a future value reaching the table before
+        # it reaches this switch should degrade, not blank the cell.
+        It 'passes an unknown status through verbatim' {
+            Get-UsageStatusLabel -Row (New-StatusRow -Status 'brand-new') | Should -Be 'brand-new'
+        }
+
+        It 'defers to Get-PlanStatus on ok' {
+            Mock Get-PlanStatus { 'near limit' }
+            Get-UsageStatusLabel -Row (New-StatusRow -Status 'ok' -Data ([pscustomobject]@{})) | Should -Be 'near limit'
+            Should -Invoke Get-PlanStatus -Times 1 -Exactly
+        }
+    }
+
+    Context 'ConvertTo-UsageTableRow' {
+        It 'renders the em-dash for a row with no usable data' {
+            $cells = ConvertTo-UsageTableRow -Row ([pscustomobject]@{
+                Name = 'a'; IsActive = $false; Status = 'expired'; Data = $null; Email = $null
+            })
+            $cells.Five  | Should -Match '—'
+            $cells.Seven | Should -Match '—'
+            $cells.Marker | Should -Be ' '
+        }
+
+        It 'marks the active row' {
+            $cells = ConvertTo-UsageTableRow -Row ([pscustomobject]@{
+                Name = 'a'; IsActive = $true; Status = 'expired'; Data = $null; Email = $null
+            })
+            $cells.Marker | Should -Be '*'
+        }
+
+        # A rate-limited row served from the cache fallback carries last-known
+        # Data. Blanking it would make a transiently throttled slot look dead.
+        It 'renders percentages for a rate-limited row that carries cached data' {
+            $cells = ConvertTo-UsageTableRow -Row ([pscustomobject]@{
+                Name = 'a'; IsActive = $false; Status = 'rate-limited'; Email = $null
+                Data = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 42.0; resets_at = $null }
+                    seven_day = [pscustomobject]@{ utilization = 7.0;  resets_at = $null }
+                }
+            })
+            $cells.Five   | Should -Match '42'
+            $cells.Seven  | Should -Match '7'
+            $cells.Status | Should -Be 'rate-limited'
+        }
+
+        # A row may carry one bucket and not the other once a window rolls.
+        It 'keeps the em-dash for a bucket the row omits' {
+            $cells = ConvertTo-UsageTableRow -Row ([pscustomobject]@{
+                Name = 'a'; IsActive = $false; Status = 'ok'; Email = $null
+                Data = [pscustomobject]@{
+                    five_hour = [pscustomobject]@{ utilization = 12.0; resets_at = $null }
+                    seven_day = $null
+                }
+            })
+            $cells.Five  | Should -Match '12'
+            $cells.Seven | Should -Match '—'
+        }
+    }
+
+    Context 'Measure-UsageTableColumns' {
+        # Minimums are the header labels, so a 1-slot table cannot clip its
+        # own headers.
+        It 'floors each column at its header label width' {
+            $w = Measure-UsageTableColumns -Rows @(
+                [pscustomobject]@{ Name = 'a'; Account = 'b'; Five = 'c'; Seven = 'd'; Status = 'e' }
+            )
+            $w.Name    | Should -Be 4   # 'Slot'
+            $w.Account | Should -Be 7   # 'Account'
+            $w.Five    | Should -Be 7   # 'Session'
+            $w.Seven   | Should -Be 4   # 'Week'
+            $w.Status  | Should -Be 6   # 'Status'
+        }
+
+        It 'grows each column to its widest cell' {
+            $w = Measure-UsageTableColumns -Rows @(
+                [pscustomobject]@{ Name = 'short'; Account = 'a'; Five = 'b'; Seven = 'c'; Status = 'd' }
+                [pscustomobject]@{ Name = 'much-longer-slot'; Account = 'a'; Five = 'b'; Seven = 'c'; Status = 'rate-limited' }
+            )
+            $w.Name   | Should -Be 'much-longer-slot'.Length
+            $w.Status | Should -Be 'rate-limited'.Length
+        }
+
+        # TotalWidth sizes the aggregate bars, so it must track the format
+        # string exactly: 2 indent + 1 marker + 1 sep + columns + 2 between.
+        It 'reports a TotalWidth matching the rendered line width' {
+            $w = Measure-UsageTableColumns -Rows @(
+                [pscustomobject]@{ Name = 'a'; Account = 'b'; Five = 'c'; Seven = 'd'; Status = 'e' }
+            )
+            $expected = 2 + 1 + 1 + $w.Name + 2 + $w.Account + 2 + $w.Five + 2 + $w.Seven + 2 + $w.Status
+            $w.TotalWidth | Should -Be $expected
+
+            $fmt = "  {0} {1,-$($w.Name)}  {2,-$($w.Account)}  {3,-$($w.Five)}  {4,-$($w.Seven)}  {5}"
+            ($fmt -f ' ', 'Slot', 'Account', 'Session', 'Week', 'Status').Length | Should -Be $w.TotalWidth
+        }
+
+        It 'returns the floors for an empty batch' {
+            $w = Measure-UsageTableColumns -Rows @()
+            $w.Name | Should -Be 4
+            # 2 + 1 + 1 + 4 + 2 + 7 + 2 + 7 + 2 + 4 + 2 + 6: the header row
+            # alone, which is the narrowest table that can be rendered.
+            $w.TotalWidth | Should -Be 40
+        }
+    }
+
+    Context 'Write-UsageTableHeader' {
+        It 'renders the bare header when no threshold is given' {
+            $out = Write-UsageTableHeader 6>&1 | Out-String
+            $out | Should -Match '\[Usage\] Plan usage'
+            $out | Should -Not -Match 'switching slot'
+        }
+
+        It 'appends the auto indicator when the terminal can fit it' {
+            Mock Get-ConsoleWidth { 120 }
+            $out = Write-UsageTableHeader -AutoThreshold 95 6>&1 | Out-String
+            $out | Should -Match 'switching slot at 95%'
+        }
+
+        # Dropping loses nothing: the footer's [Monitor] line carries the same
+        # state, and a wrapped indicator reads as a rendering bug.
+        It 'drops the indicator when the terminal is too narrow' {
+            Mock Get-ConsoleWidth { 20 }
+            $out = Write-UsageTableHeader -AutoThreshold 95 6>&1 | Out-String
+            $out | Should -Match '\[Usage\] Plan usage'
+            $out | Should -Not -Match 'switching slot'
+        }
+
+        It 'treats an unknown terminal width as narrow' {
+            Mock Get-ConsoleWidth { 0 }
+            $out = Write-UsageTableHeader -AutoThreshold 95 6>&1 | Out-String
+            $out | Should -Not -Match 'switching slot'
+        }
+    }
+
     Context 'Get-CachedUsageOrNull' {
         # Direct unit tests for the per-process usage cache helper.
         # $Script:SlotUsageCache is re-initialized to @{} in each
@@ -2589,6 +2990,22 @@ Describe 'switch_claude_account' {
 
         It 'returns $null on cache miss' {
             (Get-CachedUsageOrNull -SlotPath 'missing/path.json') | Should -BeNullOrEmpty
+        }
+
+        It 'refuses a throttle-only entry rather than reporting ok with no Data' {
+            # Set-SlotRateLimitBackoff creates these for slots that never read
+            # successfully. Serving one would return Status='ok' with Data=$null,
+            # which Get-RowMaxUtilization scores 0% and auto-rotation then reads
+            # as a healthy idle slot: a throttled slot promoted to active
+            # precisely because nothing could be read from it.
+            $slot = 'D:/throttle-only/path.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data             = $null
+                Timestamp        = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+            (Get-CachedUsageOrNull -SlotPath $slot)            | Should -BeNullOrEmpty
+            (Get-CachedUsageOrNull -SlotPath $slot -AllowStale) | Should -BeNullOrEmpty
         }
 
         It 'returns $null on stale entries (older than UsageCacheTTL minutes)' {
@@ -3105,11 +3522,6 @@ Describe 'switch_claude_account' {
         }
     }
 
-    # The `usage -Auto` / `usage -Warmup` integration contexts were removed
-    # in 3.0.0: those flags moved to the `monitor` action. The watch-engine
-    # guards they exercised (Claude-Code refusal, interactive-terminal
-    # requirement) are now covered in Invoke-MonitorAction.Tests.ps1.
-
     Context 'anthropic-version header propagation' {
         # Defense-in-depth: assert that every authenticated request adds
         # the anthropic-version header so a future tightening at any
@@ -3310,7 +3722,7 @@ Describe 'switch_claude_account' {
 
             # The mirror step after an ok activation calls Invoke-Reconcile;
             # the orchestration does not care about its internals, so stub it.
-            Mock Invoke-Reconcile -MockWith { }
+            Mock Invoke-Reconcile -MockWith { New-ReconcileResult }
 
             # Default /api/oauth/usage mock for the verify-after-activation
             # read: an ok activation triggers a Get-SlotUsage call so the
@@ -3450,6 +3862,57 @@ Describe 'switch_claude_account' {
             # The mirror runs once per ok activation so the slot file picks
             # up the token claude refreshed.
             Should -Invoke Invoke-Reconcile -Times 1 -Exactly
+        }
+
+        # claude reached the token endpoint and the grant was refused. Recording
+        # that is the only way a later plain `sca usage`, which never runs
+        # claude and whose own probe can be turned away before the grant is
+        # read, can report a dead login instead of a throttle.
+        It 'records an auth verdict when the activator reports the grant refused' {
+            New-WarmupSlot -Name 'dead' | Out-Null
+            Mock Invoke-SlotActivator -MockWith {
+                [pscustomobject]@{ Status = 'expired'; Error = 'OAuth session expired and could not be refreshed' }
+            }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            $v = Read-ScaState
+            $v.auth_verdicts['dead'].status | Should -Be 'expired'
+            $v.auth_verdicts['dead'].error  | Should -Match 'could not be refreshed'
+        }
+
+        It 'records the verdict for an unauthorized activation too' {
+            New-WarmupSlot -Name 'revoked' | Out-Null
+            Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'unauthorized'; Error = 'forbidden' } }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            (Read-ScaState).auth_verdicts['revoked'].status | Should -Be 'unauthorized'
+        }
+
+        It 'does NOT record a verdict for a throttled activation' {
+            # A rate limit says nothing about the grant; recording it would
+            # relabel a healthy slot as dead for as long as its bytes stand.
+            New-WarmupSlot -Name 'limited2' | Out-Null
+            Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'rate-limited' } }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            $state = Read-ScaState
+            if ($state -and $state.auth_verdicts) {
+                $state.auth_verdicts.ContainsKey('limited2') | Should -BeFalse
+            }
+        }
+
+        It 'clears a recorded verdict once the slot activates successfully' {
+            # New-SlotPair returns the slot PATH as a string, not an object.
+            $slotPath = New-WarmupSlot -Name 'healed'
+            Set-SlotAuthVerdict -SlotName 'healed' -SlotPath $slotPath -Status 'expired' -ErrorMessage 'was dead'
+            Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'ok' } }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            Get-SlotAuthVerdict -SlotPath $slotPath | Should -BeNullOrEmpty
         }
 
         It 'activator no-oauth: row ends Status="no-oauth", no mirror or usage read' {
@@ -3906,6 +4369,34 @@ Describe 'switch_claude_account' {
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
 
+        # The round-robin overwrites .credentials.json once per slot, and this
+        # step runs after the poll's reconcile AND after a full serial usage
+        # pass, so a refresh landing in that window would be discarded here.
+        # Same guard, same window, as Invoke-AutoRotationStep's.
+        It 'refuses (without warming) when reconcile could not capture the active credentials' {
+            Mock Invoke-Reconcile { New-ReconcileResult -Action 'noop' -Reason 'identity-unresolved' -Slot 'a' -Captured $false }
+            $times = @{}
+            $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 -CurrentLatch 'x'
+
+            $out | Should -Match '^\[Warmup\] Re-warm refused! .*could not be captured'
+            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+            # Not stamped: the slot was never attempted, so the next poll must
+            # be free to retry it as soon as the capture succeeds.
+            $times.ContainsKey('a') | Should -BeFalse
+        }
+
+        It 'reconciles before warming so the swap cannot discard a fresh refresh' {
+            Mock Invoke-Reconcile { New-ReconcileResult -Action 'mirror' -Slot 'a' }
+            $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x' | Out-Null
+
+            Should -Invoke Invoke-Reconcile -Times 1 -Exactly
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
+        }
+
         It 'surfaces a warm-path exception as "Re-warm failed!" and still stamps the attempt' {
             Mock Invoke-WarmAllSlots { throw [System.IO.IOException]::new('locked slot file') }
             $times = @{}
@@ -3943,6 +4434,96 @@ Describe 'switch_claude_account' {
                 @($Names).Count -eq 2 -and (@($Names) -contains 'b') -and (@($Names) -contains 'c')
             }
             $out | Should -Match "^\[Warmup\] Re-warmed 'b', 'c' at"
+        }
+
+        # A flat cooldown assumes the next attempt can differ. While the
+        # account's token endpoint is throttled it cannot: `claude -p`
+        # refreshes through that same endpoint, so every retry buys the same
+        # answer at ~$0.004. A data-less throttled row also scores 0% in
+        # Get-RowMaxUtilization, so the at-limit gate cannot hold it off
+        # either, which left such a slot retried every cooldown forever.
+        It 'counts a failed warm and stretches that slot cooldown' {
+            Mock Invoke-WarmAllSlots {
+                [pscustomobject]@{ Results = @([pscustomobject]@{ Name = 'b'; Status = 'rate-limited' }) }
+            }
+            $times = @{}; $fails = @{}
+            $snap  = New-KwSnapshot @( (New-KwRow -Name 'b' -Status 'rate-limited') )
+
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 `
+                                -CooldownMin 5 -WarmupFailures $fails -CurrentLatch 'x' | Out-Null
+
+            $fails['b'] | Should -Be 1
+
+            # 6 minutes on: past the flat 5, still inside the doubled 10.
+            $times['b'] = [DateTime]::Now.AddMinutes(-6)
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 `
+                                -CooldownMin 5 -WarmupFailures $fails -CurrentLatch 'x' | Out-Null
+
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
+        }
+
+        It 'resets the failure count after a successful warm' {
+            Mock Invoke-WarmAllSlots {
+                [pscustomobject]@{ Results = @([pscustomobject]@{ Name = 'a'; Status = 'ok' }) }
+            }
+            $fails = @{ 'a' = 3 }
+            $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 `
+                                -CooldownMin 5 -WarmupFailures $fails -CurrentLatch 'x' | Out-Null
+
+            $fails.ContainsKey('a') | Should -BeFalse
+        }
+
+        It 'counts every slot in the batch as failed when the warm pass throws' {
+            Mock Invoke-WarmAllSlots { throw [System.IO.IOException]::new('locked slot file') }
+            $fails = @{}
+            $snap  = New-KwSnapshot @(
+                (New-KwRow -Name 'a' -FiveResetsAt $null),
+                (New-KwRow -Name 'b' -FiveResetsAt $null)
+            )
+
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 `
+                                -CooldownMin 5 -WarmupFailures $fails -CurrentLatch 'x' | Out-Null
+
+            $fails['a'] | Should -Be 1
+            $fails['b'] | Should -Be 1
+        }
+
+        It 'omitting -WarmupFailures keeps the flat-cooldown behaviour' {
+            # Backward compatibility for one-shot callers and existing tests.
+            $times = @{ 'a' = [DateTime]::Now.AddMinutes(-6) }
+            $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 `
+                                -CooldownMin 5 -CurrentLatch 'x' | Out-Null
+
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
+        }
+    }
+
+    Context 'Get-WarmupCooldownMinutes' {
+        It 'returns the base cooldown when the slot has no failures' {
+            Get-WarmupCooldownMinutes -BaseMin 5 -Failures 0 | Should -Be 5
+        }
+
+        It 'doubles once per consecutive failure' {
+            Get-WarmupCooldownMinutes -BaseMin 5 -Failures 1 | Should -Be 10
+            Get-WarmupCooldownMinutes -BaseMin 5 -Failures 2 | Should -Be 20
+            Get-WarmupCooldownMinutes -BaseMin 5 -Failures 3 | Should -Be 40
+        }
+
+        It 'caps the doubling so a recovered slot is still noticed' {
+            $cap = Get-WarmupCooldownMinutes -BaseMin 5 -Failures $Script:WarmupBackoffMaxDoublings
+            Get-WarmupCooldownMinutes -BaseMin 5 -Failures 99 | Should -Be $cap
+        }
+
+        It 'keeps a zero base at zero, so the test override still disables the gate' {
+            Get-WarmupCooldownMinutes -BaseMin 0 -Failures 4 | Should -Be 0
+        }
+
+        It 'treats a negative failure count as no failures' {
+            Get-WarmupCooldownMinutes -BaseMin 5 -Failures -2 | Should -Be 5
         }
     }
 

@@ -23,6 +23,66 @@ BeforeAll {
     $script:OriginalProfile     = $global:PROFILE
     $script:OriginalHome        = $env:HOME
     $script:OriginalConfigDir   = $env:CLAUDE_CONFIG_DIR
+
+    # The watch engine spans several functions, and the static tests in
+    # 'Watch-mode VT control rendering' assert over all of them at once.
+    # Two of those assertions are negative ("no Write-Host VT escape", "no
+    # ESC[2J literal"), and a negative is trivially true of a function that
+    # no longer holds the code: naming one function would let a later
+    # extraction disarm the guard while the suite stayed green. So the list
+    # lives here, every guard walks all of it, and the two negative guards
+    # each pair with a positive existence check over the same list. Extend
+    # this list whenever watch code moves into a new function.
+    function Get-WatchFamilyAst {
+        Param ([Parameter(Mandatory)] [string] $Path)
+
+        $family = @(
+            'Invoke-UsageWatch'
+            'Test-WatchInteractive'
+            'Enter-WatchTerminal'
+            'Exit-WatchTerminal'
+            'New-WatchSession'
+            'Invoke-WatchPoll'
+            'Format-WatchFooter'
+            'Write-WatchFrame'
+            'Invoke-WatchStartupWarm'
+        )
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $Path, [ref]$null, [ref]$null)
+        $found = @($ast.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $family -contains $n.Name
+        }, $true))
+
+        # A rename that forgets this list would otherwise shrink the family
+        # silently, which is the exact failure the list exists to prevent.
+        $missing = @($family | Where-Object { $_ -notin @($found.Name) })
+        if ($missing.Count -gt 0) {
+            throw "watch-family functions missing from the script: $($missing -join ', ')"
+        }
+        return $found
+    }
+
+    # Run $Body with [Console]::Out swapped for a StringWriter and return
+    # what was written. The watch writes its VT control sequences straight to
+    # [Console]::Out to bypass the PlainText filter Write-Host applies, so
+    # this swap is the only way to see them. Pester's own output goes through
+    # the host UI rather than Console.Out and is unaffected; the finally puts
+    # the real writer back even when $Body throws.
+    function Get-CapturedConsoleOut {
+        Param ([Parameter(Mandatory)] [scriptblock] $Body)
+
+        $origOut = [Console]::Out
+        $sw      = [System.IO.StringWriter]::new()
+        try {
+            [Console]::SetOut($sw)
+            & $Body
+        } finally {
+            [Console]::SetOut($origOut)
+        }
+        return $sw.ToString()
+    }
 }
 
 Describe 'switch_claude_account' {
@@ -793,21 +853,29 @@ Describe 'switch_claude_account' {
         # one static (no Write-Host VT escapes in Invoke-UsageWatch),
         # one behavioral (Write-VTSequence preserves DEC modes verbatim).
 
-        It 'Invoke-UsageWatch routes all VT control sequences through Write-VTSequence (no Write-Host VT escapes)' {
+        It 'the watch family routes all VT control sequences through Write-VTSequence (no Write-Host VT escapes)' {
             # AST-based static check: pin the call sites without a brittle
             # line-range. A future accidental `Write-Host "`e[?...h"`
-            # reintroduction in the watch loop fails this test.
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-                $script:ScriptPath, [ref]$null, [ref]$null)
-            $func = $ast.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                $n.Name -eq 'Invoke-UsageWatch'
-            }, $true) | Select-Object -First 1
+            # reintroduction in the watch lifecycle fails this test.
+            $funcs = Get-WatchFamilyAst -Path $script:ScriptPath
 
-            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
+            # Positive half first. The assertion below is "no VT through
+            # Write-Host", which a family that emits no VT at all satisfies
+            # trivially, so pin that the family still owns the VT writes.
+            $vtWrites = @(
+                $funcs | ForEach-Object {
+                    $_.FindAll({
+                        param($n)
+                        $n -is [System.Management.Automation.Language.CommandAst]
+                    }, $true)
+                } | Where-Object { $_.GetCommandName() -eq 'Write-VTSequence' }
+            )
+            $vtWrites.Count | Should -BeGreaterOrEqual 1 -Because (
+                'the watch lifecycle emits VT controls; if the family holds ' +
+                'none, the no-Write-Host assertion below is vacuous and the ' +
+                'code that actually emits them is unguarded')
 
-            $bodyLines = $func.Extent.Text -split "`r?`n"
+            $bodyLines = @($funcs | ForEach-Object { $_.Extent.Text -split "`r?`n" })
             $offending = @($bodyLines | Where-Object {
                 $_ -match '\bWrite-Host\b' -and $_ -match '`e\['
             })
@@ -819,7 +887,7 @@ Describe 'switch_claude_account' {
                 'private modes, which causes -Watch -NoColor to flicker.')
         }
 
-        It 'Invoke-UsageWatch emits an OSC 0 title set inside the loop and restores the captured title in finally' {
+        It 'the watch family emits an OSC 0 title set and restores the captured title on exit' {
             # Pin the contract that watch mode (a) updates the terminal
             # title on each successful poll and (b) restores the
             # pre-watch title on exit. The static check guards against
@@ -827,28 +895,22 @@ Describe 'switch_claude_account' {
             # title-set the background-window UX regresses, without
             # title-restore the watch leaks its title into the user's
             # post-Ctrl-C shell session.
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-                $script:ScriptPath, [ref]$null, [ref]$null)
-            $func = $ast.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                $n.Name -eq 'Invoke-UsageWatch'
-            }, $true) | Select-Object -First 1
-            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
-
-            $body = $func.Extent.Text
+            $funcs = Get-WatchFamilyAst -Path $script:ScriptPath
+            $body  = ($funcs | ForEach-Object { $_.Extent.Text }) -join "`n"
 
             # OSC 0 sequence: ESC ] 0 ; <title> BEL. Match the literal
             # `e]0; opener; the renderer interpolation and BEL terminator
             # vary across edits but the opener is invariant.
             $body | Should -Match '`e\]0;' -Because (
-                'Invoke-UsageWatch must emit an OSC 0 (\e]0;<title>\a) ' +
+                'the watch must emit an OSC 0 (\e]0;<title>\a) ' +
                 'sequence so the terminal-title shows live usage when ' +
                 'the watch window is in the background.')
 
-            # The captured pre-watch title must be restored on exit.
+            # The captured pre-watch title must be restored on exit. Named
+            # rather than shape-matched because "some OSC 0 write exists"
+            # cannot distinguish the restore from the per-poll update.
             $body | Should -Match '\$origTitle' -Because (
-                'Invoke-UsageWatch must capture and restore the pre-watch ' +
+                'the watch must capture and restore the pre-watch ' +
                 'terminal title; without restore the watch-mode title ' +
                 'persists into the user post-Ctrl-C shell session.')
         }
@@ -889,7 +951,7 @@ Describe 'switch_claude_account' {
                 'loses its DEC 2026 sync envelope and flickers.')
         }
 
-        It 'Invoke-UsageWatch suppresses the information stream on every nested action whose advisories would flash on screen' {
+        It 'the watch family suppresses the information stream on every nested action whose advisories would flash on screen' {
             # AST-based static check for the sub-frame flash bug:
             #
             # The polling loop calls three things inside its `if ($dueForPoll)`
@@ -914,16 +976,9 @@ Describe 'switch_claude_account' {
             # 6>$null; #3's inner site is asserted separately by the
             # Invoke-AutoRotationStep tests.
             #
-            # Static check rather than behavioral because Invoke-UsageWatch
+            # Static check rather than behavioral because the watch loop
             # is an infinite loop and hard to drive in a unit test.
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-                $script:ScriptPath, [ref]$null, [ref]$null)
-            $func = $ast.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                $n.Name -eq 'Invoke-UsageWatch'
-            }, $true) | Select-Object -First 1
-            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
+            $funcs = Get-WatchFamilyAst -Path $script:ScriptPath
 
             # Walk the AST for actual CommandAst nodes (function calls)
             # rather than regex-scanning the function body. Regex on
@@ -931,10 +986,12 @@ Describe 'switch_claude_account' {
             # `# (matches Get-UsageSnapshot).` which are not invocations
             # and would produce false positives. CommandAst.GetCommandName()
             # returns the bound command name for real invocations only.
-            $allCommands = $func.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.CommandAst]
-            }, $true)
+            $allCommands = @($funcs | ForEach-Object {
+                $_.FindAll({
+                    param($n)
+                    $n -is [System.Management.Automation.Language.CommandAst]
+                }, $true)
+            })
 
             $reconcileInvocations = @($allCommands | Where-Object {
                 $_.GetCommandName() -eq 'Invoke-Reconcile'
@@ -968,7 +1025,7 @@ Describe 'switch_claude_account' {
                     }).Count -gt 0
                 }
                 $hasInfoSuppression | Should -BeTrue -Because (
-                    'every Invoke-Reconcile inside Invoke-UsageWatch must ' +
+                    'every Invoke-Reconcile in the watch family must ' +
                     'suppress information stream (6>$null); without it the ' +
                     "[Sync] auto-save / identity-change advisories print " +
                     'to the alt buffer outside the captured frame, where ' +
@@ -993,7 +1050,7 @@ Describe 'switch_claude_account' {
                     }).Count -gt 0
                 }
                 $hasInfoSuppression | Should -BeTrue -Because (
-                    'every Get-UsageSnapshot inside Invoke-UsageWatch must ' +
+                    'every Get-UsageSnapshot in the watch family must ' +
                     'suppress information stream (6>$null); Update-SlotTokens ' +
                     "(called via Get-SlotUsage) writes [Sync] yellow advisories " +
                     'on its two unhappy paths and those would print to the ' +
@@ -1129,7 +1186,7 @@ Describe 'switch_claude_account' {
             }
         }
 
-        It 'Invoke-UsageWatch stamps $lastPoll after the poll, never from the pre-poll $now' {
+        It 'the watch family stamps the last-poll time after the poll, never from the pre-poll $now' {
             # The loop is an infinite Start-Sleep loop and cannot be driven
             # directly, so this guards the shape instead. $lastPoll = $now uses
             # the timestamp captured BEFORE the HTTP work, which pre-credits the
@@ -1137,20 +1194,17 @@ Describe 'switch_claude_account' {
             # -Interval then makes the next iteration due immediately and the
             # loop polls back-to-back with no delay, hammering an endpoint whose
             # limiter trips after a handful of calls in a few seconds.
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-                $script:ScriptPath, [ref]$null, [ref]$null)
-            $func = $ast.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                $n.Name -eq 'Invoke-UsageWatch'
-            }, $true) | Select-Object -First 1
-            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
+            $funcs = Get-WatchFamilyAst -Path $script:ScriptPath
 
-            $assignments = @($func.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-                $n.Left.Extent.Text -eq '$lastPoll'
-            }, $true))
+            # Suffix match, so the guard survives the local becoming a field
+            # on the session object ($lastPoll -> $Session.LastPoll).
+            $assignments = @($funcs | ForEach-Object {
+                $_.FindAll({
+                    param($n)
+                    $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    $n.Left.Extent.Text -match '(^\$|\.)lastPoll$'
+                }, $true)
+            })
             $assignments.Count | Should -BeGreaterOrEqual 1
 
             foreach ($a in $assignments) {
@@ -1158,6 +1212,695 @@ Describe 'switch_claude_account' {
                     'the poll interval must be measured from when the poll ' +
                     'finished, not from the timestamp captured before it ran')
             }
+        }
+    }
+
+    Context 'Watch-mode terminal lifecycle' {
+        # Both halves are driven for real, against the live [Console], with
+        # only the output stream swapped. That is the point rather than an
+        # accident: the conditions that break these two are exactly the
+        # conditions a test runs in -- no attached console -- so executing
+        # them here reproduces the platform failure instead of describing it.
+        # A static assertion that a guard is present passes just as happily
+        # against a function nothing ever calls.
+        #
+        # Enter-WatchTerminal mutates real process state ([Console]::
+        # OutputEncoding), so every test that calls it restores through
+        # Exit-WatchTerminal in a finally.
+
+        BeforeAll {
+            # Enter the watch terminal with output captured, then hand the
+            # token and everything written during entry to $Assert. Always
+            # restores, including when $Assert fails, so one red test cannot
+            # leave the rest of the suite writing into an alt buffer.
+            function Invoke-WithEnteredWatchTerminal {
+                Param ([Parameter(Mandatory)] [scriptblock] $Assert)
+
+                $origOut   = [Console]::Out
+                $sw        = [System.IO.StringWriter]::new()
+                $term      = $null
+                $enterText = ''
+                try {
+                    [Console]::SetOut($sw)
+                    $term      = Enter-WatchTerminal
+                    $enterText = $sw.ToString()
+                } finally {
+                    if ($term) { Exit-WatchTerminal -State $term }
+                    [Console]::SetOut($origOut)
+                }
+                & $Assert $term $enterText
+            }
+        }
+
+        It 'Exit-WatchTerminal restores the title, then shows the cursor and leaves the alt buffer' {
+            # Exact-match rather than two -Match assertions: the ORDER is the
+            # contract. Title first so the title swap and the screen restore
+            # land in the same frame.
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = 'my shell'; EnteredAlt = $true
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -Be "`e]0;my shell`a`e[?25h`e[?1049l"
+        }
+
+        It 'Exit-WatchTerminal emits an empty title payload when the capture failed' {
+            # $null Title means RawUI was unavailable (test runner, ssh
+            # without a tty). Most terminals reset the tab label to their
+            # profile default on an empty OSC 0 payload, which beats leaving
+            # the watch's own title behind.
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = $null; EnteredAlt = $true
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -Be "`e]0;`a`e[?25h`e[?1049l"
+        }
+
+        It 'Exit-WatchTerminal strips control bytes from the restored title' {
+            # Defense in depth against an OSC-envelope breakout: a title
+            # carrying its own BEL would terminate the sequence early and
+            # let the rest execute as a new one.
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = "my`e]0;spoof`ashell"; EnteredAlt = $true
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -Be "`e]0;my]0;spoofshell`a`e[?25h`e[?1049l"
+        }
+
+        It 'Exit-WatchTerminal emits nothing when the alt buffer was never entered' {
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = 'my shell'; EnteredAlt = $false
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -BeNullOrEmpty
+        }
+
+        It 'Exit-WatchTerminal tolerates a $null state' {
+            # Enter-WatchTerminal throwing leaves the caller's token unset,
+            # and the finally runs regardless.
+            { Exit-WatchTerminal -State $null } | Should -Not -Throw
+        }
+
+        It 'Exit-WatchTerminal still emits the VT cursor restore when the cursor capture failed' {
+            # The API restore is skipped on a $null capture, but ESC[?25h is
+            # what the user's cursor actually depends on, so it must still
+            # go out. Pins that the $null guard does not short-circuit the
+            # visible half.
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = ''; EnteredAlt = $true
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -Match ([regex]::Escape("`e[?25h"))
+        }
+
+        It 'Exit-WatchTerminal restores a captured console encoding and skips a null one' {
+            $orig = [Console]::OutputEncoding
+            try {
+                $target = [System.Text.UTF8Encoding]::new($false)
+                [Console]::OutputEncoding = [System.Text.ASCIIEncoding]::new()
+                Exit-WatchTerminal -State ([pscustomobject]@{
+                    Cursor = $null; Encoding = $target; Title = $null; EnteredAlt = $false
+                })
+                [Console]::OutputEncoding.CodePage | Should -Be $target.CodePage
+
+                # $null Encoding must leave the current one alone rather than
+                # clearing it.
+                Exit-WatchTerminal -State ([pscustomobject]@{
+                    Cursor = $null; Encoding = $null; Title = $null; EnteredAlt = $false
+                })
+                [Console]::OutputEncoding.CodePage | Should -Be $target.CodePage
+            } finally {
+                [Console]::OutputEncoding = $orig
+            }
+        }
+
+        It 'New-WatchSession starts due for a poll with both latches off' {
+            # MinValue is load-bearing: the loop's poll gate is
+            # (now - LastPoll) >= Interval, so anything near "now" would
+            # make a bare `sca usage -Watch` sit on an empty frame for a
+            # full interval before its first request.
+            $s = New-WatchSession
+            $s.Snapshot       | Should -BeNullOrEmpty
+            $s.LastPoll       | Should -Be ([DateTime]::MinValue)
+            $s.LastPollError  | Should -BeNullOrEmpty
+            $s.AutoLatch      | Should -BeNullOrEmpty
+            $s.WarmLatch      | Should -BeNullOrEmpty
+            $s.WarmupTimes    | Should -BeOfType ([hashtable])
+            $s.WarmupFailures | Should -BeOfType ([hashtable])
+            $s.WarmupTimes.Count    | Should -Be 0
+            $s.WarmupFailures.Count | Should -Be 0
+        }
+
+        It 'New-WatchSession latches each mode on before its first event' {
+            # The latches are what the footer renders between poll
+            # boundaries; an unset one would leave `sca monitor` silent
+            # about being engaged until the first rotation.
+            (New-WatchSession -Auto).AutoLatch   | Should -Be $Script:MonitorSteadyLatch
+            (New-WatchSession -Auto).WarmLatch   | Should -BeNullOrEmpty
+            (New-WatchSession -Warmup).WarmLatch | Should -Be '[Warmup] Keeping all slots warm.'
+            (New-WatchSession -Warmup).AutoLatch | Should -BeNullOrEmpty
+
+            $both = New-WatchSession -Auto -Warmup
+            $both.AutoLatch | Should -Not -BeNullOrEmpty
+            $both.WarmLatch | Should -Not -BeNullOrEmpty
+        }
+
+        It 'New-WatchSession hands out independent warmup maps per session' {
+            # Both maps are mutated in place by Invoke-KeepWarmStep; a
+            # shared reference would leak one watch's cooldowns into the
+            # next.
+            $a = New-WatchSession -Warmup
+            $b = New-WatchSession -Warmup
+            $a.WarmupTimes['slot'] = [DateTime]::Now
+            $b.WarmupTimes.Count | Should -Be 0
+        }
+
+        It 'Enter-WatchTerminal survives a host with no attached console' {
+            # THE regression test for the platform bug. Both
+            # [Console]::CursorVisible halves throw here: the getter carries
+            # [SupportedOSPlatform("windows")] and throws
+            # PlatformNotSupportedException on Linux and macOS, and off an
+            # attached console on Windows the getter throws IOException and
+            # the setter SetValueInvocationException. Unguarded, this call
+            # aborted the whole watch engine at startup on two of the three
+            # supported platforms.
+            #
+            # Running under Pester IS the broken condition, on every CI leg,
+            # so the guards are proven by execution rather than by a regex
+            # over the source. docs/architecture.md -> Console APIs.
+            Invoke-WithEnteredWatchTerminal {
+                Param ($term, $enterText)
+                $term | Should -Not -BeNullOrEmpty
+            }
+        }
+
+        It 'Enter-WatchTerminal enters the alt buffer and hides the cursor in one write' {
+            # One write, not two: a caller that sees the alt buffer without
+            # the cursor hide gets a caret blinking inside the table.
+            Invoke-WithEnteredWatchTerminal {
+                Param ($term, $enterText)
+                $enterText | Should -Be "`e[?1049h`e[?25l"
+            }
+        }
+
+        It 'Enter-WatchTerminal reports the alt buffer as entered so the restore fires' {
+            # Exit-WatchTerminal skips the whole restore on a falsy
+            # EnteredAlt, which would strand the user in the alt buffer.
+            Invoke-WithEnteredWatchTerminal {
+                Param ($term, $enterText)
+                $term.EnteredAlt | Should -BeTrue
+            }
+        }
+
+        It 'Enter-WatchTerminal records a failed cursor capture as null, never as a value' {
+            # $null means "no API restore". A defaulted $false would be
+            # written back through the setter on exit and leave the user's
+            # cursor hidden. Under Pester the capture always fails, so this
+            # pins the failure path specifically.
+            Invoke-WithEnteredWatchTerminal {
+                Param ($term, $enterText)
+                $term.Cursor | Should -BeNullOrEmpty
+            }
+        }
+
+        It 'Enter-WatchTerminal forces UTF-8 and Exit-WatchTerminal puts the old encoding back' {
+            # The frame is painted through [Console]::Out.Write, which
+            # encodes via OutputEncoding; on a legacy OEM codepage the bar,
+            # play and ellipsis glyphs become '?'. The restore matters just
+            # as much: the watch must not leak UTF-8 into the user's shell.
+            $before  = [Console]::OutputEncoding
+            $origOut = [Console]::Out
+            $sw      = [System.IO.StringWriter]::new()
+            $term    = $null
+            $during  = $null
+            try {
+                [Console]::SetOut($sw)
+                $term   = Enter-WatchTerminal
+                $during = [Console]::OutputEncoding
+            } finally {
+                if ($term) { Exit-WatchTerminal -State $term }
+                [Console]::SetOut($origOut)
+            }
+            $during.CodePage | Should -Be ([System.Text.UTF8Encoding]::new($false).CodePage)
+            [Console]::OutputEncoding.CodePage | Should -Be $before.CodePage
+        }
+    }
+
+    Context 'Invoke-WatchPoll' {
+        # The poll step is the only extracted watch unit that touches
+        # credentials, and until it came out of the loop none of it was
+        # reachable by a test: the loop around it never terminates. Every
+        # collaborator is mocked, so these drive the step's own decisions
+        # (what it stores, what it swallows, what it skips, in what order)
+        # and nothing else.
+
+        BeforeEach {
+            Mock Invoke-Reconcile        -MockWith { [pscustomobject]@{ Captured = $true } }
+            Mock Write-VTSequence        -MockWith { }
+            Mock Format-WatchTitle       -MockWith { 'title' }
+            Mock Invoke-AutoRotationStep -MockWith { '[Monitor] rotated' }
+            Mock Invoke-KeepWarmStep     -MockWith { '[Warmup] re-warmed' }
+            Mock Get-UsageSnapshot       -MockWith { [pscustomobject]@{ Results = @(); NoSlots = $false } }
+        }
+
+        It 'stores the fresh snapshot and clears a stale poll error' {
+            $s = New-WatchSession
+            $s.LastPollError = 'previous failure'
+            Invoke-WatchPoll -Session $s -Name '' -Threshold 95
+            $s.Snapshot      | Should -Not -BeNullOrEmpty
+            $s.LastPollError | Should -BeNullOrEmpty
+        }
+
+        It 'parks the failure on the session and keeps the previous snapshot on screen' {
+            # The watch must never blank on a transport error; the previous
+            # table stays up and the message reaches the footer instead.
+            Mock Get-UsageSnapshot -MockWith { throw 'socket closed' }
+            $s = New-WatchSession
+            $stale = [pscustomobject]@{ Results = @(); NoSlots = $false }
+            $s.Snapshot = $stale
+
+            { Invoke-WatchPoll -Session $s -Name '' -Threshold 95 } | Should -Not -Throw
+            $s.Snapshot      | Should -Be $stale
+            $s.LastPollError | Should -Be 'socket closed'
+        }
+
+        It 'leaves the terminal title alone when the poll failed' {
+            # Title and body must move together; a title updated off a poll
+            # that produced no data would disagree with the table under it.
+            Mock Get-UsageSnapshot -MockWith { throw 'nope' }
+            Invoke-WatchPoll -Session (New-WatchSession) -Name '' -Threshold 95
+            Should -Invoke Format-WatchTitle -Times 0 -Exactly
+        }
+
+        It 'stamps the last-poll time after the work, not before it' {
+            # Behavioural counterpart to the AST guard: a stamp taken before
+            # the request pre-credits the interval with the poll's own
+            # duration, so a poll slower than -Interval makes the next
+            # iteration due immediately and the loop hammers the limiter.
+            Mock Get-UsageSnapshot -MockWith {
+                Start-Sleep -Milliseconds 300
+                [pscustomobject]@{ Results = @(); NoSlots = $false }
+            }
+            $s = New-WatchSession
+            $before = [DateTime]::Now
+            Invoke-WatchPoll -Session $s -Name '' -Threshold 95
+            ($s.LastPoll - $before).TotalMilliseconds | Should -BeGreaterThan 250
+        }
+
+        It 'stamps the last-poll time even when the poll threw' {
+            # Otherwise a failing endpoint would leave LastPoll at MinValue
+            # and the loop would retry with no delay at all.
+            Mock Get-UsageSnapshot -MockWith { throw 'nope' }
+            $s = New-WatchSession
+            Invoke-WatchPoll -Session $s -Name '' -Threshold 95
+            $s.LastPoll | Should -BeGreaterThan ([DateTime]::MinValue)
+        }
+
+        It 'rotates only under -Auto, and latches the verdict' {
+            $plain = New-WatchSession
+            Invoke-WatchPoll -Session $plain -Name '' -Threshold 95
+            Should -Invoke Invoke-AutoRotationStep -Times 0 -Exactly
+            $plain.AutoLatch | Should -BeNullOrEmpty
+
+            $auto = New-WatchSession -Auto
+            Invoke-WatchPoll -Session $auto -Name '' -Threshold 95 -Auto
+            Should -Invoke Invoke-AutoRotationStep -Times 1 -Exactly
+            $auto.AutoLatch | Should -Be '[Monitor] rotated'
+        }
+
+        It 'keeps slots warm only under -Warmup, and latches the outcome' {
+            $plain = New-WatchSession
+            Invoke-WatchPoll -Session $plain -Name '' -Threshold 95
+            Should -Invoke Invoke-KeepWarmStep -Times 0 -Exactly
+
+            $warm = New-WatchSession -Warmup
+            Invoke-WatchPoll -Session $warm -Name '' -Threshold 95 -Warmup
+            Should -Invoke Invoke-KeepWarmStep -Times 1 -Exactly
+            $warm.WarmLatch | Should -Be '[Warmup] re-warmed'
+        }
+
+        It 'runs keep-warm after auto-rotation' {
+            # Order is load-bearing: Invoke-WarmAllSlots restores whichever
+            # slot was active when it started, so warming before a rotation
+            # would undo the rotation.
+            $order = [System.Collections.Generic.List[string]]::new()
+            Mock Invoke-AutoRotationStep -MockWith { $order.Add('rotate'); 'latch' }
+            Mock Invoke-KeepWarmStep     -MockWith { $order.Add('warm');   'latch' }
+
+            Invoke-WatchPoll -Session (New-WatchSession -Auto -Warmup) -Name '' -Threshold 95 -Auto -Warmup
+            $order -join ',' | Should -Be 'rotate,warm'
+        }
+
+        It 'reconciles before reading any slot bytes' {
+            # A refresh that landed since the last poll must be captured into
+            # the tracked slot before its token is used for the usage call.
+            $order = [System.Collections.Generic.List[string]]::new()
+            Mock Invoke-Reconcile  -MockWith { $order.Add('reconcile'); [pscustomobject]@{ Captured = $true } }
+            Mock Get-UsageSnapshot -MockWith { $order.Add('snapshot'); [pscustomobject]@{ Results = @(); NoSlots = $false } }
+
+            Invoke-WatchPoll -Session (New-WatchSession) -Name '' -Threshold 95
+            $order -join ',' | Should -Be 'reconcile,snapshot'
+        }
+
+        It 'passes -Aggregate to the title only under -Auto' {
+            # Under rotation the active slot moves under the user, so the
+            # title switches to the pool mean; bare -Watch keeps the
+            # per-slot alarm glance.
+            Invoke-WatchPoll -Session (New-WatchSession) -Name '' -Threshold 95
+            Should -Invoke Format-WatchTitle -Times 1 -Exactly -ParameterFilter { -not $Aggregate }
+
+            Invoke-WatchPoll -Session (New-WatchSession -Auto) -Name '' -Threshold 95 -Auto
+            Should -Invoke Format-WatchTitle -Times 1 -Exactly -ParameterFilter { $Aggregate }
+        }
+    }
+
+    Context 'Format-WatchFooter' {
+        # Pure, and previously unreachable: every branch lived inline in the
+        # watch loop, so none of the four was exercised by anything.
+
+        It 'orders mode state above transport detail' {
+            # The mode lines lead so the user's eye finds them first; poll
+            # timestamp and failure tail follow underneath.
+            Format-WatchFooter -AutoLatch '[Monitor] on' -WarmLatch '[Warmup] on' `
+                               -LastPoll ([DateTime]::new(2026, 1, 2, 13, 4, 5)) |
+                Should -Be "[Monitor] on`n[Warmup] on`n[Watch] Last poll at 13:04:05"
+        }
+
+        It 'renders the startup shape as the latches alone' {
+            # The -Warmup startup pass has not polled yet, so a "Last poll
+            # at ..." line would be a lie. Omitting -LastPoll is how a
+            # caller says so.
+            Format-WatchFooter -AutoLatch '[Monitor] on' -WarmLatch '[Warmup] on' |
+                Should -Be "[Monitor] on`n[Warmup] on"
+        }
+
+        It 'drops the latches it was not given' {
+            Format-WatchFooter -LastPoll ([DateTime]::new(2026, 1, 2, 13, 4, 5)) |
+                Should -Be '[Watch] Last poll at 13:04:05'
+            Format-WatchFooter -WarmLatch '[Warmup] on' -LastPoll ([DateTime]::new(2026, 1, 2, 13, 4, 5)) |
+                Should -Be "[Warmup] on`n[Watch] Last poll at 13:04:05"
+        }
+
+        It 'appends the failure tail under the poll line' {
+            $out = Format-WatchFooter -LastPoll ([DateTime]::new(2026, 1, 2, 13, 4, 5)) `
+                                      -LastPollError 'socket closed'
+            $out | Should -Be (
+                "[Watch] Last poll at 13:04:05`n" +
+                '[Watch] Last poll failed: socket closed (keeping previous data; will retry on next tick)')
+        }
+
+        It 'collapses a multi-line failure onto one footer line' {
+            # Format-UsageFooter splits the footer on newlines and prefixes
+            # nothing, so an uncollapsed socket exception would fork one
+            # entry into several stray lines.
+            $out = Format-WatchFooter -LastPoll ([DateTime]::new(2026, 1, 2, 13, 4, 5)) `
+                                      -LastPollError "one`ntwo`n  three"
+            @($out -split "`n").Count | Should -Be 2
+            $out | Should -Match 'one two three'
+        }
+
+        It 'suppresses the failure tail when there has been no poll' {
+            # The tail is meaningless without the poll line it hangs from,
+            # and the startup pass never sets an error anyway.
+            Format-WatchFooter -WarmLatch '[Warmup] on' -LastPollError 'ignored' |
+                Should -Be '[Warmup] on'
+        }
+
+        It 'returns an empty string when there is nothing to report' {
+            Format-WatchFooter | Should -Be ''
+        }
+    }
+
+    Context 'Write-WatchFrame' {
+        # The single paint site. Both callers (the polling loop and the
+        # -Warmup startup repaint) go through it, so the DEC envelope and
+        # the no-clear guarantee have one home instead of two copies.
+
+        It 'wraps the frame in the DEC 2026 sync envelope' {
+            $out = Get-CapturedConsoleOut { Write-WatchFrame { Write-Host 'row' } }
+            $out.StartsWith("`e[?2026h") | Should -BeTrue
+            $out.EndsWith("`e[?2026l")   | Should -BeTrue
+        }
+
+        It 'homes the cursor and never full-clears' {
+            # The whole point of the in-place repaint: an ESC[2J here brings
+            # back the black -> row-by-row flash on any terminal that lacks
+            # DEC 2026 or is too loaded to honour it.
+            $out = Get-CapturedConsoleOut { Write-WatchFrame { Write-Host 'row' } }
+            $out | Should -Match ([regex]::Escape("`e[H"))
+            $out.Contains("`e[2J") | Should -BeFalse
+        }
+
+        It 'paints the frame in a single write' {
+            # A frame split across writes can be interrupted by a render
+            # tick mid-paint, which is exactly what the envelope exists to
+            # prevent.
+            Mock Write-VTSequence -MockWith { }
+            Write-WatchFrame { Write-Host 'row' }
+            Should -Invoke Write-VTSequence -Times 1 -Exactly
+        }
+
+        It 'renders the caller block into the payload' {
+            $out = Get-CapturedConsoleOut { Write-WatchFrame { Write-Host 'hello'; Write-Host 'world' } }
+            $out | Should -Match 'hello'
+            $out | Should -Match 'world'
+        }
+    }
+
+    Context 'Invoke-WatchStartupWarm' {
+        # The -Warmup startup pass, previously inline in the watch loop and
+        # so unreachable. Invoke-WarmAllSlots is mocked throughout: the real
+        # one spawns `claude -p` per slot and is billable.
+
+        BeforeEach {
+            Mock Invoke-Reconcile  -MockWith { [pscustomobject]@{ Captured = $true } }
+            Mock Write-VTSequence  -MockWith { }
+            Mock Format-WatchTitle -MockWith { 'title' }
+            Mock Invoke-WarmAllSlots -MockWith {
+                [pscustomobject]@{
+                    Results = @(
+                        [pscustomobject]@{ Name = 'alpha' }
+                        [pscustomobject]@{ Name = 'beta' }
+                    )
+                    NoSlots        = $false
+                    HasRateLimited = $false
+                }
+            }
+        }
+
+        It 'refuses to warm on top of credentials nothing captured' {
+            # The round-robin overwrites .credentials.json once per slot, so
+            # running it over uncaptured bytes would destroy them.
+            Mock Invoke-Reconcile -MockWith { [pscustomobject]@{ Captured = $false } }
+            { Invoke-WatchStartupWarm -Session (New-WatchSession -Warmup) -Interval 300 -Threshold 95 } |
+                Should -Throw
+            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+        }
+
+        It 'stamps the last-poll time so the loop redraws instead of re-polling' {
+            # The pass already produced a frame; leaving LastPoll at MinValue
+            # would make the loop's first iteration fire a second full poll
+            # immediately.
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+            $s.LastPoll | Should -BeGreaterThan ([DateTime]::Now.AddSeconds(-10))
+        }
+
+        It 'seeds the cooldown map with every slot it warmed' {
+            # A slot whose startup verify-read lagged still reports a closed
+            # window; without the seed the first poll would re-warm it
+            # immediately, at a billable ~$0.004 a time.
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+            $s.WarmupTimes.Keys | Sort-Object | Should -Be @('alpha', 'beta')
+        }
+
+        It 'schedules an early repoll when the pass ended rate-limited' {
+            # Otherwise the user stares at dashes for a whole -Interval when
+            # the 429 cooldown is only seconds long.
+            Mock Invoke-WarmAllSlots -MockWith {
+                [pscustomobject]@{
+                    Results        = @([pscustomobject]@{ Name = 'alpha' })
+                    NoSlots        = $false
+                    HasRateLimited = $true
+                }
+            }
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+            # Rewound by (Interval - WarmupRepollDelaySec), so the next poll
+            # is due ~WarmupRepollDelaySec out rather than a full interval.
+            ([DateTime]::Now - $s.LastPoll).TotalSeconds | Should -BeGreaterThan 280
+        }
+
+        It 'leaves the session alone when no slots matched' {
+            # Invoke-WarmAllSlots returns $null rather than an empty
+            # snapshot; stamping LastPoll off that would park the loop on an
+            # empty frame for a full interval.
+            Mock Invoke-WarmAllSlots -MockWith { $null }
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+            $s.LastPoll          | Should -Be ([DateTime]::MinValue)
+            $s.WarmupTimes.Count | Should -Be 0
+            Should -Invoke Format-WatchTitle -Times 0 -Exactly
+        }
+
+        It 'survives a host that refuses the title write' {
+            # RawUI-less hosts throw here; the warm pass has already done its
+            # billable work by then and must not be lost to a cosmetic
+            # failure.
+            Mock Write-VTSequence -MockWith { throw 'no title for you' }
+            $s = New-WatchSession -Warmup
+            { Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95 } | Should -Not -Throw
+            $s.WarmupTimes.Count | Should -Be 2
+        }
+
+        It 'passes the threshold to the header only under -Auto' {
+            # The "switching slot at N%" indicator is auto-rotation state; a
+            # bare warm pass has nothing to announce.
+            Mock Invoke-WarmAllSlots -MockWith {
+                # Drive the repaint so the header argument is actually built.
+                & $Repaint ([pscustomobject]@{ Results = @(); NoSlots = $true; HasRateLimited = $false })
+                $null
+            }
+            Mock Format-UsageFrame -MockWith { }
+
+            Invoke-WatchStartupWarm -Session (New-WatchSession -Warmup) -Interval 300 -Threshold 95
+            Should -Invoke Format-UsageFrame -Times 1 -Exactly -ParameterFilter { $AutoThreshold -eq 0 }
+
+            Invoke-WatchStartupWarm -Session (New-WatchSession -Auto -Warmup) -Interval 300 -Threshold 95 -Auto
+            Should -Invoke Format-UsageFrame -Times 1 -Exactly -ParameterFilter { $AutoThreshold -eq 95 }
+        }
+    }
+
+    Context 'Invoke-UsageWatch loop' {
+        # The assembly, as opposed to the parts. Every piece the loop calls
+        # is tested on its own above; what none of those cover is whether
+        # the loop wires them together -- and until Test-WatchInteractive
+        # existed nothing could reach the loop at all, because a test host
+        # is by definition the case its guard refuses.
+        #
+        # Enter-WatchTerminal and Exit-WatchTerminal run for real, so this
+        # also proves the try/finally restores the terminal. The renderers
+        # run for real too; only the boundary is stubbed.
+
+        BeforeEach {
+            $script:watchTicks = 0
+            $script:tickBudget = 2
+
+            Mock Test-WatchInteractive -MockWith { $true }
+
+            # The loop is `while ($true)` with no exit. Start-Sleep is the
+            # one call every tick makes regardless of branch, so it doubles
+            # as the tick counter and the way out. The sentinel unwinds
+            # through the real try/finally exactly as an unexpected failure
+            # would, which is what makes the restore assertions meaningful.
+            Mock Start-Sleep -MockWith {
+                $script:watchTicks++
+                if ($script:watchTicks -ge $script:tickBudget) { throw 'watch-loop-stop' }
+            }
+
+            Mock Invoke-WatchPoll -MockWith {
+                $Session.Snapshot = [pscustomobject]@{
+                    NoSlots = $false
+                    Results = @(
+                        [pscustomobject]@{
+                            Name     = 'alpha'
+                            Status   = 'ok'
+                            IsActive = $true
+                            Email    = $null
+                            Data     = [pscustomobject]@{
+                                five_hour = [pscustomobject]@{ utilization = 10 }
+                                seven_day = [pscustomobject]@{ utilization = 20 }
+                            }
+                            Error            = $null
+                            IsCachedFallback = $false
+                        }
+                    )
+                }
+                $Session.LastPoll = [DateTime]::Now
+            }
+
+            # Swallow only our own sentinel; a real failure still fails the
+            # test rather than being mistaken for the loop bound.
+            function script:Invoke-BoundedWatch {
+                Param ([hashtable] $WatchArgs = @{})
+
+                Get-CapturedConsoleOut {
+                    try { Invoke-UsageWatch @WatchArgs }
+                    catch { if ($_.Exception.Message -ne 'watch-loop-stop') { throw } }
+                }
+            }
+        }
+
+        It 'refuses to start when stdout is not a terminal' {
+            # Proves the seam is load-bearing and not merely present: with
+            # the probe reporting a pipe, the loop never runs.
+            Mock Test-WatchInteractive -MockWith { $false }
+            { Invoke-UsageWatch } | Should -Throw -ExpectedMessage '*requires an interactive terminal*'
+            Should -Invoke Invoke-WatchPoll -Times 0 -Exactly
+        }
+
+        It 'enters the alt buffer once and leaves it once' {
+            # Entering twice would nest the buffer and lose the user's
+            # scrollback; leaving zero times would strand them in it.
+            $out = Invoke-BoundedWatch
+            ([regex]::Matches($out, [regex]::Escape("`e[?1049h"))).Count | Should -Be 1
+            ([regex]::Matches($out, [regex]::Escape("`e[?1049l"))).Count | Should -Be 1
+        }
+
+        It 'restores the cursor and leaves the alt buffer last, even when the body throws' {
+            # The sentinel is an unexpected failure as far as the loop is
+            # concerned, so this is the finally doing its job.
+            $out = Invoke-BoundedWatch
+            $out.EndsWith("`e[?25h`e[?1049l") | Should -BeTrue
+        }
+
+        It 'paints one frame per tick' {
+            $script:tickBudget = 3
+            $out = Invoke-BoundedWatch
+            ([regex]::Matches($out, [regex]::Escape("`e[?2026h"))).Count | Should -Be 3
+        }
+
+        It 'polls on the first tick and not again inside the interval' {
+            # The redraw cadence is 1 s and the poll cadence is -Interval;
+            # conflating them would hammer the unofficial endpoint once a
+            # second.
+            $script:tickBudget = 3
+            Invoke-BoundedWatch | Out-Null
+            Should -Invoke Invoke-WatchPoll -Times 1 -Exactly
+        }
+
+        It 'polls every tick while no snapshot has arrived yet' {
+            # The other half of the gate: with nothing on screen the loop
+            # must keep trying rather than wait out an interval.
+            Mock Invoke-WatchPoll -MockWith { }
+            $script:tickBudget = 3
+            Invoke-BoundedWatch | Out-Null
+            Should -Invoke Invoke-WatchPoll -Times 3 -Exactly
+        }
+
+        It 'shows the waiting advisory until the first poll succeeds' {
+            Mock Invoke-WatchPoll -MockWith { }
+            Invoke-BoundedWatch | Should -Match 'Waiting for first successful'
+        }
+
+        It 'renders the table once a snapshot exists' {
+            $out = Invoke-BoundedWatch
+            $out | Should -Match 'alpha'
+            $out | Should -Not -Match 'Waiting for first successful'
+        }
+
+        It 'carries the mode latch through the footer into the frame' {
+            # Proves Format-WatchFooter's output actually reaches
+            # Format-UsageFrame; the two were wired by hand in the loop.
+            Invoke-BoundedWatch -WatchArgs @{ Auto = $true } |
+                Should -Match ([regex]::Escape($Script:MonitorSteadyLatch))
+        }
+
+        It 'clamps an interval below the minimum and says so' {
+            $msg = & {
+                Invoke-BoundedWatch -WatchArgs @{ Interval = 1 } | Out-Null
+            } 6>&1 | Out-String
+            $msg | Should -Match 'clamping to 60s'
         }
     }
 
@@ -1231,39 +1974,44 @@ Describe 'switch_claude_account' {
             $text | Should -Be "leaked`nB`n"
         }
 
-        It 'Invoke-UsageWatch never full-clears the screen (no ESC[2J literal)' {
+        It 'the watch family never full-clears the screen (no ESC[2J literal)' {
             # AST guard for the flicker fix: a future edit that reintroduces
             # a clear-then-redraw fails here. Prose mentions of "ESC[2J" use
             # the spelled-out form, so the backtick-e literal match ignores
             # them.
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-                $script:ScriptPath, [ref]$null, [ref]$null)
-            $func = $ast.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                $n.Name -eq 'Invoke-UsageWatch'
-            }, $true) | Select-Object -First 1
-            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
-            $func.Extent.Text | Should -Not -Match '`e\[2J' -Because (
-                'the watch repaints in place (home + per-line ESC[K + trailing ' +
-                'ESC[0J); an ESC[2J reintroduces the black -> row-by-row flash.')
+            $funcs = Get-WatchFamilyAst -Path $script:ScriptPath
+
+            # Positive half first, for the same reason as the Write-VTSequence
+            # guard above: "contains no ESC[2J" is vacuously true of a family
+            # that no longer paints frames at all.
+            $paints = @(
+                $funcs | ForEach-Object {
+                    $_.FindAll({
+                        param($n)
+                        $n -is [System.Management.Automation.Language.CommandAst]
+                    }, $true)
+                } | Where-Object { $_.GetCommandName() -eq 'ConvertTo-WatchFrameSequence' }
+            )
+            $paints.Count | Should -BeGreaterOrEqual 1 -Because (
+                'the in-place repaint is what this test guards; if no family ' +
+                'member builds a frame sequence, the ESC[2J assertion below ' +
+                'is vacuous and the real paint site is unguarded')
+
+            foreach ($f in $funcs) {
+                $f.Extent.Text | Should -Not -Match '`e\[2J' -Because (
+                    'the watch repaints in place (home + per-line ESC[K + trailing ' +
+                    'ESC[0J); an ESC[2J reintroduces the black -> row-by-row flash.')
+            }
         }
 
-        It 'Invoke-UsageWatch forces UTF-8 console output encoding and restores it (glyph regression)' {
+        It 'the watch family forces UTF-8 console output encoding and restores it (glyph regression)' {
             # Regression guard: the frame body is painted via [Console]::Out
             # .Write, which encodes through [Console]::OutputEncoding. On a
             # legacy OEM codepage (e.g. CP850) the bar / play / ellipsis
             # glyphs become '?'. The watch must force UTF-8 and restore the
             # original on exit.
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-                $script:ScriptPath, [ref]$null, [ref]$null)
-            $func = $ast.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                $n.Name -eq 'Invoke-UsageWatch'
-            }, $true) | Select-Object -First 1
-            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
-            $body = $func.Extent.Text
+            $funcs = Get-WatchFamilyAst -Path $script:ScriptPath
+            $body  = ($funcs | ForEach-Object { $_.Extent.Text }) -join "`n"
             $body | Should -Match 'OutputEncoding\s*=\s*\[System\.Text\.UTF8Encoding\]' -Because (
                 'frame glyphs degrade to "?" unless [Console]::Out writes UTF-8')
             $body | Should -Match '\$origEncoding' -Because (
@@ -1488,7 +2236,7 @@ Describe 'switch_claude_account' {
             # Hard-failure statuses. Keyed on the raw Status value, because
             # Format-UsageAdvisory's reason lines are where these remedies
             # render now that the Status column carries only a bare label.
-            @{ Case = 'expired';           Label = 'expired';           Expected = 'token refresh failed; run sca switch to refresh' }
+            @{ Case = 'expired';           Label = 'expired';           Expected = 'token refresh failed; run sca switch, then /login if it persists' }
             @{ Case = 'unauthorized';      Label = 'unauthorized';      Expected = 'token revoked; run sca switch then /login' }
             @{ Case = 'no-oauth';          Label = 'no-oauth';          Expected = 'api key or non-claude.ai slot' }
         ) {
@@ -1547,15 +2295,22 @@ Describe 'switch_claude_account' {
                     [string] $Name,
                     [string] $Status = 'rate-limited',
                     [bool]   $Cached = $false,
-                    [string] $Reason = 'rate-limit'
+                    [string] $Reason = 'rate-limit',
+                    # A throttled row that HAS numbers was read successfully at
+                    # some point, which is what separates the "rate-limited or
+                    # at a plan limit" condition from the unverified one.
+                    [switch] $WithData
                 )
                 $fallbackReason = if ($Cached) { $Reason } else { $null }
+                $data = if ($WithData) {
+                    [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 12.0 }; seven_day = $null }
+                } else { $null }
                 [pscustomobject]@{
                     Name             = $Name
                     Status           = $Status
                     IsCachedFallback = $Cached
                     FallbackReason   = $fallbackReason
-                    Data             = $null
+                    Data             = $data
                     Error            = $null
                     Email            = $null
                     IsActive         = $false
@@ -1578,22 +2333,33 @@ Describe 'switch_claude_account' {
         }
 
         It 'no-cache, one slot: names it with "is" and no last-known clause' {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'))
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -WithData))
             Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'slot-1' is currently rate-limited or at a plan limit."
         }
 
         It 'no-cache, multiple slots: names them with "are"' {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'), (New-RlRow -Name 'slot-3'))
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -WithData), (New-RlRow -Name 'slot-3' -WithData))
             Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'slot-1', 'slot-3' are currently rate-limited or at a plan limit."
         }
 
         It 'no-cache, >3 slots: collapses to "and N more" with plural verb' {
-            $rows = @('a','b','c','d') | ForEach-Object { New-RlRow -Name $_ }
+            $rows = @('a','b','c','d') | ForEach-Object { New-RlRow -Name $_ -WithData }
             $snap = New-RlSnapshot -Results $rows
             Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'a', 'b', 'c' and 1 more are currently rate-limited or at a plan limit."
+        }
+
+        # sca's own token request can be refused before the server looks at the
+        # grant, so a throttled row it has never read could equally be a revoked
+        # login. Claiming the former sent the user off to wait out something
+        # that never clears.
+        It 'throttled row it has never read: names the check instead of guessing' {
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'))
+            $out  = Format-UsageAdvisory -Snapshot $snap
+            $out | Should -Be "[Usage] 'slot-1' could not be read, and sca cannot tell a throttle from an expired login; run 'sca warmup <slot>' to check."
+            $out | Should -Not -Match 'currently rate-limited or at a plan limit'
         }
 
         It 'cache branch: names the cached slot and adds the last-known clause' {
@@ -1689,7 +2455,7 @@ Describe 'switch_claude_account' {
         }
 
         It 'falls back to the canned remedy for a hard failure with no message: <Case>' -ForEach @(
-            @{ Case = 'expired';      Status = 'expired';      Expected = 'token refresh failed; run sca switch to refresh' }
+            @{ Case = 'expired';      Status = 'expired';      Expected = 'token refresh failed; run sca switch, then /login if it persists' }
             @{ Case = 'unauthorized'; Status = 'unauthorized'; Expected = 'token revoked; run sca switch then /login' }
             @{ Case = 'no-oauth';     Status = 'no-oauth';     Expected = 'api key or non-claude.ai slot' }
         ) {
@@ -1720,12 +2486,12 @@ Describe 'switch_claude_account' {
             $lines.Count | Should -Be 2
             # Fixed worst-first status order, matching the condition lines
             # above, rather than whichever status the caller listed first.
-            $lines[0] | Should -Be "[Usage] 'b': token refresh failed; run sca switch to refresh"
+            $lines[0] | Should -Be "[Usage] 'b': token refresh failed; run sca switch, then /login if it persists"
             $lines[1] | Should -Be "[Usage] 'a', 'c': api key or non-claude.ai slot"
         }
 
         It 'stays silent for a rate-limited row with no message (the condition line already says it)' {
-            $snap  = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'))
+            $snap  = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -WithData))
             $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
             $lines.Count | Should -Be 1
             $lines[0]    | Should -Match 'currently rate-limited or at a plan limit'
@@ -1828,7 +2594,7 @@ Describe 'switch_claude_account' {
             # 1 condition line + 1 grouped remedy + 3 capped messages.
             $lines.Count | Should -Be 5
             @($lines | Where-Object { $_ -match 'z-expired' }).Count | Should -Be 1
-            $lines[1] | Should -Be "[Usage] 'z-expired': token refresh failed; run sca switch to refresh"
+            $lines[1] | Should -Be "[Usage] 'z-expired': token refresh failed; run sca switch, then /login if it persists"
         }
 
         It 'prefers the message over the remedy when the slot fits inside the cap' {
@@ -1868,12 +2634,13 @@ Describe 'switch_claude_account' {
         # $Script:AdvisoryReasonMaxWidth, is enough to push the table off a
         # 24-row screen on its own.
         It 'never exceeds AdvisoryMaxLines, and drops only per-slot detail' {
-            # Four distinct conditions (one slot each) so every condition line
+            # Five distinct conditions (one slot each) so every condition line
             # fires, plus three hard-failure statuses for three remedies, plus
             # enough messages to overflow.
             $rows = @()
             $e = New-RlRow -Name 'bare-err' -Status 'error';        $e.Error = 'boom bare-err';   $rows += $e
-            $l = New-RlRow -Name 'bare-lim' -Status 'rate-limited'; $rows += $l
+            $l = New-RlRow -Name 'bare-lim' -Status 'rate-limited' -WithData; $rows += $l
+            $u = New-RlRow -Name 'unverif'  -Status 'rate-limited'; $rows += $u
             $n = New-RlRow -Name 'cach-net' -Status 'error';        $n.Error = 'boom cach-net'
             $n.IsCachedFallback = $true; $n.FallbackReason = 'network';  $rows += $n
             $c = New-RlRow -Name 'cach-lim' -Status 'rate-limited'
@@ -1886,13 +2653,14 @@ Describe 'switch_claude_account' {
 
             $lines.Count | Should -BeLessOrEqual $Script:AdvisoryMaxLines
 
-            # Coverage survives the cap: all four condition lines and all three
+            # Coverage survives the cap: all five condition lines and all three
             # remedies are present, so no failing slot goes unmentioned.
             @($lines | Where-Object { $_ -match 'could not be read; usage unknown' }).Count      | Should -Be 1
             @($lines | Where-Object { $_ -match 'currently rate-limited or at a plan limit\.' }).Count | Should -Be 1
+            @($lines | Where-Object { $_ -match "run 'sca warmup <slot>' to check" }).Count      | Should -Be 1
             @($lines | Where-Object { $_ -match 'could not be read live; showing last known usage' }).Count | Should -Be 1
             @($lines | Where-Object { $_ -match 'plan limit; showing last known usage' }).Count            | Should -Be 1
-            $lines | Should -Contain "[Usage] 'gone-exp': token refresh failed; run sca switch to refresh"
+            $lines | Should -Contain "[Usage] 'gone-exp': token refresh failed; run sca switch, then /login if it persists"
             $lines | Should -Contain "[Usage] 'gone-401': token revoked; run sca switch then /login"
             $lines | Should -Contain "[Usage] 'gone-key': api key or non-claude.ai slot"
 
@@ -2046,6 +2814,64 @@ Describe 'switch_claude_account' {
         }
     }
 
+    # The contending writer is Claude Code, which holds ~/.claude.json.lock and
+    # merges under it while sca does not, so only sca's side can lose a write.
+    # Driven by mocking the transform and letting the mock move the file
+    # underneath, rather than by mocking Get-Content, which the whole suite
+    # depends on reading real sandbox files.
+    Context 'Set-OAuthAccountInClaudeJson (concurrent ~/.claude.json writes)' {
+        BeforeEach {
+            $script:original = '{"numStartups":1,"oauthAccount":{"emailAddress":"a@b.com"}}'
+            Set-Content -LiteralPath $ClaudeJsonPath -Value $script:original -NoNewline -Encoding utf8NoBOM
+            $script:oa = [pscustomobject]@{ emailAddress = 'c@d.com' }
+            $script:transformCalls = 0
+        }
+
+        It 'restarts the substitution when the file moves under it, then commits' {
+            $script:intruder = '{"numStartups":2,"oauthAccount":{"emailAddress":"a@b.com"}}'
+            Mock ConvertTo-UpdatedClaudeJson {
+                $script:transformCalls++
+                # Only the first pass races: Claude Code lands its own write
+                # while we are transforming the bytes we read.
+                if ($script:transformCalls -eq 1) {
+                    Set-Content -LiteralPath $ClaudeJsonPath -Value $script:intruder -NoNewline -Encoding utf8NoBOM
+                }
+                return 'COMMITTED'
+            }
+
+            Set-OAuthAccountInClaudeJson -OAuthAccount $script:oa
+
+            # Two passes: the first is discarded unwritten, the second sees the
+            # intruder's bytes and commits on top of them.
+            $script:transformCalls | Should -Be 2
+            Get-Content -LiteralPath $ClaudeJsonPath -Raw | Should -Be 'COMMITTED'
+        }
+
+        It 'gives up rather than overwrite a writer that keeps winning' {
+            Mock ConvertTo-UpdatedClaudeJson {
+                $script:transformCalls++
+                # A new value every pass, so the verify read never matches.
+                Set-Content -LiteralPath $ClaudeJsonPath -Value "intruder-$script:transformCalls" -NoNewline -Encoding utf8NoBOM
+                return 'COMMITTED'
+            }
+
+            { Set-OAuthAccountInClaudeJson -OAuthAccount $script:oa } |
+                Should -Throw -ExpectedMessage '*changed under all 3 attempts*'
+
+            $script:transformCalls | Should -Be 3
+            # The contending writer's bytes survive; ours are not forced on top.
+            Get-Content -LiteralPath $ClaudeJsonPath -Raw | Should -Be 'intruder-3'
+        }
+
+        It 'writes nothing when no whitelisted field actually changes' {
+            Mock ConvertTo-UpdatedClaudeJson { return $null }
+
+            Set-OAuthAccountInClaudeJson -OAuthAccount $script:oa
+
+            Get-Content -LiteralPath $ClaudeJsonPath -Raw | Should -Be $script:original
+        }
+    }
+
     Context 'Get-NextSlotName (single-slot active no-op)' {
         It "prints the 'Only one slot' advisory and returns null when one active slot exists" {
             $credDir = Join-Path $script:SandboxHome '.claude'
@@ -2086,6 +2912,63 @@ Describe 'switch_claude_account' {
 
             { Update-SlotTokens -SlotPath $slot } |
                 Should -Throw -ExpectedMessage '*no OAuth material to refresh*'
+        }
+
+        # The client always sends `scope` on a refresh:
+        #   {grant_type, refresh_token, client_id, scope: w.join(" ")}
+        # (claude.exe 2.1.278). Omitting it was a silent divergence from the
+        # one request shape this unofficial endpoint is known to accept.
+        It 'sends the slot own scopes as a space-joined scope field' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $slot = Join-Path $credDir '.credentials.scoped.json'
+            $payload = @{
+                claudeAiOauth = @{
+                    accessToken  = 'old'
+                    refreshToken = 'rt'
+                    expiresAt    = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+                    scopes       = @('user:inference', 'user:profile')
+                }
+            } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            $script:sentBody = $null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:sentBody = $Body
+                return [pscustomobject]@{ access_token = 'new'; expires_in = 3600 }
+            }
+
+            Update-SlotTokens -SlotPath $slot | Out-Null
+
+            $parsed = $script:sentBody | ConvertFrom-Json
+            $parsed.grant_type | Should -Be 'refresh_token'
+            $parsed.scope      | Should -Be 'user:inference user:profile'
+        }
+
+        It 'omits scope entirely when the slot records none' {
+            # The client substitutes a default list there; guessing it would be
+            # inventing a value this script cannot verify.
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $slot = Join-Path $credDir '.credentials.unscoped.json'
+            $payload = @{
+                claudeAiOauth = @{
+                    accessToken  = 'old'
+                    refreshToken = 'rt'
+                    expiresAt    = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+                }
+            } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            $script:sentBody2 = $null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:sentBody2 = $Body
+                return [pscustomobject]@{ access_token = 'new'; expires_in = 3600 }
+            }
+
+            Update-SlotTokens -SlotPath $slot | Out-Null
+
+            ($script:sentBody2 | ConvertFrom-Json).PSObject.Properties.Name | Should -Not -Contain 'scope'
         }
 
         It 'throws when refresh response is missing access_token' {
@@ -2282,6 +3165,102 @@ Describe 'switch_claude_account' {
 
             # No retry for non-429 (avoids hammering a deterministic 4xx).
             $script:attempts | Should -Be 1
+        }
+
+        # The ladder assumes a per-token limiter that unlocks in seconds. The
+        # 429s measured on 2026-09-19 come from Cloudflare's edge and are keyed
+        # to the origin, so once one slot has drawn one, attempts 2 and 3 for
+        # every later slot in the same run are pure tally against the address.
+        It 'collapses to a single attempt once another slot holds a live backoff stamp' {
+            $Script:SlotUsageCache['X:\another-slot.json'] = @{
+                Data             = $null
+                Timestamp        = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+            $script:attempts = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:attempts++
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('429 Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            # Still surfaces the real 429 rather than falling out of the loop
+            # with $resp unset and reporting a bogus 'missing access_token'.
+            { Update-SlotTokens -SlotPath $script:slot 6>$null } |
+                Should -Throw -ExpectedMessage '*429*'
+
+            $script:attempts | Should -Be 1
+        }
+
+        It 'uses the full ladder again once the other slot stamp has expired' {
+            $Script:SlotUsageCache['X:\another-slot.json'] = @{
+                Data             = $null
+                Timestamp        = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(-1)   # expired
+            }
+            $script:attempts = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:attempts++
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('429 Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            { Update-SlotTokens -SlotPath $script:slot 6>$null } | Should -Throw
+
+            $script:attempts | Should -Be $Script:TokenRefreshRetryMax
+        }
+
+        It 'still collapses when the live stamp belongs to the slot being refreshed' {
+            # Reachable on a watch tick whose backoff expired between the
+            # short-circuit check and this refresh.
+            $Script:SlotUsageCache[$script:slot] = @{
+                Data             = $null
+                Timestamp        = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+            $script:attempts = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:attempts++
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('429 Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            { Update-SlotTokens -SlotPath $script:slot 6>$null } | Should -Throw
+            $script:attempts | Should -Be 1
+        }
+    }
+
+    Context 'Test-TokenEndpointThrottled' {
+        It 'is false when the cache is empty' {
+            Test-TokenEndpointThrottled | Should -BeFalse
+        }
+
+        It 'is false when entries carry no backoff stamp' {
+            $Script:SlotUsageCache['X:\a.json'] = @{ Data = 'D'; Timestamp = [DateTime]::UtcNow }
+            Test-TokenEndpointThrottled | Should -BeFalse
+        }
+
+        It 'is true while any single entry is inside its window' {
+            $Script:SlotUsageCache['X:\a.json'] = @{ Data = 'D'; Timestamp = [DateTime]::UtcNow }
+            $Script:SlotUsageCache['X:\b.json'] = @{
+                Data = $null; Timestamp = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+            Test-TokenEndpointThrottled | Should -BeTrue
+        }
+
+        It 'is false once every window has passed' {
+            $Script:SlotUsageCache['X:\b.json'] = @{
+                Data = $null; Timestamp = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(-1)
+            }
+            Test-TokenEndpointThrottled | Should -BeFalse
         }
     }
 
@@ -2756,6 +3735,47 @@ Describe 'switch_claude_account' {
                 Should -Throw -ExpectedMessage "*$homeVar*"
             { Assert-CredentialDir -Directory '' } |
                 Should -Throw -ExpectedMessage '*CLAUDE_CONFIG_DIR*'
+        }
+    }
+
+    Context 'Test-SameOAuthAccount' {
+        # Two records of one account can disagree about the email: Claude Code
+        # fills ~/.claude.json's emailAddress from the profile response on one
+        # login path and from the access token's embedded account_email on
+        # another. Both paths agree on the uuid, so the uuid decides wherever
+        # both sides carry one.
+        It 'answers on the uuid when both sides carry one: <Case>' -ForEach @(
+            @{ Case = 'same uuid, same email';  LUuid = 'u1'; LMail = 'a@x'; RUuid = 'u1'; RMail = 'a@x'; Expected = $true }
+            @{ Case = 'same uuid, other email'; LUuid = 'u1'; LMail = 'a@x'; RUuid = 'u1'; RMail = 'b@x'; Expected = $true }
+            @{ Case = 'other uuid, same email'; LUuid = 'u1'; LMail = 'a@x'; RUuid = 'u2'; RMail = 'a@x'; Expected = $false }
+            @{ Case = 'uuid case differs';      LUuid = 'U1'; LMail = 'a@x'; RUuid = 'u1'; RMail = 'b@x'; Expected = $true }
+        ) {
+            $left  = [pscustomobject]@{ accountUuid = $LUuid; emailAddress = $LMail }
+            $right = [pscustomobject]@{ accountUuid = $RUuid; emailAddress = $RMail }
+            Test-SameOAuthAccount -Left $left -Right $right | Should -Be $Expected
+        }
+
+        # Read-Sidecar requires an email but not a uuid, so a sidecar written
+        # before uuid capture has only the email to offer.
+        It 'falls back to the email when either side has no uuid: <Case>' -ForEach @(
+            @{ Case = 'left has none';  LUuid = $null; RUuid = 'u1'; LMail = 'a@x'; RMail = 'a@x'; Expected = $true }
+            @{ Case = 'right has none'; LUuid = 'u1';  RUuid = '';   LMail = 'a@x'; RMail = 'a@x'; Expected = $true }
+            @{ Case = 'neither has';    LUuid = $null; RUuid = $null; LMail = 'a@x'; RMail = 'b@x'; Expected = $false }
+        ) {
+            $left  = [pscustomobject]@{ accountUuid = $LUuid; emailAddress = $LMail }
+            $right = [pscustomobject]@{ accountUuid = $RUuid; emailAddress = $RMail }
+            Test-SameOAuthAccount -Left $left -Right $right | Should -Be $Expected
+        }
+
+        # No evidence is not sameness. Answering $true here would let an empty
+        # record mirror one account's tokens over another's slot, which is the
+        # degeneration Read-Sidecar's email requirement exists to prevent.
+        It 'answers false when a side is absent or carries neither field: <Case>' -ForEach @(
+            @{ Case = 'left null';   Left = $null;                                             Right = [pscustomobject]@{ accountUuid = 'u'; emailAddress = 'a@x' } }
+            @{ Case = 'right null';  Left = [pscustomobject]@{ accountUuid = 'u'; emailAddress = 'a@x' }; Right = $null }
+            @{ Case = 'both empty';  Left = [pscustomobject]@{ accountUuid = ''; emailAddress = '' };     Right = [pscustomobject]@{ accountUuid = ''; emailAddress = '' } }
+        ) {
+            Test-SameOAuthAccount -Left $Left -Right $Right | Should -BeFalse
         }
     }
 

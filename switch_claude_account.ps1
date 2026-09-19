@@ -249,7 +249,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '4.0.0'
+$Script:ScriptVersion = '4.1.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -259,48 +259,23 @@ $MarkerEnd   = "# === End Switch Claude Account ==="
 
 # --- Unofficial Claude Code OAuth-flow constants ---
 #
-# These values power the `usage` action, which replicates the live 5h /
-# 7d rate-limit read that Claude Code's own `/usage` slash command
-# performs. Extracted from claude.exe 2.1.119 (a Bun-compiled binary
-# that embeds the JS source) by string-scanning the file.
+# These power the `usage` action, which replicates the live 5h / 7d rate-limit
+# read Claude Code's own `/usage` performs, and the identity fallback.
 #
-# These endpoints are UNDOCUMENTED and unsupported by Anthropic. Expect
-# them to break when Anthropic bumps the beta flag, rotates the OAuth
-# client id, or reshapes the response body. To re-extract after an
-# upstream change, from a PowerShell 7 prompt:
+# UNDOCUMENTED and unsupported by Anthropic. Expect breakage when Anthropic
+# bumps the beta flag, rotates the client id, or reshapes a response body.
 #
-#   $bin   = (Get-Command claude -ErrorAction Stop).Source
-#   $bytes = [IO.File]::ReadAllBytes($bin)
-#   $text  = [Text.Encoding]::ASCII.GetString($bytes)
-#   # Usage endpoint path:    $text | Select-String '/api/oauth/usage'
-#   # Profile endpoint path:  $text | Select-String '/api/oauth/profile' (function Ql)
-#   # Base API URL + TOKEN_URL + CLIENT_ID: Select-String 'TOKEN_URL:"'
-#   # Beta header value:      Select-String 'lj="oauth-'
-#   # API version header:     Select-String 'anthropic-version'
-#   # UA version convention:  Select-String 'claude-code/\$\{'
-#
-# The client id below is the Claude.ai subscription flow's client id
-# (matches the `user:sessions:claude_code` scope slot files carry); the
-# other client id in the binary (22422756-...) is for the Console API-key
-# flow and does not accept our refresh tokens.
-#
-# GET /api/oauth/usage response body, verified against a live Team-plan call
-# on 2026-04-24. Every branch is optional; free-tier and API-key accounts
-# receive `{}`:
-#
-#   five_hour        { utilization: 0..100, resets_at: <ISO-8601>|null }
-#   seven_day        { utilization: 0..100, resets_at: <ISO-8601>|null }
-#   seven_day_opus   null | { utilization, resets_at }
-#   seven_day_sonnet null | { utilization, resets_at }
-#   extra_usage      { is_enabled, monthly_limit, used_credits,
-#                      utilization, currency }  (all nullable)
-#
-# Plus internal/unreleased buckets that are null for external subscriptions
-# and are NOT rendered in any view (they round-trip only via -Json):
-# seven_day_oauth_apps, seven_day_cowork, seven_day_omelette,
-# iguana_necktie, omelette_promotional. Only five_hour (Session) and
-# seven_day (Week) are rendered, matching Claude Code's own /usage bars.
+# Provenance, the re-extraction recipe, the full response schemas and the
+# client-id disambiguation: docs/claude-code-internals.md -> OAuth flow.
 $Script:UsageEndpoint       = "https://api.anthropic.com/api/oauth/usage"
+# Of the response, only five_hour (Session) and seven_day (Week) are rendered,
+# matching Claude Code's own /usage bars. Every other bucket round-trips to
+# -Json untouched, so no view has to know it exists.
+#
+# The identity guard compares `account.uuid` and never `account.email`, and
+# compares it case-insensitively. Both halves of that rule are load-bearing and
+# neither is obvious; the evidence is in docs/claude-code-internals.md ->
+# Why the identity guard compares uuid and not email.
 $Script:ProfileEndpoint     = "https://api.anthropic.com/api/oauth/profile"
 $Script:TokenEndpoint       = "https://platform.claude.com/v1/oauth/token"
 $Script:OAuthClientId       = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -312,7 +287,11 @@ $Script:AnthropicBeta       = "oauth-2025-04-20"
 # an emergency patch. Pinned to the stable 2023-06-01 API version that
 # Claude Code itself ships with.
 $Script:AnthropicApiVersion = "2023-06-01"
-$Script:UsageUserAgent      = "claude-code/2.1.119"
+# Claiming a client version many releases old is the kind of detail an
+# unofficial-endpoint operator can reasonably fingerprint, and it costs nothing
+# to keep current. Bump whenever the re-extraction recipe is re-run
+# (docs/claude-code-internals.md).
+$Script:UsageUserAgent      = "claude-code/2.1.278"
 # Per-endpoint HTTP budgets. Measured /api/oauth/usage round-trips against
 # a live subscription span 46-2108 ms, so a shared 5 s budget left under
 # 2.4x headroom and a single latency spike collapsed a slot's row to an
@@ -349,45 +328,26 @@ $Script:ProfileTimeoutSec   = 10
 $Script:TokenRefreshRetryMax     = 3
 $Script:TokenRefreshRetryDelayMs = 2000
 
+# Attempts Set-OAuthAccountInClaudeJson makes to land its substitution on bytes
+# that have not moved under it. Three, matching Set-CredentialFileAtomic's
+# rename policy, and for the same reason: a contending writer that is still
+# winning after three tries is not a blip worth waiting out. No delay between
+# them, because the contending write is Claude Code's own atomic rename rather
+# than a lock we could wait on.
+$Script:ClaudeJsonWriteRetryMax  = 3
+
 # --- Where Claude Code actually keeps the active login ---
 #
-# Everything this tool does rests on .credentials.json being the active login,
-# so it is worth recording what that premise is and how it could stop holding.
-# Extracted from claude.exe 2.1.270 with the same string-scan recipe as above.
+# Everything here rests on .credentials.json being the active login. That is an
+# observation about someone else's binary, not a contract: a server-controlled
+# flag can move Windows credentials into the Credential Manager and delete the
+# file, at which point `sca switch` would report success while the previous
+# account stayed authenticated and billing.
 #
-# Claude Code's secureStorage module defines exactly two credential backends:
-#
-#   name:"plaintext"        <CredDir>/.credentials.json, every platform
-#   name:"windows-credman"  Windows Credential Manager, via Bun.secrets
-#
-# There is no macOS Keychain credential backend. The Keychain holds only the
-# device key, under service "Claude Code-device-keys", and the one Keychain
-# API-key path is behind a hardcoded `let s=!1`. macOS reads and writes the
-# same .credentials.json as Linux, which is why `sca` supports it.
-#
-# windows-credman is NOT active by default. It is selected by
-#
-#   $env:CLAUDE_CODE_FORCE_WINDOWS_CREDMAN -eq '1'
-#     -or (.claude.json).cachedGrowthBookFeatures.tengu_windows_credman -eq $true
-#
-# a server-controlled GrowthBook flag, so it can turn on without the user doing
-# anything. When it does, storage becomes credman-primary with plaintext as
-# fallback, and the first successful credman write DELETES .credentials.json.
-# From that point `sca switch` writes a file Claude Code no longer reads: it
-# would report success while the previous account stayed authenticated and
-# billing, which is the exact failure this tool exists to prevent.
-#
-# The credman item is service "Claude Code" + OAUTH_FILE_SUFFIX ("" in
-# production) + "-credentials", suffixed with -<sha256(CLAUDE_CONFIG_DIR)[0..8]>
-# when that variable is set, under account "claude-code-user"; payloads over
-# 2400 bytes are split into base64 chunks named <service>#0..#n with a #m
-# manifest. Reading it back would mean P/Invoking CredRead/CredWrite and
-# reimplementing that chunking, which is not worth building against a flag
-# nobody has been observed to receive.
-#
-# Symptom to watch for: .credentials.json missing or stale on Windows while
-# Claude Code is logged in and `sca switch` silently fails to change /status.
-# Check with `cmdkey /list` for a "Claude Code-credentials" entry.
+# The backends, the flag, the symptom to watch for, and why the Credential
+# Manager path is not implemented: docs/claude-code-internals.md ->
+# Credential storage. .github/workflows/tests.yml re-scans the darwin build for
+# those markers on workflow_dispatch, so the premise is checked, not assumed.
 
 # Per-slot record of the last /api/oauth/usage attempt, keyed by slot path.
 # One structure (not two parallel maps) so the data and the throttle state
@@ -396,7 +356,13 @@ $Script:TokenRefreshRetryDelayMs = 2000
 #   @{ Data; Timestamp; RateLimitedUntil }
 #
 #   Data             last successful response body; the fallback served on a 429.
-#   Timestamp        when Data was captured; fresh < $Script:UsageCacheTTL min.
+#                    $null in a throttle-only entry, which Set-SlotRateLimitBackoff
+#                    creates for a slot that has never read successfully, so the
+#                    backoff covers it too. Readers must treat $null as "nothing
+#                    to serve" rather than as an empty reading: Get-CachedUsageOrNull
+#                    refuses such an entry and Get-SlotUsage drops -CachedReason.
+#   Timestamp        when Data was captured, or when a throttle-only entry was
+#                    created; fresh < $Script:UsageCacheTTL min.
 #   RateLimitedUntil [DateTime] set on every 'rate-limited' return; absent/past
 #                    otherwise. While in the future Get-SlotUsage short-circuits
 #                    to the cache with NO token/usage HTTP, so a sustained 429
@@ -428,6 +394,16 @@ $Script:UsageCacheMaxAgeMin = 360
 # within a poll or two once the throttle likely clears, long enough to break
 # the per-poll refresh storm on an expired idle-slot token. Tunable for tests.
 $Script:RateLimitBackoffSec = 120
+
+# The only conclusions `claude -p` can prove about a grant, and so the only
+# verdicts Set-SlotAuthVerdict records and ConvertTo-AuthVerdictMap accepts off
+# disk. The set is narrow on purpose: Resolve-AuthVerdictResult hands the stored
+# value to New-UsageResult's ValidateSet, so a status written by another version
+# would throw out of a Get-SlotUsage documented never to and take every row of
+# the reading with it, and an 'ok' would pass that set while carrying no Data,
+# scoring 0% in Get-RowMaxUtilization and presenting a slot nothing can be read
+# from as the preferred rotation target.
+$Script:AuthVerdictStatuses = @('expired', 'unauthorized')
 
 # Plan-usability thresholds used by Get-PlanStatus / Format-UsageTable /
 # Format-UsageVerbose. The Status column on the usage table mixes HTTP
@@ -492,10 +468,10 @@ $Script:AdvisoryReasonMaxWidth = 200
 # terminal with five slots that is enough to push the table off screen on its
 # own.
 #
-# Eight is four condition lines plus three remedies plus one, so the two groups
+# Nine is five condition lines plus three remedies plus one, so the two groups
 # that carry coverage always fit and the per-slot reasons spend whatever is
 # left; see Format-UsageAdvisory for why those are the droppable ones.
-$Script:AdvisoryMaxLines = 8
+$Script:AdvisoryMaxLines = 9
 
 # --- Atomic credential-file write primitives ------------------------------
 #
@@ -798,7 +774,7 @@ function Get-CredentialFilePaths {
 }
 
 # True when a mode grants any group or other bit. [UnixFileMode] is a flags
-# enum, so this reads as one test rather than six comparisons; kept separate
+# enum, so this reads as one test rather than a comparison per bit; kept separate
 # from the repair loop below so the rule is checkable on a platform that has no
 # modes to read.
 function Test-UnixModeIsShared {
@@ -868,6 +844,37 @@ function Repair-CredentialFileModes {
 # the loser's changes are silently dropped. Acceptable for an interactive
 # tool that is rarely (and never deliberately) invoked in parallel.
 
+# Normalize the parsed auth_verdicts block into a plain hashtable of
+# slot name -> @{ status; error; cred_hash }. Always returns a hashtable, so
+# every caller can index it without a null check.
+#
+# Entries missing a status or a cred_hash are dropped rather than repaired: a
+# verdict with no cred_hash can never be matched against a slot file, so it
+# would sit in the file forever, and one with no status carries nothing.
+#
+# A status outside $Script:AuthVerdictStatuses is dropped for the same reason,
+# and this is the only place that can drop it: every reader downstream treats
+# the value as already trustworthy. See that constant for what an unfiltered
+# one costs.
+function ConvertTo-AuthVerdictMap {
+    Param ($Parsed)
+
+    $map = @{}
+    if (-not $Parsed) { return $map }
+
+    foreach ($prop in $Parsed.PSObject.Properties) {
+        $v = $prop.Value
+        if (-not $v -or -not $v.status -or -not $v.cred_hash) { continue }
+        if ([string]$v.status -notin $Script:AuthVerdictStatuses) { continue }
+        $map[$prop.Name] = @{
+            status    = [string]$v.status
+            error     = if ($v.error) { [string]$v.error } else { $null }
+            cred_hash = [string]$v.cred_hash
+        }
+    }
+    return $map
+}
+
 # Persist $State to $StateFile via atomic rename. The schema field is
 # enforced to 1 here so callers cannot accidentally write a stale or
 # missing version. last_sync_hash and active_slot may be $null (initial
@@ -882,7 +889,14 @@ function Write-ScaState {
         active_slot    = $State.active_slot
         last_sync_hash = $State.last_sync_hash
     }
-    $json  = $payload | ConvertTo-Json -Compress
+    # Omitted entirely when empty, so a state file for a healthy pool keeps the
+    # shape it has always had and an older script reading it sees nothing new.
+    if ($State.auth_verdicts -and @($State.auth_verdicts.Keys).Count -gt 0) {
+        $payload['auth_verdicts'] = $State.auth_verdicts
+    }
+    # Depth: the verdict map nests one level deeper than ConvertTo-Json's
+    # default of 2, which would otherwise serialize each entry as its type name.
+    $json  = $payload | ConvertTo-Json -Compress -Depth 5
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
 
     Set-CredentialFileAtomic -Path $StateFile -Bytes $bytes
@@ -923,6 +937,7 @@ function Read-ScaState {
                 schema         = [int]$obj.schema
                 active_slot    = if ($obj.active_slot)    { [string]$obj.active_slot }    else { $null }
                 last_sync_hash = if ($obj.last_sync_hash) { [string]$obj.last_sync_hash } else { $null }
+                auth_verdicts  = ConvertTo-AuthVerdictMap -Parsed $obj.auth_verdicts
             }
         }
         catch {
@@ -951,6 +966,7 @@ function Read-ScaState {
                     schema         = 1
                     active_slot    = $parsed.Name
                     last_sync_hash = $activeHash
+                    auth_verdicts  = @{}
                 }
                 # Persist the migration so subsequent reads are O(1).
                 # Failure here is non-fatal; callers see correct behavior
@@ -964,16 +980,17 @@ function Read-ScaState {
     return $null
 }
 
-# Read-modify-write helper. Pass any subset of -ActiveSlot / -LastSyncHash;
-# parameters not bound are left at their current state-file value (or null
-# when no state file existed). -ClearActiveSlot wins over -ActiveSlot in
-# the unusual case both are bound, so callers expressing "forget the
-# active slot" cannot accidentally re-set it.
+# Read-modify-write helper. Pass any subset of -ActiveSlot / -LastSyncHash /
+# -AuthVerdicts; parameters not bound are left at their current state-file
+# value (or null when no state file existed). -ClearActiveSlot wins over
+# -ActiveSlot in the unusual case both are bound, so callers expressing
+# "forget the active slot" cannot accidentally re-set it.
 function Update-ScaState {
     Param (
-        [String] $ActiveSlot,
-        [String] $LastSyncHash,
-        [switch] $ClearActiveSlot
+        [String]    $ActiveSlot,
+        [String]    $LastSyncHash,
+        [hashtable] $AuthVerdicts,
+        [switch]    $ClearActiveSlot
     )
 
     $current = Read-ScaState
@@ -982,11 +999,18 @@ function Update-ScaState {
             schema         = 1
             active_slot    = $null
             last_sync_hash = $null
+            auth_verdicts  = @{}
         }
+    }
+    # A state object read before auth_verdicts existed, or built by a caller
+    # that predates it, has no such property to assign to.
+    if (-not $current.PSObject.Properties['auth_verdicts']) {
+        $current | Add-Member -NotePropertyName auth_verdicts -NotePropertyValue @{}
     }
 
     if ($PSBoundParameters.ContainsKey('ActiveSlot'))   { $current.active_slot    = $ActiveSlot }
     if ($PSBoundParameters.ContainsKey('LastSyncHash')) { $current.last_sync_hash = $LastSyncHash }
+    if ($PSBoundParameters.ContainsKey('AuthVerdicts')) { $current.auth_verdicts  = $AuthVerdicts }
     if ($ClearActiveSlot)                               { $current.active_slot    = $null }
 
     Write-ScaState -State $current
@@ -1007,17 +1031,74 @@ function Update-ScaState {
 #   1. READ (sca save / reconcile identity probe): the email Claude Code
 #      shows IS what we want to label slots with. Drift between sca and
 #      Claude Code becomes structurally impossible.
-#   2. WRITE (sca switch): we copy the destination slot's captured oauthAccount
-#      block back into ~/.claude.json so Claude Code's display follows the
-#      active slot across switches.
+#   2. WRITE (sca switch, and reconcile's adopt branch): we copy the
+#      destination slot's captured oauthAccount block back into
+#      ~/.claude.json so Claude Code's display follows the active slot.
+#      Because reconcile adopts, this write also reaches actions that
+#      deliberately mutate nothing themselves, `sca usage` and `sca list`.
 #
-# Writing is gated by Test-ClaudeRunning: Claude Code holds ~/.claude.json
-# in an in-memory cache (Un.config) that is not auto-invalidated on external
-# changes, and a flush from a running Claude Code instance would silently
-# overwrite our oauthAccount mutation. Refuse-while-running is the chosen
-# mitigation.
+# Writing is NOT gated on Claude Code being closed; see Test-ClaudeRunning for
+# which actions still refuse and why this write is not one of them.
 
 # Returns $true if Claude Code is running on the host.
+#
+# THE CONCURRENCY STORY. Every refusal in this script that cites "a running
+# Claude Code" points here, and so does every decision not to refuse.
+#
+# TWO FILES, WRITTEN SEPARATELY. A /login writes .credentials.json and
+# ~/.claude.json as two writes, tokens first. Inside that window the tokens are
+# already the new account's while the email still names the old one, so "same
+# email" does not mean "same account" and neither file can vouch for the other.
+# Every refusal below and every identity check in Invoke-Reconcile is built
+# around this one fact.
+#
+# Claude Code 2.1.274 follows both files when they change underneath it.
+# ~/.claude.json is polled with fs.watchFile at 1 s and an external mtime bump
+# replaces its in-memory config wholesale; its own writer takes
+# ~/.claude.json.lock, re-reads under that lock, merges, and refuses the write
+# outright when the re-read has lost the auth block. .credentials.json is
+# stat'd at the top of every token-refresh check and a changed mtime drops the
+# cached credentials. Verified live on 2.1.274: a `claude -p` run started on
+# one account, handed a second account's .credentials.json 4 s in, died 4 s
+# later on the SECOND account's 5h limit.
+#
+# So swapping accounts under a live Claude Code works, and `sca switch` and
+# `sca monitor` run beside one. What refuses, and why:
+#
+#   * save    Captures .credentials.json and an identity in the same breath,
+#             one from each file. Catching the window mislabels the slot
+#             permanently, and unlike a bad mirror nothing later corrects it.
+#   * warmup, monitor -KeepWarm
+#             Both make EVERY slot active in turn. A live session would be
+#             dragged across every account on the machine and bill whichever
+#             one was mounted when the user hit enter. Rotation moves to one
+#             chosen destination and stays; a round-robin underneath a user is
+#             not something they can reason about.
+#
+# What sca risks by writing beside a live client, in both files:
+#
+#   ~/.claude.json  our write does not take their lock, so a read-modify-write
+#                   of ours can drop a config change Claude Code made in
+#                   between. Costs a counter or a project flag, never a
+#                   credential.
+#   .credentials.json
+#                   a swap writes the destination slot's bytes over whatever
+#                   is there. A Claude Code token refresh landing between the
+#                   caller's reconcile and that write is discarded, leaving the
+#                   OUTGOING slot holding a refresh token the server has
+#                   already rotated. This one does cost a credential, which is
+#                   why every swap caller reconciles immediately beforehand and
+#                   refuses when that reconcile captured nothing; see
+#                   Invoke-Reconcile's `Captured`.
+#
+# The credential-level hazards the window opens are Invoke-Reconcile's to
+# handle rather than this guard's: it adopts a slot whose bytes match the
+# active file instead of mirroring over it, declines to write what it cannot
+# attribute, and asks /api/oauth/profile whose tokens these actually are before
+# overwriting a slot while a client is live.
+#
+# Recovery if a write ever does corrupt the file: Claude Code keeps rolling
+# ~/.claude/backups/.claude.json.backup.<unix-ms> copies.
 #
 # Two probes, because the CLI ships in two shapes. The native installer
 # produces a real executable named 'claude', which the name probe finds on
@@ -1047,20 +1128,12 @@ function Update-ScaState {
 #
 # Get-Process enumerates processes from ALL users on the system (limited
 # detail for processes owned by other users, but the Process objects
-# themselves still come back), so this refuses save/switch even when a
-# DIFFERENT user on a shared host has Claude Code open. That is intentional
-# multi-user safety: if any user's Claude Code holds the ~/.claude.json
-# in-memory cache, our oauthAccount mutation could race its flush. Wrapped as
-# a function so tests can mock it without driving real process state.
-#
-# This is our whole concurrency story for ~/.claude.json, and it is a
-# deliberate non-participation: Claude Code serialises its OWN writes with
-# proper-lockfile via ~/.claude.json.lock, and we do not take that lock.
-# Taking it would only order our write against theirs; it would not evict the
-# in-memory copy a running Claude Code may still flush over the top of us.
-# Refusing to run at all is the stronger guarantee, because there is no live
-# cache to lose the race against. Recovery if a write ever does corrupt the
-# file: Claude Code keeps rolling ~/.claude.json.backup.<unix-ms> copies.
+# themselves still come back), so the actions that do refuse refuse even when
+# a DIFFERENT user on a shared host has Claude Code open. Intentional: the
+# files at stake are per-user only if every user has their own home, and a
+# shared-home host is exactly where a fleet walk would surprise someone.
+# Wrapped as a function so tests can mock it without driving real process
+# state.
 function Test-ClaudeRunning {
     if (Get-Process -Name 'claude' -ErrorAction SilentlyContinue) { return $true }
     if ($IsWindows) { return $false }
@@ -1089,8 +1162,8 @@ function Test-ClaudeRunning {
 # rather than the bare word 'claude', because a checkout directory with
 # 'claude' in its name is not a running Claude Code and must not lock the user
 # out of `sca save`. Over-matching would only refuse a safe action, but
-# under-matching races Claude Code's in-memory ~/.claude.json cache, so the
-# pattern is deliberately the narrower of the two.
+# under-matching lets a write land beside a live Claude Code, so the pattern is
+# deliberately the narrower of the two. What that costs is on Test-ClaudeRunning.
 function Test-ClaudeNodeProcess {
     Param ([AllowNull()] $Processes)
 
@@ -1098,6 +1171,31 @@ function Test-ClaudeNodeProcess {
         if ($process.CommandLine -like '*/claude-code/cli.js*') { return $true }
     }
     return $false
+}
+
+# Parse ~/.claude.json once, reporting WHY there is no usable object rather
+# than collapsing every cause into $null. State is 'absent' | 'unreadable' |
+# 'ok'; Object is the parsed file on 'ok' and $null otherwise. Never throws.
+#
+# The distinction exists for Invoke-Reconcile's adopt branch, which reacts to a
+# failed identity write by asking whether the file holds an identity that write
+# would have gone stale against. An absent file holds none and the adoption is
+# safe; an unreadable one may hold any identity at all and it is not. Reading
+# both as "no identity" is how the guard came to stand down in the very case
+# most likely to need it, since an unreadable file is also the likeliest reason
+# the write failed.
+function Read-ClaudeJson {
+    if (-not (Test-Path -LiteralPath $ClaudeJsonPath)) {
+        return [pscustomobject]@{ State = 'absent'; Object = $null }
+    }
+    try {
+        $obj = Get-Content -LiteralPath $ClaudeJsonPath -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+        return [pscustomobject]@{ State = 'ok'; Object = $obj }
+    }
+    catch {
+        return [pscustomobject]@{ State = 'unreadable'; Object = $null }
+    }
 }
 
 # Read Claude Code's `oauthAccount` block out of ~/.claude.json. Returns a
@@ -1109,21 +1207,16 @@ function Test-ClaudeNodeProcess {
 # over time and should not round-trip through sca):
 #   accountUuid, emailAddress, organizationUuid, displayName, organizationName
 #
-# Failure modes (all -> $null, never throws):
+# Failure modes (all -> $null, never throws). A caller that has to tell them
+# apart wants Read-ClaudeJson, which is where the first two are distinguished:
 #   * file missing                     (fresh install / Claude Code never run)
 #   * file unparseable                 (corrupt JSON; Claude Code probably broken too)
 #   * no oauthAccount key              (logged out / API-key-only mode)
 #   * oauthAccount.emailAddress empty  (incomplete cache; treat as no identity)
 function Get-OAuthAccountFromClaudeJson {
-    if (-not (Test-Path -LiteralPath $ClaudeJsonPath)) { return $null }
-
-    try {
-        $obj = Get-Content -LiteralPath $ClaudeJsonPath -Raw -ErrorAction Stop |
-            ConvertFrom-Json -ErrorAction Stop
-    }
-    catch {
-        return $null
-    }
+    $parsed = Read-ClaudeJson
+    if ($parsed.State -ne 'ok') { return $null }
+    $obj = $parsed.Object
 
     if (-not $obj.oauthAccount) { return $null }
     $oa = $obj.oauthAccount
@@ -1186,8 +1279,8 @@ function Get-SHA256Hex {
 # via a single regex replace (a MatchEvaluator, not a replacement string, so
 # a value containing $1 / $& cannot be reinterpreted as a capture token).
 # The non-whitelisted fields (billingType, claudeCodeTrialEndsAt, etc.)
-# inside oauthAccount are also preserved byte-equal; we only touch the five
-# identity fields.
+# inside oauthAccount are also preserved byte-equal; we touch only the
+# whitelisted identity fields.
 #
 # Why not parse and reserialize: ~/.claude.json is large and structurally
 # complex, and a ConvertTo-Json round-trip silently shifts key ordering,
@@ -1206,20 +1299,24 @@ function Get-SHA256Hex {
 # emailAddress and restarting Claude Code makes /status report the new
 # value, and the rest of the file round-trips byte-equal.
 #
+# The pair is split into this pure half and the write below it, so the write
+# can re-run the whole substitution against freshly read bytes (which is what
+# makes its compare-and-swap expressible) and so the brace scan is testable
+# without a file on disk.
+#
+# Returns the updated file text, or $null when no whitelisted field actually
+# changes, which the caller reads as "nothing to write".
+#
 # Errors:
-#   * file missing                  -> throw
 #   * oauthAccount block missing    -> throw
 #   * unbalanced braces in block    -> throw (never seen in practice;
 #                                            indicates a corrupt file
 #                                            and we refuse to touch it)
-function Set-OAuthAccountInClaudeJson {
-    Param ([Parameter(Mandatory)] [pscustomobject] $OAuthAccount)
-
-    if (-not (Test-Path -LiteralPath $ClaudeJsonPath)) {
-        throw "~/.claude.json not found at '$ClaudeJsonPath'. Sign in to Claude Code first ('claude /login')."
-    }
-
-    $raw = Get-Content -LiteralPath $ClaudeJsonPath -Raw -ErrorAction Stop
+function ConvertTo-UpdatedClaudeJson {
+    Param (
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $Raw,
+        [Parameter(Mandatory)] [pscustomobject]             $OAuthAccount
+    )
 
     # Locate the opening `"oauthAccount": {`. We accept whitespace variations
     # because Claude Code's serializer indents with 2 spaces but a hand-edited
@@ -1236,8 +1333,8 @@ function Set-OAuthAccountInClaudeJson {
     # an oauthAccount value like `"organizationName": "Acme {LLC}"`.
     #
     # Why this is acceptable in practice (NOT by JSON-spec construction):
-    #   * Of the five whitelisted identity fields, three are UUIDs and
-    #     one is an RFC 5321 email; none can contain `{` / `}`.
+    #   * The whitelisted identity fields are UUIDs and an RFC 5321
+    #     email; none can contain `{` / `}`.
     #   * `displayName` / `organizationName` are user-set in Anthropic's
     #     console, but braces in those values are vanishingly rare.
     #   * Non-whitelisted oauthAccount fields Claude Code emits today
@@ -1274,7 +1371,7 @@ function Set-OAuthAccountInClaudeJson {
         $value = $OAuthAccount.$field
         # Skip null values: preserve the existing ~/.claude.json field rather
         # than nulling it out. This handles /api/oauth/profile-fallback
-        # sidecars that captured only emailAddress (the other four
+        # sidecars that captured only emailAddress (the other
         # whitelisted fields default to $null in that path). The asymmetry
         # is deliberate: a null value carries no information about Claude
         # Code's actual identity, so the existing cached value is the better
@@ -1299,10 +1396,50 @@ function Set-OAuthAccountInClaudeJson {
         }, 1)
     }
 
-    if ($newBlock -eq $blockText) { return }  # no-op write
+    if ($newBlock -eq $blockText) { return $null }  # nothing to write
 
-    $newRaw = $raw.Substring(0, $openBrace) + $newBlock + $raw.Substring($i)
-    Set-CredentialFileAtomic -Path $ClaudeJsonPath -Bytes ([System.Text.Encoding]::UTF8.GetBytes($newRaw))
+    return $raw.Substring(0, $openBrace) + $newBlock + $raw.Substring($i)
+}
+
+# Write half. Claude Code takes ~/.claude.json.lock, re-reads under it and
+# merges, so its writes do not clobber ours; ours would clobber anything it
+# committed while we were transforming, and since `switch` stopped refusing
+# beside a live client this read-modify-write races routinely rather than
+# never. What is lost that way is configuration and per-project prompt
+# history, never a credential.
+#
+# So: re-read immediately before committing and start over when the file moved
+# under us. That narrows the window from the whole substitution (a regex and a
+# brace scan over an 18 KB+ file) to the gap between the check and the rename.
+# It does NOT close it. Taking the lock is the real fix and needs its protocol
+# pinned first (`docs/claude-code-internals.md`); this is the part that can be
+# done without guessing at semantics sca has not verified.
+#
+# Giving up beats overwriting: both callers already handle a throw, and a
+# refused identity update costs a stale /status email, which the next `sca
+# switch` repairs.
+function Set-OAuthAccountInClaudeJson {
+    Param ([Parameter(Mandatory)] [pscustomobject] $OAuthAccount)
+
+    if (-not (Test-Path -LiteralPath $ClaudeJsonPath)) {
+        throw "~/.claude.json not found at '$ClaudeJsonPath'. Sign in to Claude Code first ('claude /login')."
+    }
+
+    for ($attempt = 1; $attempt -le $Script:ClaudeJsonWriteRetryMax; $attempt++) {
+        # [string] cast: Get-Content -Raw yields $null for an empty file, and
+        # the transform reports that as the missing-block throw rather than a
+        # binder error.
+        $raw    = [string](Get-Content -LiteralPath $ClaudeJsonPath -Raw -ErrorAction Stop)
+        $newRaw = ConvertTo-UpdatedClaudeJson -Raw $raw -OAuthAccount $OAuthAccount
+        if ($null -eq $newRaw) { return }
+
+        if ([string](Get-Content -LiteralPath $ClaudeJsonPath -Raw -ErrorAction Stop) -ne $raw) { continue }
+
+        Set-CredentialFileAtomic -Path $ClaudeJsonPath -Bytes ([System.Text.Encoding]::UTF8.GetBytes($newRaw))
+        return
+    }
+
+    throw "~/.claude.json changed under all $Script:ClaudeJsonWriteRetryMax attempts to update its oauthAccount block, so it was left as Claude Code wrote it rather than overwritten. Re-run once the client is idle."
 }
 
 # --- Per-slot identity sidecar -------------------------------------------
@@ -1492,8 +1629,9 @@ function Show-Help {
         "  PS profile   : $ProfilePath",
         "",
         "NOTES",
-        "  • Close Claude Code / VS Code before 'save', 'switch', 'warmup', or 'monitor'.",
-        "  • OpenCode + opencode-claude-auth support swapping accounts without restart.",
+        "  • 'switch' and 'monitor' work with Claude Code open; it follows the swap.",
+        "  • Close Claude Code / VS Code before 'save', 'warmup', or 'monitor -KeepWarm'.",
+        "  • Needs Claude Code >= 2.1.274, or OpenCode + opencode-claude-auth >= 1.5.4.",
         ""
     )
 
@@ -1846,6 +1984,38 @@ function Find-SlotByName {
     return Get-Slots | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
 }
 
+# Find the saved slot whose file is byte-identical to $Hash. Answers a question
+# the email cannot: ".credentials.json changed, but is it new bytes or an
+# existing slot moved into place?" Byte equality with a saved slot proves the
+# latter, because a token refresh mints tokens no slot file has ever held.
+#
+# Reads each candidate off disk rather than trusting a cached hash, because the
+# whole point is to compare against what is on disk right now. Hashing is
+# skipped for -ExcludeName so the common reconcile call does not re-hash the
+# slot it is about to write.
+function Find-SlotByHash {
+    Param (
+        [Parameter(Mandatory)] [String] $Hash,
+        [String] $ExcludeName
+    )
+
+    foreach ($slot in Get-Slots) {
+        if ($ExcludeName -and $slot.Name -eq $ExcludeName) { continue }
+        # Any unreadable candidate (deleted mid-scan, locked, bad ACL) is
+        # treated as "not a match" so reconcile cannot fail because of one bad
+        # file. That silently costs a detection: an unreadable twin sends the
+        # caller to the email comparison, the very branch this exists to
+        # pre-empt. Too rare for 0600 files we own to justify failing the
+        # action over, but traced so it is diagnosable when it does happen.
+        try { if ((Get-SHA256Hex -Path $slot.Path) -eq $Hash) { return $slot } }
+        catch {
+            Write-Verbose "Find-SlotByHash: skipped unreadable slot '$($slot.Name)': $_"
+            continue
+        }
+    }
+    return $null
+}
+
 # We are determining which slot should become active when `switch` is
 # called without an explicit name. Behavior:
 #   * No slots saved          -> throw (nothing to rotate to).
@@ -2000,8 +2170,8 @@ function Remove-From-Profile {
 # Returns the generated slot name on success.
 #
 # Caller owns the user-visible advisory message and the return-object
-# `Action` discriminator. Invoke-Reconcile has two auto-save callers
-# (cross-account swap detection vs unknown-state recovery) whose
+# `Action` discriminator. Invoke-Reconcile's auto-save callers
+# (cross-account swap detection vs unknown-state recovery) have
 # advisory text and return shape differ enough that merging them into
 # one helper would conflate semantically distinct events; keeping the
 # advisory + return at the call sites preserves that distinction while
@@ -2034,28 +2204,248 @@ function New-AutoSaveSlot {
     return $autoName
 }
 
+# Build the oauthAccount block a sidecar stores from an 'ok' Get-SlotProfile
+# result. Both fallback paths (Invoke-SaveAction, Invoke-Reconcile) go through
+# here rather than hand-rolling the object, because accountUuid is the ONLY
+# field Test-CredentialAccountMatch compares: a site that forgets to carry it
+# writes a sidecar that silently exempts its slot from the mirror-overwrite
+# guard forever, and the slot still looks valid to Read-Sidecar.
+#
+# The remaining fields stay $null because the endpoint does not carry
+# them. Set-OAuthAccountInClaudeJson skips nulls, so a later switch to this
+# slot preserves whatever ~/.claude.json already had for them.
+#
+# Parameter is $ProfileResult, not $Profile: the latter shadows PowerShell's
+# automatic $PROFILE inside this scope.
+function New-OAuthAccountFromProfile {
+    Param ([Parameter(Mandatory)] [pscustomobject] $ProfileResult)
+
+    return [pscustomobject]@{
+        accountUuid      = $ProfileResult.AccountUuid
+        emailAddress     = $ProfileResult.Email
+        organizationUuid = $null
+        displayName      = $null
+        organizationName = $null
+    }
+}
+
+# Ask the tokens themselves whose account they are, and compare that against
+# what a slot's sidecar says. Returns:
+#
+#   @{ Status = 'match';    Email; AccountUuid }
+#   @{ Status = 'mismatch'; Email; AccountUuid }   # different account, proven
+#   @{ Status = 'unknown';  Reason }               # could not tell
+#
+# This exists because every other identity signal sca has is read from a
+# DIFFERENT file than the one that changed (see Test-ClaudeRunning on the
+# window that opens). /api/oauth/profile is called WITH the tokens under test,
+# so its answer cannot lag them; it is the only probe that settles the question
+# rather than guessing at it.
+#
+# Compares accountUuid, never email, and case-insensitively. Why the email is
+# not interchangeable and why the case must not matter:
+# docs/claude-code-internals.md -> Why the identity guard compares uuid.
+#
+# -NoRefresh on the probe is not optional: this runs while a live Claude Code
+# may be mid-request on those exact tokens, and refreshing would rotate the
+# refresh token out from under it to answer a question.
+#
+# 'unknown' is the honest answer for every failure (offline, 429, expired
+# token, sidecar predating uuid capture) and callers must treat it as "no
+# evidence", NOT as a mismatch. Refusing to mirror on no evidence would
+# freeze slot files for anyone whose profile endpoint is unreachable.
+function Test-CredentialAccountMatch {
+    Param (
+        [Parameter(Mandatory)] [string] $CredentialPath,
+        [AllowNull()] [pscustomobject] $Sidecar
+    )
+
+    $expected = if ($Sidecar) { [string]$Sidecar.oauthAccount.accountUuid } else { $null }
+    if ([string]::IsNullOrWhiteSpace($expected)) {
+        return [pscustomobject]@{ Status = 'unknown'; Reason = 'sidecar-has-no-uuid' }
+    }
+
+    $probe = Get-SlotProfile -SlotPath $CredentialPath -NoRefresh
+    if ($probe.Status -ne 'ok') {
+        return [pscustomobject]@{ Status = 'unknown'; Reason = $probe.Status }
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$probe.AccountUuid)) {
+        return [pscustomobject]@{ Status = 'unknown'; Reason = 'profile-has-no-uuid' }
+    }
+
+    $status = if ($probe.AccountUuid -eq $expected) { 'match' } else { 'mismatch' }
+    return [pscustomobject]@{
+        Status      = $status
+        Email       = $probe.Email
+        AccountUuid = $probe.AccountUuid
+    }
+}
+
+# True when two oauthAccount-shaped records describe the same account.
+#
+# Compares accountUuid when both carry one, and falls back to emailAddress
+# otherwise, because Read-Sidecar requires an email but not a uuid: a sidecar
+# written before uuid capture has only the email to offer. That fallback is a
+# concession to those sidecars, not a second opinion. Why the email is the
+# weaker answer and why both comparisons are case-insensitive:
+# docs/claude-code-internals.md -> Why the identity guard compares uuid.
+function Test-SameOAuthAccount {
+    Param (
+        [AllowNull()] [pscustomobject] $Left,
+        [AllowNull()] [pscustomobject] $Right
+    )
+
+    if (-not $Left -or -not $Right) { return $false }
+
+    $leftUuid  = [string]$Left.accountUuid
+    $rightUuid = [string]$Right.accountUuid
+    if (-not [string]::IsNullOrWhiteSpace($leftUuid) -and
+        -not [string]::IsNullOrWhiteSpace($rightUuid)) {
+        return $leftUuid -eq $rightUuid
+    }
+
+    $leftEmail  = [string]$Left.emailAddress
+    $rightEmail = [string]$Right.emailAddress
+    if ([string]::IsNullOrWhiteSpace($leftEmail) -or
+        [string]::IsNullOrWhiteSpace($rightEmail)) {
+        return $false
+    }
+    return $leftEmail -eq $rightEmail
+}
+
+# Decide whether the bytes now in .credentials.json belong to the account the
+# tracked slot holds. One of:
+#
+#   @{ Verdict = 'same';    SlotEmail }
+#   @{ Verdict = 'differs'; SlotEmail; Email; Account; Source }
+#   @{ Verdict = 'moved';   SlotEmail }
+#
+# 'differs' carries the identity the new slot must be filed under, because the
+# probe below can overturn the offline answer, and when it does its values are
+# the correct ones rather than ~/.claude.json's.
+#
+# 'moved' means .credentials.json changed underneath the probe, so no verdict
+# describes the bytes the caller is holding and nothing may be written from
+# them.
+#
+# Split out of Invoke-Reconcile because this is the one decision there that is
+# neither a guard nor a write, and the only one whose answer can cost a network
+# round trip. Keeping it whole here is also what lets the caller read as a flat
+# dispatch over the verdicts it returns.
+function Confirm-TrackedSlotIdentity {
+    Param (
+        [Parameter(Mandatory)] [pscustomobject] $Slot,
+        [AllowNull()] [String] $IncomingEmail,
+        [AllowNull()] [pscustomobject] $IncomingAccount,
+        [AllowNull()] [String] $IncomingSource,
+        [Parameter(Mandatory)] [String] $CredentialPath,
+        [Parameter(Mandatory)] [String] $Hash
+    )
+
+    # The slot's email comes from its sidecar (Get-Slots always populates this
+    # on the slot object). Never empty: Read-Sidecar rejects a sidecar without
+    # an emailAddress, which is what keeps the equality test below from
+    # degenerating into empty-equals-empty and mirroring one account over
+    # another.
+    $slotEmail = if ($Slot.Sidecar) { [string]$Slot.Sidecar.oauthAccount.emailAddress } else { $Slot.Email }
+
+    $slotAccount = if ($Slot.Sidecar) { $Slot.Sidecar.oauthAccount } else { $null }
+    if (-not (Test-SameOAuthAccount -Left $IncomingAccount -Right $slotAccount)) {
+        return [pscustomobject]@{
+            Verdict   = 'differs'
+            SlotEmail = $slotEmail
+            Email     = $IncomingEmail
+            Account   = $IncomingAccount
+            Source    = $IncomingSource
+        }
+    }
+
+    # The email said "same account, only the tokens moved", and it came from
+    # the file that lags (see Test-ClaudeRunning). Ask the tokens themselves,
+    # because this is the last moment at which the login in that slot file
+    # still exists.
+    #
+    # Unconditional, not gated on Test-ClaudeRunning. That guard misses an
+    # npm-installed Claude Code on Windows and macOS (see its docblock), and
+    # gating on it would silently disable this probe on exactly those hosts,
+    # leaving the overwrite it exists to prevent. The round trip is also
+    # cheaper than it looks: Invoke-Reconcile returns at the hash-match check
+    # unless the bytes actually changed, so this fires about once per token
+    # refresh rather than once per command.
+    $probe = Test-CredentialAccountMatch -CredentialPath $CredentialPath -Sidecar $Slot.Sidecar
+
+    # Only a PROVEN mismatch overturns the offline answer. Treating "could not
+    # ask" as "different account" would freeze every slot file behind an
+    # unreachable profile endpoint, and a slot that stops tracking refreshes is
+    # dead within two of them.
+    if ($probe.Status -ne 'mismatch') {
+        return [pscustomobject]@{ Verdict = 'same'; SlotEmail = $slotEmail }
+    }
+
+    # The probe answered about .credentials.json as it stood when it read the
+    # file, not about the bytes the caller hashed; a /login landing between the
+    # two is the very event this exists to catch. Writing anyway would file the
+    # OLD account's tokens under the NEW account's name, which is precisely the
+    # mislabelled slot `sca save` refuses to create, with no later pass to
+    # correct it. A re-hash is cheap next to the request just made.
+    $stillSame = try { (Get-SHA256Hex -Path $CredentialPath) -eq $Hash } catch { $false }
+    if (-not $stillSame) {
+        return [pscustomobject]@{ Verdict = 'moved'; SlotEmail = $slotEmail }
+    }
+
+    # A different account wearing the old email. Test-CredentialAccountMatch
+    # carries Get-SlotProfile's Email / AccountUuid through unchanged, so the
+    # sidecar is built by the same constructor as every other profile-sourced
+    # one.
+    return [pscustomobject]@{
+        Verdict   = 'differs'
+        SlotEmail = $slotEmail
+        Email     = $probe.Email
+        Account   = (New-OAuthAccountFromProfile -ProfileResult $probe)
+        Source    = 'api_profile'
+    }
+}
+
 # Reconcile .credentials.json with the saved slot tracked in $StateFile.
 # Called at the start of every credentials-touching action that needs the
 # tracked slot to reflect Claude Code's most recent token refresh (sca
 # switch and sca usage in the redesigned model).
 #
-# Algorithm (5 outcomes; never throws unless an atomic write itself fails):
+# Algorithm (7 outcomes; never throws unless an atomic write itself fails):
 #   1. .credentials.json missing                   -> noop
 #   2. hash matches state.last_sync_hash           -> noop
-#   3. tracked slot exists, identity matches       -> mirror bytes -> slot
-#   4. tracked slot exists, identity DIFFERS       -> auto-save under new name
+#   3. bytes are byte-identical to a saved slot    -> adopt that slot as active
+#      other than the tracked one, if any             (state + ~/.claude.json;
+#                                                      no slot file is written)
+#   4. identity unresolvable                       -> noop, nothing written
+#   5. tracked slot exists, identity matches       -> mirror bytes -> slot
+#   6. tracked slot exists, identity DIFFERS       -> auto-save under new name
 #                                                     (cross-account swap detected;
-#                                                      old slot file preserved)
-#   5. no tracked slot, OR slot file is gone       -> auto-save under new name
+#                                                      old slot file preserved, or
+#                                                      noop when the file moved
+#                                                      under the identity probe)
+#   7. no tracked slot, OR slot file is gone       -> auto-save under new name
 #
-# Identity probe: ~/.claude.json's oauthAccount.emailAddress. This is the
-# same source Claude Code uses for /status, so reconcile and Claude Code can
-# never disagree about the active identity, and it is offline. Preferred over
-# /api/oauth/profile, which can return a different email for the same
-# account. When ~/.claude.json has no
-# oauthAccount yet (rare: fresh install, never logged into Claude Code),
-# we fall back to /api/oauth/profile so the noop / mirror branches still
-# work for users in that transient state.
+# The guard outcomes are ordered ahead of every outcome that writes. Of those
+# writes, the mirror is the worst: it overwrites a slot file, the one artifact
+# a login cannot be recovered from. The auto-saves are not free either, each
+# moving active tracking onto a slot it just minted.
+#
+# Identity probe: ~/.claude.json's oauthAccount.emailAddress. Same source
+# Claude Code uses for /status, so reconcile and Claude Code can never disagree
+# about the active identity, and it is offline. Preferred over
+# /api/oauth/profile's email, which is not interchangeable with it
+# (docs/claude-code-internals.md). When ~/.claude.json has no oauthAccount yet
+# (fresh install, never logged into Claude Code), the profile endpoint answers
+# instead, because some identity beats none for LABELLING a new slot.
+#
+# That probe reads a different file than the one that changed, and the window
+# this opens (see Test-ClaudeRunning) is what the adopt and mirror outcomes are
+# built around. Adopt settles the case where the incoming account is already
+# saved, by byte equality, offline and without consulting any email. The mirror
+# settles the rest by asking /api/oauth/profile whose tokens these are; see
+# Test-CredentialAccountMatch for why that answer cannot lag, and why it is
+# asked on every host rather than only where a client can be detected.
 #
 # Tracked slot's identity comes from the slot's sidecar (which was
 # captured at save time from ~/.claude.json or /api/oauth/profile). This
@@ -2068,11 +2458,26 @@ function New-AutoSaveSlot {
 #
 # Returns a [pscustomobject] describing the outcome so tests and callers
 # can assert on the action without parsing stdout. Stdout still carries
-# the user-visible advisory for the two non-silent branches (auto-save,
+# the user-visible advisory for the non-silent branches (auto-save,
 # identity-change).
+#
+# `Captured` on that object answers the one question every caller that goes on
+# to overwrite .credentials.json has to ask: are the bytes currently in it
+# safely represented on disk? It is $false for the outcomes that saw changed
+# bytes and deliberately wrote nothing (identity-unresolved,
+# credentials-changed-mid-probe). Swapping on top of those discards a refresh
+# the tracked slot never received, leaving it holding a refresh token the
+# server has already rotated: a dead login, and the one loss here that no
+# later pass can repair. Callers must read the field rather than allowlist
+# Action values, so a new non-capturing outcome cannot slip past them.
+#
+# `Captured` and "did the active slot move" are different questions. The
+# second is answered by Action alone (adopt / identity-change / auto-save all
+# move it), and only auto-rotation cares, because only it holds a decision
+# computed before the call.
 function Invoke-Reconcile {
     if (-not (Test-Path -LiteralPath $CredFile)) {
-        return [pscustomobject]@{ Action = 'noop'; Reason = 'no-active-credentials' }
+        return [pscustomobject]@{ Action = 'noop'; Reason = 'no-active-credentials'; Captured = $true }
     }
 
     $bytes = [System.IO.File]::ReadAllBytes($CredFile)
@@ -2086,65 +2491,176 @@ function Invoke-Reconcile {
 
     $state = Read-ScaState
     if ($state -and $state.last_sync_hash -eq $hash) {
-        return [pscustomobject]@{ Action = 'noop'; Reason = 'hash-match' }
+        return [pscustomobject]@{ Action = 'noop'; Reason = 'hash-match'; Captured = $true }
     }
 
     # Bytes differ from last sync. Resolve new identity. Preferred: read
     # ~/.claude.json's oauthAccount.emailAddress (offline; same source
     # Claude Code uses). Fallback: /api/oauth/profile (network) when
     # ~/.claude.json has no oauthAccount populated yet.
-    $newAccount = Get-OAuthAccountFromClaudeJson
-    $newEmail   = if ($newAccount) { $newAccount.emailAddress } else { $null }
+    # $sourceLabel is set per branch rather than inferred from the resolved
+    # account, because every field it could be inferred from is one both
+    # sources can populate. It is informational only (it lands in the
+    # sidecar's `source`), so a wrong value costs diagnosis, not behaviour.
+    $newAccount  = Get-OAuthAccountFromClaudeJson
+    $newEmail    = if ($newAccount) { $newAccount.emailAddress } else { $null }
+    $sourceLabel = 'claude_json'
     if (-not $newEmail) {
-        $profileResult = Get-SlotProfile -SlotPath $CredFile
+        # -NoRefresh because this path runs beside a live client, unlike
+        # Invoke-SaveAction's identical call. A refresh here would also rewrite
+        # .credentials.json and strand the ($bytes, $hash) pair read above.
+        $profileResult = Get-SlotProfile -SlotPath $CredFile -NoRefresh
         if ($profileResult.Status -eq 'ok') {
-            $newEmail = $profileResult.Email
-            # Synthesize a minimal accountInfo for the auto-save sidecar.
-            $newAccount = [pscustomobject]@{
-                accountUuid      = $null
-                emailAddress     = $newEmail
-                organizationUuid = $null
-                displayName      = $null
-                organizationName = $null
-            }
+            $newEmail    = $profileResult.Email
+            $newAccount  = New-OAuthAccountFromProfile -ProfileResult $profileResult
+            $sourceLabel = 'api_profile'
         }
     }
-    $sourceLabel = if ($newAccount -and $newAccount.accountUuid) { 'claude_json' } else { 'api_profile' }
+
+    # A saved slot moved into place behind our back: another writer (a
+    # `claude` /login, a second sca, a hand-edit) already activated it.
+    # Mirroring would copy its tokens over the slot state still names and
+    # destroy that login, so adopt the slot instead of writing.
+    #
+    # Ordered ahead of both writing paths, and ahead of the email comparison,
+    # because byte equality is proof where the email is only evidence: inside
+    # the /login window (see Test-ClaudeRunning) that evidence says "same
+    # account, just refreshed" and is wrong. It also covers the no-tracked-slot
+    # case, which a corrupt state file reaches (Read-ScaState's catch returns
+    # $null without running the hash bootstrap) and which would otherwise
+    # auto-save a second copy of an account already saved.
+    $activeName = if ($state) { $state.active_slot } else { $null }
+    $twin = Find-SlotByHash -Hash $hash -ExcludeName $activeName
+    if ($twin) {
+        $twinIdent = Format-SlotIdentity -Name $twin.Name -Email $twin.Email
+
+        # The identity write goes FIRST and the state write is conditional on
+        # it, because this is the one branch that changes WHICH account is
+        # active and the two files must agree about that. Committing state
+        # first and letting this fail leaves state naming the twin while
+        # ~/.claude.json still names the old account, and nothing revisits it:
+        # the next reconcile hash-matches and returns before reaching here. The
+        # one after that reads two identities that disagree, takes the differs
+        # arm, and files the twin's tokens under the OLD account's email and
+        # uuid -- a permanently mislabelled slot, the artifact `sca save`
+        # refuses to create.
+        $identityError = $null
+        try {
+            Set-OAuthAccountInClaudeJson -OAuthAccount $twin.Sidecar.oauthAccount
+        }
+        catch {
+            $identityError = $_.Exception.Message
+        }
+
+        # A failed write only splits the two files when ~/.claude.json holds an
+        # identity to disagree with. It also throws when there is none to hold
+        # (file absent, or never signed in), and that case is safe: nothing can
+        # go stale against the adoption, so it stands and only the display lags.
+        #
+        # $newEmail cannot tell those apart. Its resolver answers $null for an
+        # unreadable file exactly as for an absent one, and an unreadable file
+        # is itself the likeliest reason the write above threw, so the proxy
+        # read "nothing to disagree with" in the one case most likely to
+        # disagree. Ask the file directly and let the adoption stand only where
+        # the absence of an identity is proven.
+        $claudeJsonState = if ($identityError) { (Read-ClaudeJson).State } else { 'ok' }
+        if ($identityError -and (($claudeJsonState -eq 'unreadable') -or
+                                 ($newEmail -and $newEmail -ne $twin.Email))) {
+            Write-Color "[Sync] Active credentials match saved slot $twinIdent, but ~/.claude.json could not be pointed at it ($identityError), so the active slot is left as it was rather than split across the two files. Fix that and re-run, or run 'sca switch $($twin.Name)'." 'Yellow'
+            return [pscustomobject]@{
+                Action   = 'noop'
+                Reason   = 'adopt-identity-write-failed'
+                Slot     = $activeName
+                # The bytes are byte-identical to the twin's slot file, so they
+                # are already saved and a caller may overwrite them freely.
+                Captured = $true
+            }
+        }
+
+        Update-ScaState -ActiveSlot $twin.Name -LastSyncHash $hash | Out-Null
+        Write-Color "[Sync] Active credentials match saved slot $twinIdent; tracking it as active." 'Yellow'
+        if ($identityError) {
+            Write-Color "[Sync] ~/.claude.json was not updated ($identityError); Claude Code's /status email may lag until you run 'sca switch $($twin.Name)'." 'Yellow'
+        }
+
+        return [pscustomobject]@{
+            Action       = 'adopt'
+            Slot         = $twin.Name
+            PreviousSlot = $activeName
+            Email        = $twin.Email
+            Captured     = $true
+        }
+    }
+
+    # Unattributable bytes: neither ~/.claude.json nor the profile endpoint
+    # named an account. Every outcome below writes something that claims to know
+    # whose tokens these are, so none may run on a guess.
+    #
+    # Ahead of the tracked-slot block because the no-tracked-slot path is not
+    # the harmless one: it mints a credential file with no sidecar, which
+    # Get-Slots hides and `sca remove` cannot reach by name, then points
+    # state.active_slot at that invisible slot.
+    if (-not $newEmail) {
+        $tail = if ($activeName) {
+            "so slot '$activeName' is left untouched rather than risk overwriting it. It will catch up on the next run that can resolve an identity; if this persists while online, re-run 'sca save $activeName' to recapture the slot."
+        } else {
+            "so nothing was written. The next run that can resolve an identity will capture these credentials; if this persists while online, run 'sca save <name>' to capture them under a name you choose."
+        }
+        Write-Color "[Sync] Active credentials changed but no account could be read from ~/.claude.json or /api/oauth/profile, $tail" 'Yellow'
+        return [pscustomobject]@{
+            Action   = 'noop'
+            Reason   = 'identity-unresolved'
+            Slot     = $activeName
+            Captured = $false
+        }
+    }
 
     if ($state -and $state.active_slot) {
         $slot = Find-SlotByName -Name $state.active_slot
         if ($slot) {
-            # Tracked slot's email comes from its sidecar (Get-Slots
-            # always populates this on the slot object). Tolerate
-            # offline / unknown-new-identity by falling into the
-            # same-identity branch; preserves continuity over paranoia.
-            $slotEmail    = if ($slot.Sidecar) { [string]$slot.Sidecar.oauthAccount.emailAddress } else { $slot.Email }
-            $sameIdentity = (-not $newEmail) -or (-not $slotEmail) -or ($newEmail -eq $slotEmail)
-            if ($sameIdentity) {
+            $verdict = Confirm-TrackedSlotIdentity -Slot $slot -IncomingEmail $newEmail `
+                                                   -IncomingAccount $newAccount `
+                                                   -IncomingSource $sourceLabel `
+                                                   -CredentialPath $CredFile `
+                                                   -Hash $hash
+
+            if ($verdict.Verdict -eq 'same') {
                 Set-CredentialFileAtomic -Path $slot.Path -Bytes $bytes
                 Update-ScaState -LastSyncHash $hash | Out-Null
                 return [pscustomobject]@{
-                    Action = 'mirror'
-                    Slot   = $state.active_slot
-                    Email  = $slotEmail
+                    Action   = 'mirror'
+                    Slot     = $state.active_slot
+                    Email    = $verdict.SlotEmail
+                    Captured = $true
+                }
+            }
+
+            if ($verdict.Verdict -eq 'moved') {
+                Write-Color "[Sync] Active credentials changed while their account was being verified, so slot '$($state.active_slot)' is left untouched rather than risk filing one account's tokens under another's name. The next run reads them afresh." 'Yellow'
+                return [pscustomobject]@{
+                    Action   = 'noop'
+                    Reason   = 'credentials-changed-mid-probe'
+                    Slot     = $state.active_slot
+                    Captured = $false
                 }
             }
 
             # Cross-account swap detected. DON'T overwrite; auto-save the
             # new credentials under a fresh name so both identities are
             # preserved on disk and the user can resolve the conflict.
-            $autoName = New-AutoSaveSlot -Bytes $bytes -Email $newEmail `
-                                         -OAuthAccount $newAccount `
-                                         -SourceLabel $sourceLabel `
+            $autoName = New-AutoSaveSlot -Bytes $bytes -Email $verdict.Email `
+                                         -OAuthAccount $verdict.Account `
+                                         -SourceLabel $verdict.Source `
                                          -LastSyncHash $hash
 
-            $oldIdent = Format-SlotIdentity -Name $state.active_slot -Email $slotEmail
-            Write-Color "[Sync] Active credentials are now $newEmail; previous slot $oldIdent preserved. Active slot is now '$autoName'." 'Yellow'
+            $oldIdent = Format-SlotIdentity -Name $state.active_slot -Email $verdict.SlotEmail
+            Write-Color "[Sync] Active credentials are now $($verdict.Email); previous slot $oldIdent preserved. Active slot is now '$autoName'." 'Yellow'
             return [pscustomobject]@{
                 Action       = 'identity-change'
                 Slot         = $autoName
                 PreviousSlot = $state.active_slot
-                Email        = $newEmail
+                Email        = $verdict.Email
+                Captured     = $true
             }
         }
         # state.active_slot pointed at a slot file that no longer exists
@@ -2162,10 +2678,45 @@ function Invoke-Reconcile {
     $autoIdent = Format-SlotIdentity -Name $autoName -Email $newEmail
     Write-Color "[Sync] Auto-saved unknown active credentials as $autoIdent." 'Yellow'
     return [pscustomobject]@{
-        Action = 'auto-save'
-        Slot   = $autoName
-        Email  = $newEmail
+        Action   = 'auto-save'
+        Slot     = $autoName
+        Email    = $newEmail
+        Captured = $true
     }
+}
+
+# Build the refusal an action throws when it was about to overwrite
+# .credentials.json and Invoke-Reconcile reported `Captured = $false`.
+#
+# Self-contained on purpose: most callers suppress reconcile's own advisory
+# (6>$null, to keep JSON parseable and watch frames intact), so this is the
+# only thing the user sees. It names the recovery for the same reason
+# the adopt advisory does: nothing retries a refused action on its own.
+#
+# Branches on Reason because the two outcomes have different recoveries. A
+# mid-probe move needs only a re-run. An unresolved identity does not, and the
+# `sca save` offered there carries its precondition: save resolves identity
+# from the same two sources that just failed, and refuses outright while
+# Claude Code is open, so naming it bare would send the user to a command that
+# refuses them for the reason they are already stuck on.
+function Get-UncapturedCredentialsRefusal {
+    Param (
+        [Parameter(Mandatory)] [pscustomobject] $Sync,
+        [Parameter(Mandatory)] [String] $ActionLabel
+    )
+
+    $stake = if ($Sync.Slot) {
+        "the token refresh they carry would be lost and slot '$($Sync.Slot)' left holding a refresh token the server has already rotated"
+    } else {
+        "they would be lost with no saved copy anywhere"
+    }
+
+    if ($Sync.Reason -eq 'credentials-changed-mid-probe') {
+        return "The active credentials changed while their account was being verified, so nothing captured them. '$ActionLabel' overwrites them, and $stake. Re-run: the next pass reads them afresh."
+    }
+
+    $save = if ($Sync.Slot) { "'sca save $($Sync.Slot)'" } else { "'sca save <name>'" }
+    return "The active credentials could not be attributed to an account, so nothing captured them. '$ActionLabel' overwrites them, and $stake. Re-run once an account can be resolved; if it stays unresolved while you are online, close Claude Code and run $save to capture them by hand."
 }
 
 # We are extracting each action body into its own function so the logic
@@ -2182,12 +2733,10 @@ function Invoke-SaveAction {
         throw "$CredFile not found. Log in via Claude Code first."
     }
 
-    # Refuse if Claude Code is running. We resolve identity from
-    # ~/.claude.json's oauthAccount, which Claude Code keeps in an
-    # in-memory cache and may flush back to disk at any moment. Saving
-    # while Claude Code runs would silently capture stale identity into
-    # the sidecar AND risk overwriting our writes if a flush races our
-    # write. Refuse-while-running is the chosen mitigation.
+    # Refuse if Claude Code is running. Save pairs tokens with an identity, one
+    # read from each of the two files a /login updates separately, so catching
+    # that window writes a sidecar naming the wrong account and nothing later
+    # corrects it. See Test-ClaudeRunning.
     if (Test-ClaudeRunning) {
         throw "Claude Code is running. Close it before 'sca save' so identity capture is consistent."
     }
@@ -2201,22 +2750,15 @@ function Invoke-SaveAction {
     $accountInfo = Get-OAuthAccountFromClaudeJson
     $sourceLabel = 'claude_json'
     if (-not $accountInfo) {
-        # Fallback path: live /api/oauth/profile. Returns only the email,
-        # so the rest of the oauthAccount fields default to $null. The
-        # slot is still usable (Claude Code re-derives missing fields
-        # from the next refresh response). Use a non-automatic-variable
-        # name (`$profileResult` rather than `$profile`); `$profile` is
-        # PowerShell's automatic for the running profile path and a
-        # collision could surprise downstream code.
+        # Fallback path: live /api/oauth/profile. Carries the account uuid
+        # and email; the rest of the oauthAccount fields stay $null and
+        # Claude Code re-derives them from the next refresh response. Use a
+        # non-automatic-variable name (`$profileResult` rather than
+        # `$profile`); `$profile` is PowerShell's automatic for the running
+        # profile path and a collision could surprise downstream code.
         $profileResult = Get-SlotProfile -SlotPath $CredFile
         if ($profileResult.Status -eq 'ok' -and $profileResult.Email) {
-            $accountInfo = [pscustomobject]@{
-                accountUuid      = $null
-                emailAddress     = $profileResult.Email
-                organizationUuid = $null
-                displayName      = $null
-                organizationName = $null
-            }
+            $accountInfo = New-OAuthAccountFromProfile -ProfileResult $profileResult
             $sourceLabel = 'api_profile'
         } else {
             $reason = if ($profileResult.Error) {
@@ -2368,9 +2910,6 @@ function Invoke-SaveAction {
 #      and state.last_sync_hash matches the new credentials bytes.
 #
 # Preconditions (callers MUST enforce):
-#   * Test-ClaudeRunning returned $false. The ~/.claude.json write
-#     races Claude Code's in-memory oauthAccount cache; this helper
-#     does NOT recheck the running guard.
 #   * $Slot has a valid sidecar (the caller resolved it via
 #     Find-SlotByName / Get-Slots, both of which filter out
 #     sidecar-less slots).
@@ -2383,22 +2922,20 @@ function Invoke-SlotSwap {
         [Parameter(Mandatory)] [pscustomobject] $Slot
     )
 
-    # Atomic-rename copy: works even if Claude Code has .credentials.json
-    # open (it grants share-delete); but with the running guard enforced
-    # by the caller, this path normally only executes when Claude Code
-    # is closed. Bytes are read from the slot file once and reused for
-    # both the write and the state hash so the post-swap state.hash
-    # matches the bytes we just wrote (not a re-read that could race a
-    # concurrent refresh from another tool).
+    # Atomic-rename copy: works even if Claude Code has .credentials.json open
+    # (it grants share-delete), which is the normal case here rather than the
+    # exception -- switch and rotation both run beside a live client. Bytes are
+    # read from the slot file once and reused for both the write and the state
+    # hash so the post-swap state.hash matches the bytes we just wrote (not a
+    # re-read that could race a concurrent refresh from another tool).
     $slotBytes = [System.IO.File]::ReadAllBytes($Slot.Path)
     Set-CredentialFileAtomic -Path $CredFile -Bytes $slotBytes
 
-    # Restore the captured oauthAccount into ~/.claude.json so Claude
-    # Code's /status display matches the active slot on next start.
-    # Failure to write ~/.claude.json (file locked, malformed,
-    # disappeared) is surfaced as an advisory; we do NOT rollback the
-    # credentials write because Claude Code (or the OpenCode plugin in
-    # the -Auto case) may have already started using the new tokens.
+    # Restore the captured oauthAccount into ~/.claude.json so /status matches
+    # the active slot. A running Claude Code picks this up within a second.
+    # Failure to write it (file locked, malformed, disappeared) is surfaced as
+    # an advisory; we do NOT roll back the credentials write, because by now
+    # the client may already be using the new tokens.
     try {
         Set-OAuthAccountInClaudeJson -OAuthAccount $Slot.Sidecar.oauthAccount
     }
@@ -2414,22 +2951,20 @@ function Invoke-SlotSwap {
 function Invoke-SwitchAction {
     Param ([String] $Name)
 
-    # Refuse if Claude Code is running. Switch writes to ~/.claude.json's
-    # oauthAccount block from the destination slot's sidecar, and a
-    # running Claude Code instance keeps that file in an in-memory
-    # cache that may flush and clobber our update. Refusing is the
-    # simplest reliability guarantee.
-    if (Test-ClaudeRunning) {
-        throw "Claude Code is running. Close it before 'sca switch' so the email-display change applies cleanly."
-    }
-
     # Reconcile FIRST so any pending Claude Code refresh on the outgoing
     # active slot is mirrored into the saved slot file before we
     # overwrite .credentials.json. If reconcile triggers an auto-save or
     # identity-change branch, its yellow advisory prints above the
     # subsequent switch output; that is desired (the user sees
     # context for the unusual state).
-    Invoke-Reconcile | Out-Null
+    #
+    # Refusing when it could not capture is the whole point of reconciling
+    # here: a switch that proceeds anyway destroys the refresh it was meant to
+    # preserve. See Invoke-Reconcile's `Captured`.
+    $sync = Invoke-Reconcile
+    if (-not $sync.Captured) {
+        throw (Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca switch')
+    }
 
     # When invoked without a name, rotate to the next saved slot
     # (alphabetical, wrap-around). Get-NextSlotName returns $null for
@@ -2473,7 +3008,7 @@ function Invoke-SwitchAction {
     Invoke-SlotSwap -Slot $slot
 
     # DarkYellow header line; matches the `[List] Saved slots` /
-    # `[Usage] Plan usage` convention so all three actions present a
+    # `[Usage] Plan usage` convention so the table-rendering actions present a
     # consistent table-header look. No trailing period: this is a
     # header, not a complete sentence.
     $toIdent = Format-SlotIdentity -Name $slot.Name -Email $slot.Email
@@ -2739,8 +3274,8 @@ function Get-SlotOAuth {
 # message on failure.
 #
 # Race with a running Claude Code: `sca usage` does NOT refuse while
-# Claude Code is running (only `save` / `switch` do; see
-# Test-ClaudeRunning callers), so an active-slot refresh triggered here
+# Claude Code is running (only `save`, `warmup` and `monitor -KeepWarm` do;
+# see Test-ClaudeRunning callers), so an active-slot refresh triggered here
 # can race against Claude Code's own refresh. Anthropic rotates the
 # refresh_token on every successful /v1/oauth/token call: whichever
 # party (sca or Claude Code) calls second presents the now-rotated old
@@ -2775,11 +3310,21 @@ function Update-SlotTokens {
         throw "Slot '$SlotPath' has no OAuth material to refresh."
     }
 
-    $body = @{
+    # `scope` mirrors the client, which always sends it on a refresh:
+    #   {grant_type:"refresh_token", refresh_token, client_id, scope: w.join(" ")}
+    # (claude.exe 2.1.278). The slot file's own scopes are used rather than a
+    # hardcoded list so a grant issued with a narrower or wider set asks for
+    # what it actually holds; omitted entirely when the slot records none,
+    # since the client substitutes a default there and guessing it would be
+    # inventing a value this script cannot verify.
+    $bodyMap = [ordered]@{
         grant_type    = 'refresh_token'
         refresh_token = $info.RefreshToken
         client_id     = $Script:OAuthClientId
-    } | ConvertTo-Json -Compress
+    }
+    $scopes = @($info.RawObject.claudeAiOauth.scopes) | Where-Object { $_ }
+    if ($scopes.Count -gt 0) { $bodyMap['scope'] = ($scopes -join ' ') }
+    $body = $bodyMap | ConvertTo-Json -Compress
 
     $headers = @{
         'Content-Type'      = 'application/json'
@@ -2796,8 +3341,20 @@ function Update-SlotTokens {
     # 4xx with a malformed request or a 5xx with a server-side
     # problem). Tests override $Script:TokenRefreshRetryDelayMs to
     # zero so the mocked 429 paths complete instantly.
+    #
+    # One attempt only, once another slot has already drawn a 429 this run.
+    # Measured 2026-09-19: these 429s are served at Cloudflare's edge (Server:
+    # cloudflare, CF-RAY, and no Retry-After or rate-limit header of any kind),
+    # so they never reach the per-token limiter this ladder was written for. A
+    # bogus refresh token and a bogus authorization_code both drew 429 rather
+    # than invalid_grant, which puts the key on the origin, not the grant.
+    # Attempts 2 and 3 cannot clear that, and each is another tally against the
+    # address that tripped it. The first 429 of a run still pays full price,
+    # because nothing is known before it.
+    $maxAttempts = if (Test-TokenEndpointThrottled) { 1 } else { $Script:TokenRefreshRetryMax }
+
     $resp = $null
-    for ($attempt = 1; $attempt -le $Script:TokenRefreshRetryMax; $attempt++) {
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         try {
             $resp = Invoke-RestMethod -Method Post `
                                       -Uri $Script:TokenEndpoint `
@@ -2809,7 +3366,7 @@ function Update-SlotTokens {
         }
         catch {
             $is429 = Test-Is429 $_.Exception
-            if (-not $is429 -or $attempt -ge $Script:TokenRefreshRetryMax) {
+            if (-not $is429 -or $attempt -ge $maxAttempts) {
                 throw
             }
             # Exponential backoff: 2 s, 4 s, 8 s ... capped by RetryMax.
@@ -2856,25 +3413,41 @@ function Update-SlotTokens {
     if ($state -and $state.active_slot) {
         $activeSlot = Find-SlotByName -Name $state.active_slot
         if ($activeSlot -and $activeSlot.Path -eq $SlotPath) {
-            try {
-                Set-CredentialFileAtomic -Path $CredFile -Bytes $newBytes
-
-                $newHash = Get-SHA256Hex -Bytes $newBytes
-                Update-ScaState -LastSyncHash $newHash | Out-Null
+            # Only mirror onto bytes a reconcile actually captured. This write
+            # reaches .credentials.json from `sca usage` and from every monitor
+            # poll, neither of which refuses on Invoke-Reconcile's
+            # `Captured = $false`, so without this check it overwrites bytes no
+            # slot holds a copy of and then stamps last_sync_hash over the
+            # evidence that they were ever unreconciled.
+            #
+            # Only a PROVEN mismatch blocks it, matching the rule the identity
+            # guard follows: a file that cannot be hashed, or a state with no
+            # hash to compare against, must not be able to freeze the mirror.
+            $liveHash = try { Get-SHA256Hex -Path $CredFile } catch { $null }
+            if ($state.last_sync_hash -and $liveHash -and $liveHash -ne $state.last_sync_hash) {
+                Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but .credentials.json holds bytes no slot has captured, so they were left alone rather than overwritten. Re-run once an account can be resolved, or run 'sca switch $($state.active_slot)' to propagate this slot's tokens deliberately." 'Yellow'
             }
-            catch {
-                # Slot file holds the new tokens; .credentials.json still
-                # has the old ones. The next Invoke-Reconcile will hash-
-                # match-noop (state.last_sync_hash equals .credentials.json's
-                # current bytes) so this gap does NOT auto-heal -- the
-                # mirror direction is .credentials.json -> slot, never the
-                # reverse. The user must re-propagate explicitly via
-                # `sca switch <slot>` (which writes the slot's bytes back
-                # into .credentials.json). Until they do, Anthropic may
-                # have rotated the refresh_token we just consumed; Claude
-                # Code reading the stale .credentials.json could fail its
-                # own next refresh and require re-login.
-                Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but propagation to .credentials.json failed: $($_.Exception.Message). Run 'sca switch $($state.active_slot)' to propagate manually; otherwise Claude Code's own refresh may fail and require re-login." 'Yellow'
+            else {
+                try {
+                    Set-CredentialFileAtomic -Path $CredFile -Bytes $newBytes
+
+                    $newHash = Get-SHA256Hex -Bytes $newBytes
+                    Update-ScaState -LastSyncHash $newHash | Out-Null
+                }
+                catch {
+                    # Slot file holds the new tokens; .credentials.json still
+                    # has the old ones. The next Invoke-Reconcile will hash-
+                    # match-noop (state.last_sync_hash equals .credentials.json's
+                    # current bytes) so this gap does NOT auto-heal -- the
+                    # mirror direction is .credentials.json -> slot, never the
+                    # reverse. The user must re-propagate explicitly via
+                    # `sca switch <slot>` (which writes the slot's bytes back
+                    # into .credentials.json). Until they do, Anthropic may
+                    # have rotated the refresh_token we just consumed; Claude
+                    # Code reading the stale .credentials.json could fail its
+                    # own next refresh and require re-login.
+                    Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but propagation to .credentials.json failed: $($_.Exception.Message). Run 'sca switch $($state.active_slot)' to propagate manually; otherwise Claude Code's own refresh may fail and require re-login." 'Yellow'
+                }
             }
         }
         elseif (-not $activeSlot) {
@@ -2955,6 +3528,12 @@ function Get-CachedUsageOrNull {
     )
     if (-not $Script:SlotUsageCache.ContainsKey($SlotPath)) { return $null }
     $entry   = $Script:SlotUsageCache[$SlotPath]
+    # A throttle-only entry (Set-SlotRateLimitBackoff created it for a slot that
+    # never read successfully) carries no numbers. Serving it would report
+    # 'ok' with Data = $null, which Get-RowMaxUtilization scores 0% and
+    # auto-rotation then treats as a healthy, idle rotation target: a throttled
+    # slot promoted to active precisely because nothing could be read from it.
+    if ($null -eq $entry.Data) { return $null }
     $ageMin  = ([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes
     if ($ageMin -ge $Script:UsageCacheMaxAgeMin) { return $null }
 
@@ -3000,15 +3579,26 @@ function Resolve-UsageFailureFallback {
 
 # Mark a slot as throttled: stamp RateLimitedUntil on its cache entry so the
 # next Get-SlotUsage short-circuits to the cache without token/usage HTTP
-# (see $Script:SlotUsageCache). Existing entry only -- a slot with no prior
-# successful read has no data to protect, so it keeps the legacy retry-once
-# behaviour rather than getting a data-less marker that would complicate
-# Get-CachedUsageOrNull's staleness math.
+# (see $Script:SlotUsageCache), creating a throttle-only entry (Data = $null)
+# when the slot has none.
+#
+# Creating it matters more than protecting cached data. The backoff has two
+# jobs: keep a row's numbers on screen, and stop re-tripping a hot limiter.
+# Only the first needs a prior reading. Stamping cached slots alone excluded
+# exactly the slots that never got a reading BECAUSE they were throttled, so
+# each poll re-ran Update-SlotTokens' three-attempt ladder against an endpoint
+# already refusing: measured at 360 POSTs/hour for two such slots at the 60 s
+# default, traffic that plausibly sustains the very throttle it is probing.
+#
+# The two readers of a data-less entry are guarded at the source: Get-SlotUsage
+# omits -CachedReason when it has no numbers to serve, and Get-CachedUsageOrNull
+# refuses the entry outright rather than reporting 'ok' with no Data.
 function Set-SlotRateLimitBackoff {
     Param ([Parameter(Mandatory)] [string] $SlotPath)
-    if ($Script:SlotUsageCache.ContainsKey($SlotPath)) {
-        $Script:SlotUsageCache[$SlotPath].RateLimitedUntil = [DateTime]::UtcNow.AddSeconds($Script:RateLimitBackoffSec)
+    if (-not $Script:SlotUsageCache.ContainsKey($SlotPath)) {
+        $Script:SlotUsageCache[$SlotPath] = @{ Data = $null; Timestamp = [DateTime]::UtcNow }
     }
+    $Script:SlotUsageCache[$SlotPath].RateLimitedUntil = [DateTime]::UtcNow.AddSeconds($Script:RateLimitBackoffSec)
 }
 
 # Drop a slot's backoff stamp so the next Get-SlotUsage probes live again,
@@ -3021,6 +3611,104 @@ function Clear-SlotRateLimitBackoff {
     if ($Script:SlotUsageCache.ContainsKey($SlotPath)) {
         $Script:SlotUsageCache[$SlotPath].Remove('RateLimitedUntil')
     }
+}
+
+# Is ANY slot inside a live backoff window? Read from the per-slot stamps
+# rather than kept as a separate flag, so "we are throttled" has one record
+# and cannot drift from what Set-SlotRateLimitBackoff wrote.
+function Test-TokenEndpointThrottled {
+    $now = [DateTime]::UtcNow
+    foreach ($entry in $Script:SlotUsageCache.Values) {
+        if ($entry.RateLimitedUntil -and $now -lt $entry.RateLimitedUntil) { return $true }
+    }
+    return $false
+}
+
+# --- Auth verdicts: what `claude -p` concluded about a slot's grant --------
+#
+# sca's own /v1/oauth/token request can be refused before the server looks at
+# the grant (measured 2026-09-19: a deliberately invalid refresh token drew the
+# same 429 as a real one). When that happens sca cannot tell a dead login from
+# a live-but-throttled one, and reporting 'rate-limited' implies a temporary
+# condition that clears on its own. For a revoked grant that is false, and it
+# sends the user to wait instead of to re-login.
+#
+# `claude -p` reaches the endpoint when sca cannot, so Invoke-WarmAllSlots'
+# activation result is the better evidence. It is recorded here so a later
+# plain `sca usage`, which never runs claude, can still report the truth.
+#
+# Keyed on a hash of the credential file, not a timestamp: a verdict is about
+# specific bytes. Re-login plus `sca save` rewrites the file, the hash stops
+# matching, and the verdict is ignored without anyone having to remember to
+# clear it. That is the one failure mode a stale-by-age scheme cannot avoid.
+
+# Record claude's auth verdict for a slot. Never throws: a state-file write
+# failure costs a label, not the command.
+function Set-SlotAuthVerdict {
+    Param (
+        [Parameter(Mandatory)] [string] $SlotName,
+        [Parameter(Mandatory)] [string] $SlotPath,
+        [Parameter(Mandatory)] [string] $Status,
+        [AllowNull()] [AllowEmptyString()] [string] $ErrorMessage
+    )
+
+    try {
+        $hash  = Get-SHA256Hex -Path $SlotPath
+        $state = Read-ScaState
+        $map   = if ($state -and $state.auth_verdicts) { $state.auth_verdicts } else { @{} }
+        $map[$SlotName] = @{ status = $Status; error = $ErrorMessage; cred_hash = $hash }
+        Update-ScaState -AuthVerdicts $map | Out-Null
+    }
+    catch { Write-Verbose "Auth verdict for '$SlotName' not recorded: $_" }
+}
+
+# Drop a slot's verdict. Called when anything proves the grant works again.
+function Clear-SlotAuthVerdict {
+    Param ([Parameter(Mandatory)] [string] $SlotName)
+
+    try {
+        $state = Read-ScaState
+        if (-not $state -or -not $state.auth_verdicts) { return }
+        if (-not $state.auth_verdicts.ContainsKey($SlotName)) { return }
+        $map = $state.auth_verdicts
+        $map.Remove($SlotName)
+        Update-ScaState -AuthVerdicts $map | Out-Null
+    }
+    catch { Write-Verbose "Auth verdict for '$SlotName' not cleared: $_" }
+}
+
+# The stored verdict for a slot, but only while it still describes the bytes
+# on disk. $null otherwise, which is also what an unreadable slot file or a
+# missing state file returns: without a verdict the caller keeps its own label.
+function Get-SlotAuthVerdict {
+    Param ([Parameter(Mandatory)] [string] $SlotPath)
+
+    try {
+        $parsed = Get-SlotFileInfo -FileName (Split-Path -Leaf $SlotPath)
+        if (-not $parsed) { return $null }
+
+        $state = Read-ScaState
+        if (-not $state -or -not $state.auth_verdicts) { return $null }
+        $verdict = $state.auth_verdicts[$parsed.Name]
+        if (-not $verdict) { return $null }
+
+        if ($verdict.cred_hash -ne (Get-SHA256Hex -Path $SlotPath)) { return $null }
+        return $verdict
+    }
+    catch { return $null }
+}
+
+# The recorded verdict as a usage row, or $null when there is none. Used at the
+# two points where Get-SlotUsage would otherwise report a 'rate-limited' it
+# cannot substantiate: sca's request was refused before the grant was read, so
+# 'rate-limited' there means only "sca was turned away", and claude's verdict
+# is the better answer where one exists.
+function Resolve-AuthVerdictResult {
+    Param ([Parameter(Mandatory)] [string] $SlotPath)
+
+    $verdict = Get-SlotAuthVerdict -SlotPath $SlotPath
+    if (-not $verdict) { return $null }
+    return New-UsageResult -Status $verdict.status -ErrorMessage $verdict.error
 }
 
 # Read a slot's OAuth tokens and return a non-expired access token,
@@ -3041,10 +3729,20 @@ function Clear-SlotRateLimitBackoff {
 # fresh entry before returning 'rate-limited' (the cache-fallback path); the
 # other two callers have no cache and read Status / Error only.
 #
+# -NoRefresh returns 'expired' instead of refreshing. For callers that are
+# only ASKING something about a slot, refreshing is not a free upgrade: it
+# rotates the refresh token server-side, so doing it as a side effect of a
+# check would invalidate the copy a live Claude Code still holds. The identity
+# guard in Invoke-Reconcile uses it for exactly that reason -- it probes
+# .credentials.json while a client may be mid-request on those very tokens.
+#
 # Does NOT set $ProgressPreference: Get-SlotOAuth performs no HTTP, and
 # Update-SlotTokens sets it inside its own scope.
 function Resolve-SlotAccessToken {
-    Param ([String] $SlotPath)
+    Param (
+        [String] $SlotPath,
+        [switch] $NoRefresh
+    )
 
     try {
         $info = Get-SlotOAuth -SlotPath $SlotPath
@@ -3064,6 +3762,17 @@ function Resolve-SlotAccessToken {
     # expire mid-call.
     $threshold = [DateTime]::UtcNow.AddSeconds(60)
     if ($info.ExpiresAt -and $info.ExpiresAt -lt $threshold) {
+        if ($NoRefresh) {
+            # Same label the failed-refresh path uses, because the caller's
+            # situation is identical: no usable token. Transport=$false, since
+            # nothing was attempted and a retry would not differ.
+            return [pscustomobject]@{
+                Status     = 'expired'
+                Error      = 'access token expired and -NoRefresh was requested'
+                HttpStatus = $null
+                Transport  = $false
+            }
+        }
         try {
             $accessToken = Update-SlotTokens -SlotPath $SlotPath
         }
@@ -3152,6 +3861,16 @@ function Get-SlotUsage {
         # carrying numbers nobody should act on.
         $tooOld = ([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -ge $Script:UsageCacheMaxAgeMin
         $data   = if ($tooOld) { $null } else { $entry.Data }
+        # -CachedReason only alongside numbers: it sets IsCachedFallback, which
+        # is what routes the row to the "; showing last known usage" advisory.
+        # On a throttle-only entry, or one past the age ceiling, there is no
+        # last known usage and the row renders em-dashes, so claiming it would
+        # describe the screen wrongly.
+        if ($null -eq $data) {
+            $verdict = Resolve-AuthVerdictResult -SlotPath $SlotPath
+            if ($verdict) { return $verdict }
+            return New-UsageResult -Status 'rate-limited'
+        }
         return New-UsageResult -Status 'rate-limited' -Data $data -CachedReason 'rate-limit'
     }
 
@@ -3171,6 +3890,11 @@ function Get-SlotUsage {
             # 429 retry loop inside Update-SlotTokens.
             $fallback = Resolve-UsageFailureFallback -SlotPath $SlotPath -Reason 'rate-limit'
             if ($fallback) { return $fallback }
+            # Nothing cached, so the row would carry sca's own guess and nothing
+            # else. Prefer a recorded verdict: claude reached the endpoint when
+            # this probe could not.
+            $verdict = Resolve-AuthVerdictResult -SlotPath $SlotPath
+            if ($verdict) { return $verdict }
         }
         elseif ($tok.Status -eq 'expired' -and $tok.Transport) {
             # The refresh POST died in transport, not on its merits. Its budget
@@ -3221,9 +3945,9 @@ function Get-SlotUsage {
         # retry once"). They differ in the reason they report, in whether the
         # retry sleeps first, and in how a doomed retry is labelled.
         if ($status -eq 429) {
-            # Stamp the backoff (no-op without a prior entry; see
-            # Set-SlotRateLimitBackoff) so subsequent polls stop re-tripping a
-            # hot limiter.
+            # Stamp the backoff, creating a throttle-only entry when the slot
+            # has none (see Set-SlotRateLimitBackoff), so subsequent polls stop
+            # re-tripping a hot limiter.
             Set-SlotRateLimitBackoff -SlotPath $SlotPath
             $fallback = Resolve-UsageFailureFallback -SlotPath $SlotPath -Reason 'rate-limit'
             if ($fallback) { return $fallback }
@@ -3404,8 +4128,8 @@ function Get-ExceptionHttpStatus {
     return $null
 }
 
-# Resolve the OAuth account email for a slot. Returns one of:
-#   @{ Status = 'ok';           Email = <string> }
+# Resolve the OAuth account identity for a slot. Returns one of:
+#   @{ Status = 'ok';           Email = <string>; AccountUuid = <string> }
 #   @{ Status = 'no-oauth' }                        # slot has no claudeAiOauth
 #   @{ Status = 'expired' }                         # token expired + refresh failed (non-429)
 #   @{ Status = 'rate-limited' }                    # 429 from refresh endpoint OR profile endpoint
@@ -3429,7 +4153,10 @@ function Get-ExceptionHttpStatus {
 # endpoint without an emergency patch.
 function Get-SlotProfile {
     Param (
-        [String] $SlotPath
+        [String] $SlotPath,
+        # Threaded to Resolve-SlotAccessToken; see its docblock for why a
+        # caller that is only asking a question must not rotate tokens.
+        [switch] $NoRefresh
     )
 
     # See Get-SlotUsage for the $ProgressPreference rationale; same
@@ -3440,7 +4167,7 @@ function Get-SlotProfile {
     # 429-as-rate-limited from the token endpoint) return verbatim. No
     # profile cache to fall back on (Get-SlotProfile is no-cache by
     # design; see the function docstring above).
-    $tok = Resolve-SlotAccessToken -SlotPath $SlotPath
+    $tok = Resolve-SlotAccessToken -SlotPath $SlotPath -NoRefresh:$NoRefresh
     if ($tok.Status -ne 'ok') { return $tok }
     $accessToken = $tok.AccessToken
 
@@ -3478,7 +4205,16 @@ function Get-SlotProfile {
         return [pscustomobject]@{ Status = 'error'; Error = 'profile response missing account.email' }
     }
 
-    return [pscustomobject]@{ Status = 'ok'; Email = $email }
+    # account.uuid is required by the client's own schema (see the
+    # $Script:ProfileEndpoint docblock), but it is carried as optional here
+    # rather than failing the call: the email is what every existing caller
+    # needs, and only the identity guard reads the uuid. A response that
+    # somehow lacks it degrades that guard to "cannot confirm", which is
+    # already a case it handles, instead of breaking `sca save`.
+    $accountUuid = $null
+    if ($resp.account.uuid) { $accountUuid = [string]$resp.account.uuid }
+
+    return [pscustomobject]@{ Status = 'ok'; Email = $email; AccountUuid = $accountUuid }
 }
 
 # Run the Claude Code CLI (`claude`) as a child process and return its raw
@@ -3881,7 +4617,7 @@ function Get-StatusRationale {
         'limited'           { return 'no prompts until both 5h and 7d windows reset' }
         'near limit'        { return "at or above $($Script:UtilWarnPct)% on at least one bucket" }
         'ok (no plan data)' { return 'HTTP ok but response carried no bucket data' }
-        'expired'           { return 'token refresh failed; run sca switch to refresh' }
+        'expired'           { return 'token refresh failed; run sca switch, then /login if it persists' }
         'unauthorized'      { return 'token revoked; run sca switch then /login' }
         'no-oauth'          { return 'api key or non-claude.ai slot' }
         default             { return $null }
@@ -4066,6 +4802,151 @@ function Format-AggregateBars {
     }
 }
 
+# The Status column's vocabulary, for one row. Plan-usability when HTTP was
+# ok, HTTP state otherwise.
+#
+# Every label is a short fixed string, because this column's width also sizes
+# the aggregate bars above the header: one long cell wrapped both its own row
+# AND the two bars. Reasons (an exception tail, or the remedy for a hard
+# failure) therefore live on Format-UsageAdvisory's per-slot lines below the
+# table, which own a full terminal line. The one bounded exception is
+# 'error <code>', short enough to read at a glance and the single most useful
+# discriminator between a transient 5xx and everything else.
+function Get-UsageStatusLabel {
+    Param ([Parameter(Mandatory)] [object] $Row)
+
+    switch ($Row.Status) {
+        'ok'           { Get-PlanStatus $Row.Data }
+        'no-oauth'     { 'no-oauth' }
+        'expired'      { 'expired' }
+        'unauthorized' { 'unauthorized' }
+        'error'        {
+            if ($Row.PSObject.Properties['HttpStatus'] -and $Row.HttpStatus) {
+                "error $($Row.HttpStatus)"
+            } else {
+                'error'
+            }
+        }
+        'rate-limited' { 'rate-limited' }
+        # Both are warmup-pass transients: Invoke-WarmAllSlots seeds every row
+        # 'warming-up', flips the one it is activating to 'priming' while
+        # `claude -p` is in flight, then to the real outcome. They render
+        # space-separated to match the existing label convention ('rate
+        # limited' / 'limited 5h' / 'near limit').
+        'warming-up'   { 'warming up' }
+        'priming'      { 'priming' }
+        default        { [string]$Row.Status }
+    }
+}
+
+# One usage row to its rendered cells. Pure: every branch is a function of
+# $Row alone, which is what lets the table's cell rules be tested without
+# rendering a table and matching stdout.
+function ConvertTo-UsageTableRow {
+    Param ([Parameter(Mandatory)] [object] $Row)
+
+    $fiveCell  = '   —'
+    $sevenCell = '   —'
+
+    # Percentages render whenever the row carries data, not only on 'ok'. A
+    # 'rate-limited' row served from the (possibly stale) cache fallback
+    # carries last-known Data, and showing those numbers keeps it from looking
+    # like a dead slot during a transient throttle. Rows with no Data keep the
+    # em-dash.
+    if (Test-RowHasUsableData -Row $Row) {
+        if ($Row.Data.five_hour -and $null -ne $Row.Data.five_hour.utilization) {
+            $fiveCell = Format-BucketCell $Row.Data.five_hour.utilization $Row.Data.five_hour.resets_at
+        }
+        if ($Row.Data.seven_day -and $null -ne $Row.Data.seven_day.utilization) {
+            $sevenCell = Format-BucketCell $Row.Data.seven_day.utilization $Row.Data.seven_day.resets_at
+        }
+    }
+
+    $email = if ($Row.PSObject.Properties['Email']) { $Row.Email } else { $null }
+
+    return [pscustomobject]@{
+        Row     = $Row
+        Marker  = if ($Row.IsActive) { '*' } else { ' ' }
+        Name    = $Row.Name
+        Account = Format-AccountCell -SlotName $Row.Name -Email $email
+        Five    = $fiveCell
+        Seven   = $sevenCell
+        Status  = Get-UsageStatusLabel -Row $Row
+    }
+}
+
+# Column widths for a batch of rendered rows, plus the total line width the
+# aggregate bars fit themselves to.
+#
+# Minimums are the header label lengths so a 1-2 slot table never clips its
+# own headers; the data-driven max keeps such a table narrow. TotalWidth
+# mirrors the format string in Format-UsageTable: 2 (indent) + 1 (marker)
+# + 1 (sep) + each column + 2 between each.
+function Measure-UsageTableColumns {
+    Param ([Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Rows)
+
+    $w = @{ Name = 4; Account = 7; Five = 7; Seven = 4; Status = 6 }
+    foreach ($e in $Rows) {
+        if ($e.Name.Length    -gt $w.Name)    { $w.Name    = $e.Name.Length }
+        if ($e.Account.Length -gt $w.Account) { $w.Account = $e.Account.Length }
+        if ($e.Five.Length    -gt $w.Five)    { $w.Five    = $e.Five.Length }
+        if ($e.Seven.Length   -gt $w.Seven)   { $w.Seven   = $e.Seven.Length }
+        if ($e.Status.Length  -gt $w.Status)  { $w.Status  = $e.Status.Length }
+    }
+    $w.TotalWidth = 2 + 1 + 1 + $w.Name + 2 + $w.Account + 2 + $w.Five + 2 + $w.Seven + 2 + $w.Status
+    return $w
+}
+
+# The '[Usage] Plan usage' header line, with -Auto's optional right-aligned
+# '▶ switching slot at N%' indicator.
+#
+# The indicator anchors to the terminal's right edge less one column, and is
+# dropped entirely when the terminal cannot fit the left header plus a 2-space
+# gap plus the indicator plus that margin. Dropping loses nothing: the
+# footer's [Monitor] line carries the same state. An unknown width (0) counts
+# as narrow.
+#
+# Rendered as three -NoNewline segments so each carries its own SGR: white
+# glyph (U+25B6, a high-contrast lozenge so the auto-mode signal pops) and
+# DarkGray text (the footer's ambient-metadata weight, so the indicator
+# recedes). The trailing blank Write-Host terminates the logical row.
+function Write-UsageTableHeader {
+    Param ([int] $AutoThreshold = 0)
+
+    $headerLeft = '[Usage] Plan usage'
+    $glyph      = $null
+    $text       = $null
+    $padding    = $null
+
+    if ($AutoThreshold -gt 0) {
+        $glyph     = "$([char]0x25B6)"
+        $text      = " switching slot at $AutoThreshold%"
+        $termWidth = Get-ConsoleWidth
+        if ($termWidth -ge ($headerLeft.Length + 2 + $glyph.Length + $text.Length + 1)) {
+            $padding = ' ' * ($termWidth - $headerLeft.Length - $glyph.Length - $text.Length - 1)
+        } else {
+            $glyph = $null
+            $text  = $null
+        }
+    }
+
+    if ($glyph) {
+        Write-Color $headerLeft 'DarkYellow' -NoNewline
+        Write-Host  $padding               -NoNewline
+        Write-Color $glyph      'Gray'      -NoNewline
+        Write-Color $text       'DarkGray'
+    } else {
+        Write-Color $headerLeft 'DarkYellow'
+    }
+    Write-Host ''
+
+    # Extra breathing room under the header when -Auto is engaged: the
+    # right-side indicator makes the row visually busier, so an additional
+    # blank balances it. Without -Auto the one-blank cadence is preserved
+    # (matches the committed screenshots / SVGs).
+    if ($AutoThreshold -gt 0) { Write-Host '' }
+}
+
 # Render per-slot usage rows as a fixed-width table. Uses Write-Host (the
 # information stream) to match the other Invoke-*Action functions so the
 # existing `$out = Invoke-*Action 6>&1 | Out-String` test pattern keeps
@@ -4094,173 +4975,21 @@ function Format-UsageTable {
     Param (
         [object[]] $Results,
         [switch]   $IncludeAggregateBars,
-        # When > 0, append a right-aligned '▶ switching slot at N%'
-        # indicator to the '[Usage] Plan usage' header line. Used by
-        # the watch loop's -Auto mode to indicate auto-rotation is
-        # engaged. The indicator's right edge anchors to the terminal
-        # width minus 1 (preserves a 1-char right margin); when the
-        # terminal is too narrow to fit the left header AND a 2-space
-        # gap AND the indicator, the indicator is silently dropped
-        # (the footer's [Monitor] line still carries the state). When
-        # -Auto is set, an extra blank line is inserted under the
-        # header to balance the visually-busier right-aligned indicator.
+        # When > 0, the '[Usage] Plan usage' header carries -Auto's
+        # right-aligned indicator; see Write-UsageTableHeader.
         [int]      $AutoThreshold = 0
     )
 
     if (-not $Results) { return }
 
-    # Precompute per-row cell content so column widths can auto-fit.
-    $rows = foreach ($r in $Results) {
-        $fiveCell  = '   —'
-        $sevenCell = '   —'
+    $rows = @(foreach ($r in $Results) { ConvertTo-UsageTableRow -Row $r })
+    $w    = Measure-UsageTableColumns -Rows $rows
 
-        # Render bucket percentages whenever the row carries data, not only
-        # on 'ok'. A 'rate-limited' row served from the (possibly stale)
-        # cache fallback carries last-known Data; showing those numbers
-        # keeps the row from looking like a dead/unused slot during a
-        # transient throttle. Rows with no Data (expired / unauthorized /
-        # error / no-oauth / no-cache rate-limited) keep the em-dash.
-        if (Test-RowHasUsableData -Row $r) {
-            if ($r.Data.five_hour -and $null -ne $r.Data.five_hour.utilization) {
-                $fiveCell = Format-BucketCell $r.Data.five_hour.utilization $r.Data.five_hour.resets_at
-            }
-            if ($r.Data.seven_day -and $null -ne $r.Data.seven_day.utilization) {
-                $sevenCell = Format-BucketCell $r.Data.seven_day.utilization $r.Data.seven_day.resets_at
-            }
-        }
+    $fmt = "  {0} {1,-$($w.Name)}  {2,-$($w.Account)}  {3,-$($w.Five)}  {4,-$($w.Seven)}  {5}"
+    $totalLineWidth = $w.TotalWidth
 
-        $email = if ($r.PSObject.Properties['Email']) { $r.Email } else { $null }
-        $accountCell = Format-AccountCell -SlotName $r.Name -Email $email
+    Write-UsageTableHeader -AutoThreshold $AutoThreshold
 
-        # Status: plan-usability when HTTP was ok, HTTP-state otherwise.
-        # Every label is a short fixed string, because this is the last
-        # column and its width also sizes the aggregate bars above the
-        # header: one long cell wrapped both its own row AND the two bars.
-        # Reasons (an exception tail, or the remedy for a hard failure)
-        # therefore live on Format-UsageAdvisory's per-slot lines below the
-        # table, which own a full terminal line. The one bounded exception
-        # is 'error <code>', short enough to read at a glance and the single
-        # most useful discriminator between transient 5xx and everything else.
-        $statusText = switch ($r.Status) {
-            'ok'           { Get-PlanStatus $r.Data }
-            'no-oauth'     { 'no-oauth' }
-            'expired'      { 'expired' }
-            'unauthorized' { 'unauthorized' }
-            'error'        {
-                if ($r.PSObject.Properties['HttpStatus'] -and $r.HttpStatus) {
-                    "error $($r.HttpStatus)"
-                } else {
-                    'error'
-                }
-            }
-            'rate-limited' { 'rate-limited' }
-            # 'warming-up' is the transient initial label rendered when
-            # Invoke-WarmAllSlots starts iterating slots on `sca warmup`
-            # or `sca monitor -KeepWarm` startup. Synthetic snapshot rows carry
-            # it; the warmup pass mutates each row's Status to 'priming'
-            # while its `claude -p` activation is in flight, then to the
-            # real outcome ('ok' / 'rate-limited' / 'no-oauth' /
-            # 'expired' / 'unauthorized' / 'error') once it returns. The
-            # hyphenated internal value renders space-separated to match
-            # the existing label convention ('rate limited' / 'limited
-            # 5h' / 'near limit').
-            'warming-up'    { 'warming up' }
-            'priming'       { 'priming' }
-            default         { [string]$r.Status }
-        }
-
-        [pscustomobject]@{
-            Row     = $r
-            Marker  = if ($r.IsActive) { '*' } else { ' ' }
-            Name    = $r.Name
-            Account = $accountCell
-            Five    = $fiveCell
-            Seven   = $sevenCell
-            Status  = $statusText
-        }
-    }
-
-    # Minimum widths are the header label lengths so headers never get
-    # clipped. Data-driven max keeps narrow tables narrow for 1-2 slots.
-    # 'Session' (7) / 'Week' (4) are the new header literals; min widths
-    # match. Status header is 6 chars but the column flows; track the
-    # widest rendered status so $totalLineWidth below is accurate.
-    $nameW = 4; $acctW = 7; $fiveW = 7; $sevenW = 4; $statusW = 6
-    foreach ($e in $rows) {
-        if ($e.Name.Length    -gt $nameW)   { $nameW   = $e.Name.Length }
-        if ($e.Account.Length -gt $acctW)   { $acctW   = $e.Account.Length }
-        if ($e.Five.Length    -gt $fiveW)   { $fiveW   = $e.Five.Length }
-        if ($e.Seven.Length   -gt $sevenW)  { $sevenW  = $e.Seven.Length }
-        if ($e.Status.Length  -gt $statusW) { $statusW = $e.Status.Length }
-    }
-
-    $fmt = "  {0} {1,-$nameW}  {2,-$acctW}  {3,-$fiveW}  {4,-$sevenW}  {5}"
-
-    # Total rendered line width; used to fit-to-table the aggregate
-    # bars above the header. Mirrors the $fmt pattern: 2 (indent) + 1
-    # (marker) + 1 (sep) + nameW + 2 + acctW + 2 + fiveW + 2 + sevenW
-    # + 2 + statusW.
-    $totalLineWidth = 2 + 1 + 1 + $nameW + 2 + $acctW + 2 + $fiveW + 2 + $sevenW + 2 + $statusW
-
-    # Header: '[Usage] Plan usage' left-anchored, optional right-aligned
-    # auto-mode indicator. The indicator is computed against the terminal
-    # width (Get-ConsoleWidth) so it floats to the right edge with
-    # a 1-column right margin. Width-aware fallback: when the terminal
-    # is too narrow to fit both segments with a 2-space minimum gap, the
-    # indicator is silently dropped (the footer's [Monitor] line still
-    # carries the state, so no information is lost). An unknown width (0)
-    # counts as "narrow" and drops the indicator.
-    #
-    # Indicator visual: '<glyph><space><text>' where:
-    #   glyph = '▶' (U+25B6, "black right-pointing triangle"), white
-    #           (high-contrast lozenge so the auto-mode signal pops
-    #            against the dimmer header / footer text).
-    #   text  = 'switching slot at N%', DarkGray (matches the footer
-    #           '[Watch]' / '[Monitor]' line color so the indicator recedes
-    #           into ambient-metadata weight).
-    # Rendered via three Write-Color calls with -NoNewline so each segment
-    # carries its own SGR color while the line is still a single logical
-    # row. The trailing un-piped Write-Host '' terminates the row.
-    $headerLeft  = '[Usage] Plan usage'
-    $autoGlyph   = $null
-    $autoText    = $null
-    $autoPadding = $null
-    if ($AutoThreshold -gt 0) {
-        $autoGlyph    = "$([char]0x25B6)"
-        $autoText     = " switching slot at $AutoThreshold%"
-        $indicatorLen = $autoGlyph.Length + $autoText.Length
-        $termWidth    = Get-ConsoleWidth
-        # Reserve 1 col right margin so the indicator isn't flush with
-        # the terminal edge. Need: leftLen + 2 (min gap) + indicatorLen
-        # + 1 (right margin) <= width.
-        if ($termWidth -lt ($headerLeft.Length + 2 + $indicatorLen + 1)) {
-            $autoGlyph = $null
-            $autoText  = $null
-        } else {
-            $padCount    = $termWidth - $headerLeft.Length - $indicatorLen - 1
-            $autoPadding = ' ' * $padCount
-        }
-    }
-    if ($autoGlyph) {
-        # Three-segment colored line: DarkYellow header + padding (no
-        # color) + white glyph (high-contrast lozenge) + DarkGray text
-        # (matches footer ambient-metadata color). -NoNewline chains
-        # them onto one logical row; final Write-Host '' below terminates.
-        Write-Color $headerLeft  'DarkYellow' -NoNewline
-        Write-Host  $autoPadding -NoNewline
-        Write-Color $autoGlyph   'Gray'       -NoNewline
-        Write-Color $autoText    'DarkGray'
-    } else {
-        Write-Color $headerLeft 'DarkYellow'
-    }
-    Write-Host ''
-    # Extra breathing room under the header when -Auto is engaged: the
-    # right-side indicator makes the header row visually busier, so an
-    # additional blank balances the layout. Without -Auto the original
-    # one-blank cadence is preserved (matches existing screenshots / SVG).
-    if ($AutoThreshold -gt 0) {
-        Write-Host ''
-    }
     # Aggregate bars sit between the post-header blank and the column
     # header. Format-AggregateBars emits per bar: 'bar line' + blank,
     # so the caller's blank above acts as the leading padding. When
@@ -4281,8 +5010,8 @@ function Format-UsageTable {
         }
         Format-AggregateBars -Results $Results -TotalLineWidth $barLineWidth
     }
-    Write-Host ($fmt -f ' ',  'Slot',         'Account',       'Session',     'Week',          'Status')
-    Write-Host ($fmt -f ' ', ('-' * $nameW), ('-' * $acctW),  ('-' * $fiveW), ('-' * $sevenW), '------')
+    Write-Host ($fmt -f ' ',  'Slot',            'Account',            'Session',        'Week',            'Status')
+    Write-Host ($fmt -f ' ', ('-' * $w.Name), ('-' * $w.Account), ('-' * $w.Five), ('-' * $w.Seven), '------')
 
     foreach ($entry in $rows) {
         $color = Get-StatusColor -Label $entry.Status -IsActive ([bool]$entry.Row.IsActive)
@@ -4580,9 +5309,19 @@ function Format-UsageAdvisory {
     # carries a non-ok Status too, and reporting it twice would contradict
     # itself (once as "unreadable", once as "showing last known usage").
     $bareError  = @($rows | Where-Object { $_.Status -eq 'error'        -and -not $_.IsCachedFallback })
-    $bareLimit  = @($rows | Where-Object { $_.Status -eq 'rate-limited' -and -not $_.IsCachedFallback })
     $cachedNet  = @($rows | Where-Object { $_.IsCachedFallback -and $_.FallbackReason -eq 'network' })
     $cachedLim  = @($rows | Where-Object { $_.IsCachedFallback -and $_.FallbackReason -ne 'network' })
+
+    # Throttled rows split on whether sca has ever actually read the slot. One
+    # carrying numbers was read at some point, so "rate-limited or at a plan
+    # limit" describes it. One with nothing to show has never been read, and
+    # sca's own token request can be refused before the server looks at the
+    # grant (measured 2026-09-19), so from here a throttle and a revoked login
+    # are indistinguishable. Claiming the first sends the user off to wait out
+    # something that will never clear; naming the command that can tell them
+    # apart is the only honest line available.
+    $bareLimit  = @($rows | Where-Object { $_.Status -eq 'rate-limited' -and -not $_.IsCachedFallback -and $_.Data })
+    $unverified = @($rows | Where-Object { $_.Status -eq 'rate-limited' -and -not $_.IsCachedFallback -and -not $_.Data })
 
     $conditions = [System.Collections.Generic.List[string]]::new()
 
@@ -4600,8 +5339,9 @@ function Format-UsageAdvisory {
     # session limit" is a plan limit and not a rate limit. The per-slot reason
     # line below carries the real cause, which is accurate for both producers.
     foreach ($bucket in @(
-        @{ Rows = $bareError; NeedsCopula = $false; Tail = 'could not be read; usage unknown.' },
-        @{ Rows = $bareLimit; NeedsCopula = $true;  Tail = 'currently rate-limited or at a plan limit.' },
+        @{ Rows = $bareError;  NeedsCopula = $false; Tail = 'could not be read; usage unknown.' },
+        @{ Rows = $unverified; NeedsCopula = $false; Tail = "could not be read, and sca cannot tell a throttle from an expired login; run 'sca warmup <slot>' to check." },
+        @{ Rows = $bareLimit;  NeedsCopula = $true;  Tail = 'currently rate-limited or at a plan limit.' },
         @{ Rows = $cachedNet; NeedsCopula = $false; Tail = 'could not be read live; showing last known usage.' },
         @{ Rows = $cachedLim; NeedsCopula = $true;  Tail = 'currently rate-limited or at a plan limit; showing last known usage.' }
     )) {
@@ -4690,7 +5430,7 @@ function Format-UsageAdvisory {
     }
 
     # Conditions and remedies always fit, by construction: their worst case is
-    # 4 + 3 and $Script:AdvisoryMaxLines is set above that, which is what makes
+    # 5 + 3 and $Script:AdvisoryMaxLines is set above that, which is what makes
     # "every failing slot is named" a property of the block rather than of the
     # pool that happened to fail.
     $lines = [System.Collections.Generic.List[string]]::new()
@@ -4940,9 +5680,11 @@ function Invoke-UsageAction {
     }
 
     if ($Watch) {
-        # Read-only live view: no auto-rotation, no keep-warm. Those modes
-        # are `sca monitor` (Invoke-MonitorAction), which calls the same
-        # watch engine with -Auto / -Warmup set.
+        # Non-rotating live view: no auto-rotation, no keep-warm. Those
+        # modes are `sca monitor` (Invoke-MonitorAction), which calls the
+        # same watch engine with -Auto / -Warmup set. It still writes: the
+        # per-poll Invoke-Reconcile below mirrors into the tracked slot,
+        # and its adopt branch writes state and ~/.claude.json.
         Invoke-UsageWatch -Name $Name -Interval $Interval
         return
     }
@@ -5010,14 +5752,12 @@ function Invoke-UsageAction {
 # (Invoke-UsageWatch), which keeps its internal -Auto / -Warmup parameter
 # names; the public surface is `monitor` (rotation is unconditional) and
 # -KeepWarm. A positional <name> is ignored: rotation and keep-warm span
-# the whole slot fleet, so scoping to one slot is meaningless. The
-# Claude-Code-running refusal lives in Invoke-UsageWatch's pre-loop guard.
+# the whole slot fleet, so scoping to one slot is meaningless.
 #
-# Scope is OpenCode-only by design (issue #8). Rotation depends on the client
-# re-reading .credentials.json when its cached token misses, which
-# opencode-claude-auth >= 1.5.4 does, so a swap propagates without a restart.
-# Claude Code caches ~/.claude.json in memory instead and would race the
-# swap, which is why the guard refuses rather than warns.
+# Rotation needs the client to re-read .credentials.json when its cached token
+# misses, which opencode-claude-auth >= 1.5.4 and Claude Code >= 2.1.274 both
+# do, so plain `monitor` runs beside either. -KeepWarm refuses a live Claude
+# Code, guarded in Invoke-UsageWatch; see Test-ClaudeRunning.
 function Invoke-MonitorAction {
     Param (
         [string] $Name,
@@ -5035,24 +5775,28 @@ function Invoke-MonitorAction {
 # table with live percentages and exits. This is the automation of the
 # manual "switch to a slot, send one message" routine across all slots.
 #
-# Refuses up front if Claude Code is already running (the per-slot swap
-# writes ~/.claude.json's oauthAccount, which a live Claude Code caches)
-# and if the `claude` binary is not on PATH (the activation IS `claude`).
-# The original active slot is restored by Invoke-WarmAllSlots' finally
-# block. Billable: ~$0.004 per slot on the pinned Haiku model.
+# Refuses up front if Claude Code is already running (see Test-ClaudeRunning),
+# and when the `claude` binary is not on PATH, since the activation IS
+# `claude`. The original active slot is restored by Invoke-WarmAllSlots'
+# finally block. Billable: ~$0.004 per slot on the pinned Haiku model.
 function Invoke-WarmupAction {
     Param ([String] $Name)
 
     if (Test-ClaudeRunning) {
-        throw "Claude Code is running. Close it before 'sca warmup' so each per-slot credentials swap applies cleanly without racing Claude Code's in-memory ~/.claude.json cache."
+        throw "Claude Code is running. Close it before 'sca warmup', which makes every slot active in turn and would drag the live session across all of them. 'sca switch' and 'sca monitor' do not have that problem and run fine alongside Claude Code."
     }
     if (-not (Get-Command claude -CommandType Application -ErrorAction SilentlyContinue)) {
         throw "The 'claude' CLI was not found on PATH. 'sca warmup' activates each slot by running 'claude -p', so Claude Code must be installed."
     }
 
     # Reconcile first so a cross-account swap landed since the last sca call
-    # is captured before any slot bytes are read (matches list / usage).
-    Invoke-Reconcile | Out-Null
+    # is captured before any slot bytes are read (matches list / usage), and
+    # refuse if it could not: this walk overwrites .credentials.json once per
+    # slot. See Invoke-Reconcile's `Captured`.
+    $sync = Invoke-Reconcile
+    if (-not $sync.Captured) {
+        throw (Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca warmup')
+    }
 
     Write-Color "[Warmup] Activating saved slots via 'claude -p' (billable; ~`$0.004/slot on Haiku, a few seconds each)..." 'DarkYellow'
 
@@ -5340,11 +6084,10 @@ function Format-AutoCooldownDelta {
 #
 #   1. Get-AutoRotationDecision (pure) to classify the active slot's
 #      state against -Threshold.
-#   2. Re-check Test-ClaudeRunning before any rotation (covers the
-#      "Claude Code launched after -Auto started" race; the pre-loop
-#      guard in Invoke-UsageWatch only fires once at startup).
-#   3. Find-SlotByName + Invoke-SlotSwap when a peer is eligible.
-#   4. Map the outcome to a single-line latched footer string that
+#   2. Invoke-Reconcile, then Find-SlotByName + Invoke-SlotSwap when a
+#      peer is eligible. An outcome that moved state.active_slot aborts
+#      the tick instead, because it invalidates the decision from step 1.
+#   3. Map the outcome to a single-line latched footer string that
 #      Invoke-UsageWatch appends to every subsequent frame until the
 #      next state change.
 #
@@ -5418,15 +6161,41 @@ function Invoke-AutoRotationStep {
         }
 
         'rotate' {
-            # Per-rotation Test-ClaudeRunning re-check. The pre-loop
-            # guard caught the startup case; this catches the "Claude
-            # Code launched mid-watch" race. Surface the refusal as
-            # a [Monitor] line; the credentials swap does NOT happen.
-            if (Test-ClaudeRunning) {
-                return '[Monitor] Rotation refused! Claude Code is running.'
-            }
-
             try {
+                # Re-capture before the swap. The poll reconciled before
+                # Get-UsageSnapshot, which then spends a full serial HTTP pass
+                # across every slot; a Claude Code refresh landing in that
+                # window would otherwise be overwritten by the swap below and
+                # never mirrored, leaving the outgoing slot holding a refresh
+                # token Anthropic has already rotated (see Update-SlotTokens on
+                # what losing that rotation costs). Only on the rotate branch:
+                # the polls that do not rotate write nothing and pay nothing.
+                # A throw here is caught below and reported as a rotation
+                # failure, which is correct -- rotating away from a slot we
+                # could not capture is the loss this call exists to prevent.
+                $sync = Invoke-Reconcile 6>$null
+
+                # A reconcile that wrote nothing leaves the swap below about to
+                # discard the refresh this call exists to preserve, so the tick
+                # is abandoned for the same reason a throw would abandon it.
+                # Nothing is lost by waiting: the next poll re-reads and the
+                # threshold that triggered this will still be crossed.
+                if (-not $sync.Captured) {
+                    return '[Monitor] Rotation refused! The active slot''s latest tokens could not be captured; retrying at the next poll.'
+                }
+
+                # Reconcile is not only a capture. Adopt, identity-change and
+                # auto-save each move state.active_slot, and that makes
+                # $decision stale: it was computed from a snapshot taken before
+                # this call, judging a slot that is no longer the active one.
+                # Rotating on it would move off an account whose usage nobody
+                # has read, and latch a FromName that is not where we came
+                # from. Skipping costs one tick; the next poll reads usage
+                # again and replaces this latch with a decision that fits.
+                if ($sync.Action -in @('adopt', 'identity-change', 'auto-save')) {
+                    return "[Monitor] Active account changed to '$($sync.Slot)'; re-evaluating at the next poll."
+                }
+
                 $slot = Find-SlotByName -Name $decision.ToName
                 if (-not $slot) {
                     # Sidecar disappeared between snapshot and lookup.
@@ -5497,6 +6266,19 @@ $Script:WarmupSpacingMs    = 300
 # Tunable for tests (Common.ps1 overrides to zero).
 $Script:WarmupCooldownMin  = 5
 
+# How many times the cooldown may double for a slot whose warm attempts keep
+# failing: 5, 10, 20, 40, 80, then 160 minutes and no further.
+#
+# A flat cooldown assumes the next attempt can succeed. When the account's
+# token endpoint is throttled that assumption is false for every attempt,
+# and `claude -p` is billable (~$0.004), so a flat 5 minutes spends about
+# $1.15 per slot per day discovering the same answer. Doubling keeps the
+# fast first retry for the transient case the cooldown was written for and
+# makes a persistent failure cheap; the cap keeps a recovered slot from
+# waiting hours to be noticed. The counter resets on the first successful
+# warm, so nothing is sticky once the condition clears.
+$Script:WarmupBackoffMaxDoublings = 5
+
 # Slot activator (`claude -p`) settings. Warmup opens a slot's 5h session
 # window by running the real Claude Code CLI as that slot, exactly as a
 # user typing one message would (Invoke-SlotActivator). This delegates the
@@ -5553,8 +6335,8 @@ $Script:ActivatorTimeoutSec = 90
 # -Names, else -Name, when set), each starting at Status='warming-up' with Data=$null,
 # transitioning through 'priming' (the claude -p call in flight) to its
 # real outcome. The end state is the first frame of the polling loop; the
-# caller wires it to $snapshot and sets $lastPoll = now. Returns $null
-# when no slots match.
+# caller wires it to the watch session's Snapshot and stamps its LastPoll.
+# Returns $null when no slots match.
 #
 # The original active slot is captured before the loop via Read-ScaState
 # + Find-SlotByName. A finally block restores it via one more Invoke-Slot-
@@ -5672,6 +6454,11 @@ function Invoke-WarmAllSlots {
                     # must probe live rather than be short-circuited by the
                     # backoff it is recovering from.
                     Clear-SlotRateLimitBackoff -SlotPath $row.Path
+                    # And any recorded auth verdict: claude just authenticated
+                    # as this slot, which is the proof that retires it. Must
+                    # precede the read below, or Get-SlotUsage would answer
+                    # from the verdict this activation has just disproved.
+                    Clear-SlotAuthVerdict -SlotName $row.Name
                     $u = Get-SlotUsage -SlotPath $row.Path 6>$null
                     $row.Status           = $u.Status
                     $row.Data             = $u.Data
@@ -5687,6 +6474,16 @@ function Invoke-WarmAllSlots {
                     # must not incur extra refresh calls.
                     $row.Status = $r.Status
                     $row.Error  = $r.Error
+
+                    # claude reached the token endpoint and the grant itself was
+                    # refused. Record it: a later `sca usage` never runs claude,
+                    # and its own probe can be turned away before the server
+                    # looks at the grant, so this is the only way that command
+                    # can tell a dead login from a throttle.
+                    if ($r.Status -in $Script:AuthVerdictStatuses) {
+                        Set-SlotAuthVerdict -SlotName $row.Name -SlotPath $row.Path `
+                                            -Status $r.Status -ErrorMessage $r.Error
+                    }
                 }
             }
             catch {
@@ -5751,6 +6548,19 @@ function Test-WarmEligible {
     return -not ($null -ne $reset -and $reset -gt $Now)
 }
 
+# Re-warm cooldown for one slot, doubled once per consecutive failed warm and
+# capped at $MaxDoublings doublings. A zero base (tests) stays zero. Pure.
+function Get-WarmupCooldownMinutes {
+    Param (
+        [Parameter(Mandatory)] [int] $BaseMin,
+        [int] $Failures     = 0,
+        [int] $MaxDoublings = $Script:WarmupBackoffMaxDoublings
+    )
+
+    if ($Failures -le 0) { return [double]$BaseMin }
+    return [double]$BaseMin * [Math]::Pow(2, [Math]::Min($Failures, $MaxDoublings))
+}
+
 # Per-poll keep-warm step for `sca monitor -KeepWarm`. Mirrors
 # Invoke-AutoRotationStep: returns the footer-latch string the watch loop
 # appends to every frame until the next state change. Via Invoke-WarmAllSlots
@@ -5763,10 +6573,21 @@ function Test-WarmEligible {
 # pathological FAILED-warm case: a successful warm pushes resets_at ~5h out,
 # so the closed-window check holds a healthy slot off on its own.
 #
-# Re-checks Test-ClaudeRunning per tick (the swap writes ~/.claude.json), same
-# rationale as Invoke-AutoRotationStep. Re-warmed rows are NOT merged back into
-# $Snapshot; the next poll re-reads /api/oauth/usage. Never throws: a warm-path
-# exception surfaces as a '[Warmup] Re-warm failed! ...' line.
+# $WarmupFailures (slot name -> consecutive failures) stretches that cooldown
+# via Get-WarmupCooldownMinutes. The flat cooldown assumed the next attempt
+# could differ, which is false while the account's token endpoint is throttled:
+# `claude -p` refreshes through the same endpoint, so every retry buys the same
+# answer at ~$0.004. A data-less throttled row also scores 0% in
+# Get-RowMaxUtilization, so Test-WarmEligible's at-limit gate cannot hold it
+# off either, and the pair left a permanently unreachable slot retried every
+# $CooldownMin for the life of the watch. Optional: omitted (tests, one-shot
+# callers) means no slot has failed yet, which is the flat-cooldown behaviour.
+#
+# Re-checks Test-ClaudeRunning per tick, catching a Claude Code launched
+# mid-watch that the pre-loop guard could not see. Re-warmed rows are NOT
+# merged back into $Snapshot; the next poll re-reads /api/oauth/usage. Never
+# throws: a warm-path exception surfaces as a '[Warmup] Re-warm failed! ...'
+# line.
 # -Threshold is mandatory rather than defaulted: it must be the SAME value
 # auto-rotation uses, and the caller always has it. A default here would let a
 # wiring mistake silently disable the at-limit skip instead of failing loudly.
@@ -5776,6 +6597,7 @@ function Invoke-KeepWarmStep {
         [Parameter(Mandatory)] [hashtable]      $WarmupTimes,
         [Parameter(Mandatory)] [int]            $Threshold,
         [int]                                   $CooldownMin = $Script:WarmupCooldownMin,
+        [hashtable]                             $WarmupFailures = @{},
         [AllowNull()] [AllowEmptyString()] [string] $CurrentLatch
     )
 
@@ -5790,7 +6612,8 @@ function Invoke-KeepWarmStep {
             if (-not (Test-WarmEligible -Row $r -Now $nowUtc -Threshold $Threshold)) { continue }
 
             $last = $WarmupTimes[$r.Name]
-            if ($last -and ($now - $last).TotalMinutes -lt $CooldownMin) { continue }
+            $wait = Get-WarmupCooldownMinutes -BaseMin $CooldownMin -Failures ([int]$WarmupFailures[$r.Name])
+            if ($last -and ($now - $last).TotalMinutes -lt $wait) { continue }
 
             $r.Name
         }
@@ -5821,20 +6644,48 @@ function Invoke-KeepWarmStep {
         return '[Warmup] Re-warm refused! Claude Code is running.'
     }
 
+    # Re-capture before the round-robin below overwrites .credentials.json once
+    # per slot. Same window, and the same reason, as Invoke-AutoRotationStep's:
+    # the poll reconciled before Get-UsageSnapshot, which then spent a full
+    # serial HTTP pass across every slot. This step runs later still, so a
+    # refresh landing in that window would be discarded here and never
+    # mirrored. See Invoke-Reconcile's `Captured`.
+    $sync = Invoke-Reconcile 6>$null
+    if (-not $sync.Captured) {
+        return '[Warmup] Re-warm refused! The active slot''s latest tokens could not be captured; retrying at the next poll.'
+    }
+
     $list = ($cold | Sort-Object | ForEach-Object { "'$_'" }) -join ', '
     try {
         # 6>$null: suppress Invoke-WarmAllSlots's nested advisories so they
         # don't paint outside the watch loop's sync envelope (matches
         # Invoke-AutoRotationStep). No-op repaint: the loop's own redraw
         # covers the table; only the footer latch reports the event.
-        Invoke-WarmAllSlots -Names $cold -Repaint { Param ($snap) } 6>$null | Out-Null
-        foreach ($n in $cold) { $WarmupTimes[$n] = $now }
+        $warmed = Invoke-WarmAllSlots -Names $cold -Repaint { Param ($snap) } 6>$null
+
+        # Read the per-slot outcome rather than discarding it: the escalation
+        # only works if a failure is distinguishable from a success. 'ok' is
+        # the single status that proves the 5h window actually opened, so
+        # anything else counts against the slot.
+        $outcome = @{}
+        foreach ($w in @($warmed.Results)) { if ($w.Name) { $outcome[$w.Name] = $w.Status } }
+
+        foreach ($n in $cold) {
+            $WarmupTimes[$n] = $now
+            if ($outcome[$n] -eq 'ok') { $WarmupFailures.Remove($n) }
+            else { $WarmupFailures[$n] = 1 + [int]$WarmupFailures[$n] }
+        }
         return "[Warmup] Re-warmed $list at $($now.ToString('HH:mm:ss'))"
     }
     catch {
         # Stamp the attempt anyway so a hard failure does not re-fire every
         # poll; the cooldown then holds the slot off until it likely recovers.
-        foreach ($n in $cold) { $WarmupTimes[$n] = $now }
+        # The throw says nothing about individual slots, so every slot in the
+        # batch counts as failed and the cooldown stretches for all of them.
+        foreach ($n in $cold) {
+            $WarmupTimes[$n]    = $now
+            $WarmupFailures[$n] = 1 + [int]$WarmupFailures[$n]
+        }
         # Collapsed for the same reason as the [Monitor] rotation-failure line:
         # this string becomes one footer entry, and Format-UsageFooter splits
         # the footer on newlines.
@@ -5842,11 +6693,11 @@ function Invoke-KeepWarmStep {
     }
 }
 
-# Compute the $lastPoll value that schedules the next watch poll roughly
-# $DelaySec from now. The watch loop polls when (now - $lastPoll) >=
+# Compute the last-poll stamp that schedules the next watch poll roughly
+# $DelaySec from now. The watch loop polls when (now - LastPoll) >=
 # $Interval, so to fire $DelaySec out we must rewind by ($Interval -
 # $DelaySec), NOT by $DelaySec. Clamped at 0 so a $DelaySec >= $Interval
-# never pushes $lastPoll into the future (which would DELAY the poll);
+# never pushes the stamp into the future (which would DELAY the poll);
 # at the clamp the loop polls immediately. Pure; unit-tested in
 # Helpers.Tests.ps1.
 function Get-EarlyRepollLastPoll {
@@ -5856,6 +6707,354 @@ function Get-EarlyRepollLastPoll {
         [int]      $DelaySec
     )
     return $Now.AddSeconds(-[Math]::Max(0, $Interval - $DelaySec))
+}
+
+# True when stdout is a terminal the watch can paint into. A one-line
+# wrapper over a static probe for the same reason as Test-ClaudeRunning:
+# a [Console] static cannot be mocked, and without a seam here no test can
+# reach the watch loop at all, because a test host is by definition the
+# case this returns false for.
+function Test-WatchInteractive {
+    return (-not [Console]::IsOutputRedirected)
+}
+
+# Terminal-state lifecycle for the watch loop, split into a capture-and-
+# mutate half and a restore half so the caller's try/finally spans three
+# lines instead of the entire loop body. Enter- returns the token Exit-
+# consumes; nothing else may read it.
+#
+# Enter-'s read of [Console]::CursorVisible and its write are both guarded:
+# neither is reliable off an attached Windows console, and an unguarded read
+# aborted the whole watch engine at startup on Linux and macOS. Exit- restores
+# through the API only where the capture succeeded, which confines its own
+# unguarded write to a console that already answered once.
+# A $null Cursor means "not captured",
+# and Exit-WatchTerminal skips the API restore on it rather than coercing
+# $null to $false and leaving the user's cursor hidden. The ESC[?25h in the
+# alt-buffer leave is what the cursor actually depends on; the API call is
+# belt-and-suspenders for the .NET-side state.
+# `docs/architecture.md` → *Console APIs*.
+#
+# The alt-buffer entry is the LAST mutation on purpose: it is the one that
+# needs undoing, and the caller's finally cannot run for a throw raised
+# before its try is entered. Nothing after it can fail.
+function Enter-WatchTerminal {
+    $origCursor = try { [Console]::CursorVisible } catch { $null }
+    # The frame body is painted via Write-VTSequence -> [Console]::Out.Write,
+    # which encodes through [Console]::OutputEncoding; on Windows that
+    # defaults to a legacy OEM codepage (e.g. CP850) that cannot represent
+    # the bar glyphs (█ ▓), the auto-mode glyph (▶), the ellipsis (…), or the
+    # em dash (—), so they render as '?'. Write-Host did not hit this because
+    # the PowerShell host writes UTF-16 to the console (WriteConsoleW),
+    # bypassing the codepage.
+    $origEncoding = [Console]::OutputEncoding
+    # $Host.UI.RawUI.WindowTitle is the only portable read path; no terminal
+    # protocol reliably reports the current OSC 0 title back. Some hosts throw
+    # when RawUI is unavailable (test runners, ssh-without-tty); $null then
+    # signals "no restore" to Exit-WatchTerminal.
+    $origTitle = try { $Host.UI.RawUI.WindowTitle } catch { $null }
+
+    # Wrapped so a host that forbids the change (rare) does not abort the
+    # watch; the glyphs degrade to '?' but the loop still runs.
+    try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { Write-Verbose "UTF-8 console encoding not settable: $_" }
+    try { [Console]::CursorVisible = $false } catch { Write-Verbose "Cursor hide via console API not available: $_" }
+
+    # Alt screen buffer + cursor hide in one write. The alt buffer gives a
+    # clean canvas and restores the user's pre-watch scrollback on exit;
+    # cursor-hide stops the caret blinking inside the table during the
+    # (atomic) repaint.
+    Write-VTSequence "`e[?1049h`e[?25l"
+
+    return [pscustomobject]@{
+        Cursor     = $origCursor
+        Encoding   = $origEncoding
+        Title      = $origTitle
+        EnteredAlt = $true
+    }
+}
+
+# Restore half of Enter-WatchTerminal; see its docblock for the token's
+# fields and the CursorVisible asymmetry. Tolerates a $null token so the
+# caller's finally is unconditional.
+function Exit-WatchTerminal {
+    Param ([pscustomobject] $State)
+
+    if (-not $State) { return }
+
+    if ($State.EnteredAlt) {
+        # Title restore before the alt-buffer leave, so the title swap and
+        # the screen restore land in the same frame. Empty payload when the
+        # capture failed; most terminals then reset the tab label to their
+        # profile default (Windows Terminal: profile name; VS Code: shell
+        # name).
+        $restoreTitle = if ($null -ne $State.Title) { [string]$State.Title } else { '' }
+        $restoreTitle = [regex]::Replace($restoreTitle, '[\x00-\x1F\x7F]', '')
+        Write-VTSequence ("`e]0;{0}`a" -f $restoreTitle)
+        Write-VTSequence "`e[?25h`e[?1049l"
+    }
+    if ($null -ne $State.Cursor) { [Console]::CursorVisible = $State.Cursor }
+    # Encoding last, after the alt-buffer leave and title restore have been
+    # written through the UTF-8 writer (the original title may itself carry
+    # non-ASCII).
+    if ($State.Encoding) {
+        try { [Console]::OutputEncoding = $State.Encoding } catch { Write-Verbose "Restoring console encoding failed: $_" }
+    }
+}
+
+# The watch loop's mutable state as one object, so the poll step and the
+# startup pass can be functions instead of inline blocks reading and writing
+# seven loose locals. Mutated in place by its consumers rather than returned
+# and reassigned, following Invoke-KeepWarmStep, which already mutates the
+# caller's WarmupTimes / WarmupFailures hashtables.
+#
+# WarmupTimes (slot name -> last re-warm attempt) and WarmupFailures (slot
+# name -> consecutive failed warms) are separate maps because a session that
+# never fails keeps the second empty. Neither is persisted; both live for
+# this watch only and feed the cooldown gate in Invoke-KeepWarmStep.
+function New-WatchSession {
+    Param (
+        [switch] $Auto,
+        [switch] $Warmup
+    )
+
+    return [pscustomobject]@{
+        Snapshot       = $null
+        # MinValue, not Now: the first loop iteration must fall into the poll
+        # branch. The -Warmup startup pass overwrites it with a real stamp
+        # because its own pass already produced a frame.
+        LastPoll       = [DateTime]::MinValue
+        LastPollError  = $null
+        # One latch per mode, each holding that mode's last state line until
+        # the next state change, so a frame rendered between poll boundaries
+        # still reports it. The initial values say the mode is engaged before
+        # the first event of its kind.
+        AutoLatch      = if ($Auto)   { $Script:MonitorSteadyLatch } else { $null }
+        WarmLatch      = if ($Warmup) { '[Warmup] Keeping all slots warm.' } else { $null }
+        WarmupTimes    = @{}
+        WarmupFailures = @{}
+    }
+}
+
+# One poll boundary of the watch loop: reconcile, read usage, retitle, then
+# let -Auto rotate and -Warmup re-warm. Mutates $Session in place (see
+# New-WatchSession); returns nothing.
+#
+# The work sits in one try because every step of it is optional to the
+# frame: a failure anywhere leaves the previous snapshot on screen and parks
+# the message on LastPollError for the footer, so the display never blanks
+# and the user can still quit cleanly. This is the only extracted watch unit
+# that touches credentials.
+function Invoke-WatchPoll {
+    Param (
+        [Parameter(Mandatory)] [pscustomobject] $Session,
+        [String] $Name,
+        [int]    $Threshold,
+        [switch] $Auto,
+        [switch] $Warmup
+    )
+
+    try {
+        # Reconcile at every poll boundary so a refresh that happened since
+        # the last poll is captured into the tracked slot before we read its
+        # bytes for the /api/oauth/usage call. Suppressed stdout: any
+        # advisory the reconcile emits would print straight to the alt buffer
+        # (outside the captured frame) and the in-place repaint would not
+        # overwrite it cleanly anyway.
+        Invoke-Reconcile 6>$null | Out-Null
+        # 6>$null on Get-UsageSnapshot: Update-SlotTokens (called via
+        # Get-SlotUsage when a token is within 60s of expiry) emits yellow
+        # [Sync] advisories on its two unhappy paths (propagation-to-
+        # .credentials.json failure, or active slot sidecar-orphaned). Those
+        # Write-Host calls would print to the alt buffer outside the captured
+        # frame and linger (the in-place repaint overwrites only the cells
+        # the frame occupies, never ESC[2J-clears), producing a stray line
+        # the user cannot dismiss. Suppress them here; the user still sees
+        # the same condition in non-watch contexts (`sca usage`, `sca list`).
+        # Matches the Invoke-Reconcile above and the Invoke-SlotSwap 6>$null
+        # inside Invoke-AutoRotationStep.
+        $Session.Snapshot      = Get-UsageSnapshot -Name $Name 6>$null
+        $Session.LastPollError = $null
+
+        # Update the terminal title only on a successful poll; on a failed
+        # poll the previous title (and body) persist together until the next
+        # tick. OSC 0 ('ESC ] 0 ; <title> BEL') sets both window and icon
+        # title; supported by Windows Terminal, modern ConHost, VS Code,
+        # iTerm2, kitty, alacritty, WezTerm, foot, gnome-terminal, mintty.
+        # Routed through Write-VTSequence for parity with DEC sequences
+        # (bypasses the OutputRendering=PlainText filter; see
+        # Write-VTSequence docblock).
+        # -Aggregate is tied to -Auto: in -Auto mode the active slot moves
+        # under the user as the script rotates, so the active-slot title
+        # loses signal; pool-mean matches the aggregate bars rendered above
+        # the table. Bare -Watch keeps the per-slot alarm-glance title. See
+        # Format-WatchTitle docblock.
+        Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $Session.Snapshot -Aggregate:$Auto))
+
+        # Auto-rotation decision happens after each successful poll. The
+        # latched footer string is updated based on the decision so it stays
+        # visible until the next state change (the next 'rotate' /
+        # 'no-eligible' outcome). Failures inside the swap are caught there
+        # and surfaced as a 'Rotation failed!' line; the watch never aborts
+        # because of an auto-rotation issue (the user can still quit with
+        # Ctrl-C and inspect the table).
+        if ($Auto) {
+            $Session.AutoLatch = Invoke-AutoRotationStep -Snapshot $Session.Snapshot -Threshold $Threshold -CurrentLatch $Session.AutoLatch
+        }
+
+        # Keep-warm decision after auto-rotation so the slot
+        # Invoke-WarmAllSlots restores to is the post-rotation active one.
+        # Keep-warm and rotation cannot fight over a slot: both gate on
+        # Get-RowMaxUtilization against the same -Threshold, and
+        # Test-WarmEligible skips anything at or above it, so a rotation
+        # source is never warm-eligible. Re-opens any slot whose 5h window
+        # has closed; the latched footer reports it.
+        if ($Warmup) {
+            $Session.WarmLatch = Invoke-KeepWarmStep -Snapshot $Session.Snapshot -WarmupTimes $Session.WarmupTimes `
+                                                     -Threshold $Threshold -WarmupFailures $Session.WarmupFailures `
+                                                     -CurrentLatch $Session.WarmLatch
+        }
+    }
+    catch {
+        # Keep the previous snapshot visible. If the very first poll failed
+        # there is nothing to show below the header yet and the frame falls
+        # back to a waiting advisory; either way the error reaches the user
+        # through the footer rather than ending the watch.
+        $Session.LastPollError = $_.Exception.Message
+    }
+    # Stamped AFTER the poll, never from a timestamp taken before it: a poll
+    # that outruns -Interval (slow endpoint x N slots) would otherwise be
+    # pre-credited with its own duration and the next iteration would re-poll
+    # with zero delay, hammering a limiter that 429s after a handful of calls
+    # in a few seconds. Matches the post-warmup stamp in the startup pass.
+    $Session.LastPoll = [DateTime]::Now
+}
+
+# Assemble the watch frame's footer block. Pure.
+#
+# Order: [Monitor] state (if -Auto) -> [Warmup] state (if -Warmup) ->
+# [Watch] Last poll -> [Watch] Last poll failed (if any). The mode-state
+# lines lead so the user's eye finds them first; transport-level details
+# follow underneath.
+#
+# -LastPoll is optional because the footer has two shapes. The -Warmup
+# startup pass renders the latches alone: it has not polled yet, and a
+# "Last poll at 00:00:00" line would be a lie. The loop passes it, and only
+# then can a failure tail follow.
+function Format-WatchFooter {
+    Param (
+        [AllowEmptyString()] [AllowNull()] [String]   $AutoLatch,
+        [AllowEmptyString()] [AllowNull()] [String]   $WarmLatch,
+        [Nullable[DateTime]]                          $LastPoll,
+        [AllowEmptyString()] [AllowNull()] [String]   $LastPollError
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    if ($AutoLatch) { $lines.Add($AutoLatch) }
+    if ($WarmLatch) { $lines.Add($WarmLatch) }
+    # [Nullable[DateTime]] for the "no poll yet" signal only: PowerShell
+    # unwraps it to a plain DateTime on binding, so this is a $null check on
+    # the parameter, not on a Nullable wrapper, and .Value does not exist.
+    if ($null -ne $LastPoll) {
+        $lines.Add("[Watch] Last poll at $($LastPoll.ToString('HH:mm:ss'))")
+        if ($LastPollError) {
+            # Collapse before interpolating: Format-UsageFooter splits the
+            # footer on newlines, so a multi-line socket exception would
+            # otherwise fork one entry into several unprefixed lines.
+            $pollReason = Format-StatusErrorTail -Message $LastPollError
+            $lines.Add("[Watch] Last poll failed: $pollReason (keeping previous data; will retry on next tick)")
+        }
+    }
+    return ($lines -join "`n")
+}
+
+# Paint one watch frame: render $RenderScript to a string, then write it in
+# one go as cursor-home + per-line erase-to-EOL + trailing erase-below
+# (ConvertTo-WatchFrameSequence), wrapped in the DEC 2026 sync envelope.
+#
+# The single write plus the absence of ESC[2J is what makes this
+# flicker-free even on a loaded machine or a terminal without DEC 2026:
+# nothing is ever blanked to black, so a render tick that lands mid-paint
+# shows the previous (near-identical) frame underneath rather than the
+# "black -> row for row" flash a clear-then-redraw produces. DEC 2026 (Win
+# Terminal >= 1.23, VS Code, iTerm2, kitty, alacritty, WezTerm, foot,
+# gnome-terminal, mintty, modern ConHost) is a bonus tier on top that also
+# suppresses sub-frame tearing, not the sole defense; older terminals ignore
+# the unknown DEC private mode with no regression.
+#
+# Callers repaint unconditionally on every tick, which is also what
+# self-heals a terminal resize within ~1 s: the per-line ESC[K and the
+# trailing ESC[0J reclaim any cells left by the old geometry.
+function Write-WatchFrame {
+    Param ([Parameter(Mandatory)] [scriptblock] $RenderScript)
+
+    $frameText = Get-WatchFrameText $RenderScript
+    Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence $frameText) + "`e[?2026l")
+}
+
+# The -Warmup startup pass, run once before the polling loop. Mutates
+# $Session in place (see New-WatchSession); returns nothing.
+#
+# Invoke-WarmAllSlots does the per-slot swap-then-activate round-robin and
+# returns a populated snapshot, which becomes the loop's first frame: the
+# LastPoll stamp below is what makes the loop's first iteration fall into
+# the redraw branch rather than polling again immediately.
+#
+# Throws on uncaptured credentials, which aborts the watch. That is the
+# point: the round-robin overwrites .credentials.json once per slot, so
+# warming on top of bytes nothing has captured would destroy them.
+function Invoke-WatchStartupWarm {
+    Param (
+        [Parameter(Mandatory)] [pscustomobject] $Session,
+        [String] $Name,
+        [int]    $Interval,
+        [int]    $Threshold,
+        [switch] $Auto
+    )
+
+    # Reconcile first so a cross-account swap landed since the last sca call
+    # is captured before any slot bytes are read; matches the polling loop's
+    # per-poll contract. See Invoke-Reconcile's `Captured`.
+    $sync = Invoke-Reconcile 6>$null
+    if (-not $sync.Captured) {
+        throw (Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca monitor -KeepWarm')
+    }
+
+    # -Auto's right-aligned "▶ switching slot at N%" header indicator stays
+    # off when -Auto is absent.
+    $autoHeader = if ($Auto) { $Threshold } else { 0 }
+    $Session.Snapshot = Invoke-WarmAllSlots -Name $Name -Repaint {
+        Param ($snap)
+        # No -LastPoll: the startup pass has not polled yet, so the footer
+        # is the two latches alone.
+        $startupFooter = Format-WatchFooter -AutoLatch $Session.AutoLatch -WarmLatch $Session.WarmLatch
+        Write-WatchFrame {
+            Format-UsageFrame -Name $Name -Snapshot $snap -Footer $startupFooter -AutoThreshold $autoHeader
+        }
+    }
+    if ($null -eq $Session.Snapshot) { return }
+
+    $Session.LastPoll = [DateTime]::Now
+    try {
+        Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $Session.Snapshot -Aggregate:$Auto))
+    } catch { Write-Verbose "Warmup title set deferred: $_" }
+
+    # If warmup ended with rate-limited rows, the user sees dashes for the
+    # full poll interval. Schedule an early repoll ~$Script:WarmupRepollDelaySec
+    # from now (regardless of -Interval) so the short 429 cooldown likely
+    # clears and real data appears sooner. If the early repoll also gets 429,
+    # LastPoll resets to now and we fall back to the normal interval: no
+    # worse than not trying.
+    if ($Session.Snapshot.HasRateLimited) {
+        $Session.LastPoll = Get-EarlyRepollLastPoll -Now ([DateTime]::Now) -Interval $Interval -DelaySec $Script:WarmupRepollDelaySec
+    }
+
+    # Seed the cooldown map with the startup pass: every slot just warmed
+    # counts as a re-warm at "now", so a slot whose startup verify-read
+    # failed or lagged (still reporting a closed window) is not immediately
+    # re-warmed on the first poll. The closed-window check covers the
+    # healthy slots; this covers the laggy ones.
+    $seed = [DateTime]::Now
+    foreach ($r in @($Session.Snapshot.Results)) { $Session.WarmupTimes[$r.Name] = $seed }
 }
 
 # Live `sca usage -Watch` loop: redraws once per second and re-polls the
@@ -5869,24 +7068,9 @@ function Get-EarlyRepollLastPoll {
 # visibility. On HTTP failure the previous snapshot stays visible and
 # an advisory is appended to the footer so the display never blanks.
 #
-# Flicker-free rendering. Each frame is rendered to a string
-# (Get-WatchFrameText), then painted in a single write as cursor-home
-# (ESC[H) + per-line erase-to-EOL (ESC[K) + trailing erase-below (ESC[0J)
-# via ConvertTo-WatchFrameSequence, wrapped in the DEC 2026 sync envelope
-# (ESC[?2026h … ESC[?2026l). The frame is overwritten in place and never
-# blanked to black -- there is no ESC[2J -- so even when the terminal
-# lacks DEC 2026 or is too loaded to honor it, a render tick that lands
-# mid-paint shows the previous (near-identical) frame underneath instead
-# of the "black -> row for row" flash a clear-then-redraw produces. This
-# is the ANSI equivalent of how PSReadLine / SetBufferContents repaint:
-# overwrite in place, never clear. DEC 2026 (Win Terminal >= 1.23, VS
-# Code, iTerm2, kitty, alacritty, WezTerm, foot, gnome-terminal, mintty,
-# modern ConHost) is now a bonus tier that also suppresses sub-frame
-# tearing on capable terminals; older terminals ignore the unknown DEC
-# private mode with no regression. The watch also enters the alternate
-# screen buffer (ESC[?1049h) so the pre-watch terminal scrollback is
-# restored on exit, mirroring how top / htop / vim behave. Renderer
-# functions are reused unchanged; this loop captures and repaints them.
+# Renderer functions are reused unchanged; this loop captures and
+# repaints them through Write-WatchFrame, which owns the flicker-free
+# paint. Enter-WatchTerminal owns the alt-buffer and encoding setup.
 #
 # VT control sequences (alt buffer, sync mode, cursor hide/show, home,
 # erase) are emitted via `Write-VTSequence` so they bypass the
@@ -5917,37 +7101,25 @@ function Invoke-UsageWatch {
         # -Auto fires a rotation. Ignored when -Auto is absent.
         [int]    $Threshold = 95,
         # -Warmup: keep every saved slot warm for the life of the watch.
-        # The startup pass (Invoke-WarmAllSlots, below the alt-screen entry)
-        # activates every slot via the real Claude Code CLI (`claude -p`)
-        # before the first poll; thereafter Invoke-KeepWarmStep re-opens any
-        # slot whose 5h window has closed at each poll boundary. Driven only
-        # by `sca monitor -KeepWarm` (which always sets -Auto too).
+        # Invoke-WatchStartupWarm activates every slot via the real Claude
+        # Code CLI (`claude -p`) before the first poll; thereafter
+        # Invoke-KeepWarmStep re-opens any slot whose 5h window has closed at
+        # each poll boundary. Driven only by `sca monitor -KeepWarm` (which
+        # always sets -Auto too).
         [switch] $Warmup
     )
 
-    # Pre-loop Claude Code guard for -Auto and -Warmup. Both write
-    # ~/.claude.json's oauthAccount block via Invoke-SlotSwap (-Auto
-    # during the in-loop rotation step; -Warmup during the per-slot
-    # swap-then-activate round-robin). Claude Code keeps that block in an
-    # in-memory cache; racing its flush would clobber our update. The
-    # short-lived `claude -p` the warmup spawns is awaited to exit before
-    # the next swap, so it never overlaps a file write.
-    # Same guard / wording as Invoke-SwitchAction so the user sees a
-    # consistent message regardless of entry point. Only `sca monitor`
-    # reaches this branch ($Auto is always set by Invoke-MonitorAction;
-    # `usage -Watch` is read-only and sets neither switch). -Auto
-    # additionally re-checks Test-ClaudeRunning before every rotation
-    # attempt to cover the "Claude Code launched mid-watch" race;
-    # -Warmup's window is short enough (one round-robin pass) that the
-    # pre-loop check is the only one needed.
-    # Checked BEFORE the IsOutputRedirected guard so the user sees the
+    # Pre-loop Claude Code guard, -Warmup only; see Test-ClaudeRunning for why
+    # the fleet walk refuses and rotation does not.
+    #
+    # Checked BEFORE the Test-WatchInteractive guard so the user sees the
     # more actionable "close Claude Code" message rather than the
     # interactive-terminal one (which the test harness always hits).
-    if (($Auto -or $Warmup) -and (Test-ClaudeRunning)) {
-        throw "Claude Code is running. Close it before 'sca monitor' so the credentials swap applies cleanly without racing Claude Code's in-memory ~/.claude.json cache."
+    if ($Warmup -and (Test-ClaudeRunning)) {
+        throw "Claude Code is running. Close it before 'sca monitor -KeepWarm', which makes every slot active in turn and would drag the live session across all of them. Plain 'sca monitor' rotates without that and runs fine alongside Claude Code."
     }
 
-    if ([Console]::IsOutputRedirected) {
+    if (-not (Test-WatchInteractive)) {
         throw "-Watch requires an interactive terminal; for scripted output use 'sca usage -Json'."
     }
 
@@ -5956,266 +7128,46 @@ function Invoke-UsageWatch {
         $Interval = $Script:UsageWatchMinInterval
     }
 
-    $origCursor = [Console]::CursorVisible
-    # Capture the pre-watch console output encoding. The frame body is
-    # painted via Write-VTSequence -> [Console]::Out.Write, which encodes
-    # the string through [Console]::OutputEncoding; on Windows that defaults
-    # to a legacy OEM codepage (e.g. CP850) that cannot represent the bar
-    # glyphs (█ ▓), the auto-mode glyph (▶), the ellipsis (…), or the em
-    # dash (—), so they render as '?'. Write-Host did not hit this because
-    # the PowerShell host writes UTF-16 to the console (WriteConsoleW),
-    # bypassing the codepage. Forcing UTF-8 for the watch's duration makes
-    # [Console]::Out.Write emit those glyphs correctly; the finally restores
-    # the original encoding so the user's post-watch shell is unaffected.
-    $origEncoding = [Console]::OutputEncoding
-    # Capture the pre-watch terminal title so the `finally` block can
-    # restore it on Ctrl-C. $Host.UI.RawUI.WindowTitle is the only
-    # portable read path (no terminal protocol reliably reports the
-    # current OSC 0 title back). Some hosts throw when RawUI is not
-    # available (test runners, ssh-without-tty); $null then signals
-    # "no restore" to the finally block.
-    $origTitle  = try { $Host.UI.RawUI.WindowTitle } catch { $null }
-    $enteredAlt = $false
+    $terminal = Enter-WatchTerminal
     try {
-        # UTF-8 so [Console]::Out.Write renders the non-ASCII frame glyphs
-        # (see $origEncoding capture above). Wrapped in try so a host that
-        # forbids the change (rare) does not abort the watch; the glyphs
-        # would degrade to '?' but the loop still runs.
-        try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { Write-Verbose "UTF-8 console encoding not settable: $_" }
-        # Enter alt screen buffer + hide cursor in one write. The alt
-        # buffer gives a clean canvas and ensures the user's pre-watch
-        # scrollback is restored on exit. Cursor-hide stops the caret
-        # from blinking inside the table during the (atomic) repaint.
-        Write-VTSequence "`e[?1049h`e[?25l"
-        $enteredAlt = $true
-        [Console]::CursorVisible = $false
+        $session = New-WatchSession -Auto:$Auto -Warmup:$Warmup
 
-        $snapshot      = $null
-        $lastPoll      = [DateTime]::MinValue
-        $lastPollError = $null
-
-        # -Auto footer-line latch. Updated at each poll boundary based on
-        # Get-AutoRotationDecision's verdict; the latched string is
-        # appended (in DarkGray, like the [Watch] lines) to every frame
-        # until the next state change. Initial value 'Enabled' shows the
-        # mode is engaged before the first rotation event.
-        $lastAutoFooter = if ($Auto) { $Script:MonitorSteadyLatch } else { $null }
-
-        # -Warmup footer-line latch + per-slot last-re-warm map. The latch
-        # parallels $lastAutoFooter (steady-state line until a keep-warm
-        # event replaces it). $warmupTimes (slot name -> last attempt
-        # [DateTime]) lives only for this watch session and feeds the
-        # cooldown gate in Invoke-KeepWarmStep; it is never persisted.
-        $lastWarmupFooter = if ($Warmup) { '[Warmup] Keeping all slots warm.' } else { $null }
-        $warmupTimes      = @{}
-
-        # -Warmup startup pass. Invoke-WarmAllSlots does the per-slot
-        # swap-then-activate round-robin and returns a populated snapshot
-        # we hand off to the polling loop as its first frame ($lastPoll
-        # = now so the loop's first iteration falls into the redraw
-        # branch, not the poll branch). Reconcile first so a cross-
-        # account swap landed since the last sca call is captured before
-        # any slot bytes are read; matches the polling loop's per-poll
-        # contract below.
         if ($Warmup) {
-            Invoke-Reconcile 6>$null | Out-Null
-
-            # -Auto's right-aligned "▶ switching slot at N%" header
-            # indicator stays off when -Auto is absent.
-            $autoHeader = if ($Auto) { $Threshold } else { 0 }
-            $snapshot = Invoke-WarmAllSlots -Name $Name -Repaint {
-                Param ($snap)
-                $startupFooter = ''
-                if ($lastAutoFooter)   { $startupFooter = $lastAutoFooter + "`n" }
-                if ($lastWarmupFooter) { $startupFooter += $lastWarmupFooter }
-                # Same in-place-overwrite single-write paint as the polling
-                # loop (no ESC[2J); the alt buffer is already blank on entry,
-                # so the first warmup repaint has nothing stale to clear and
-                # each subsequent per-slot repaint overwrites in place.
-                $frameText = Get-WatchFrameText {
-                    Format-UsageFrame -Name $Name -Snapshot $snap -Footer $startupFooter -AutoThreshold $autoHeader
-                }
-                Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence $frameText) + "`e[?2026l")
-            }
-            if ($null -ne $snapshot) {
-                $lastPoll = [DateTime]::Now
-                try {
-                    Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $snapshot -Aggregate:$Auto))
-                } catch { Write-Verbose "Warmup title set deferred: $_" }
-            }
-            # If warmup ended with rate-limited rows, the user sees dashes
-            # for the full poll interval. Schedule an early repoll
-            # ~$Script:WarmupRepollDelaySec from now (regardless of
-            # -Interval) so the short 429 cooldown likely clears and real
-            # data appears sooner. If the early repoll also gets 429,
-            # $lastPoll resets to now and we fall back to the normal
-            # interval — no worse than current behaviour.
-            if ($snapshot -and $snapshot.HasRateLimited) {
-                $lastPoll = Get-EarlyRepollLastPoll -Now ([DateTime]::Now) -Interval $Interval -DelaySec $Script:WarmupRepollDelaySec
-            }
-
-            # Seed the cooldown map with the startup pass: every slot just
-            # warmed counts as a re-warm at "now", so a slot whose startup
-            # verify-read failed/lagged (still reporting a closed window) is
-            # not immediately re-warmed on the first poll. The closed-window
-            # check covers the healthy slots; this covers the laggy ones.
-            if ($null -ne $snapshot) {
-                $seed = [DateTime]::Now
-                foreach ($r in @($snapshot.Results)) { $warmupTimes[$r.Name] = $seed }
-            }
+            Invoke-WatchStartupWarm -Session $session -Name $Name -Interval $Interval -Threshold $Threshold -Auto:$Auto
         }
 
         while ($true) {
+            # Poll when there is nothing on screen yet, or when the interval
+            # has elapsed since the last poll finished.
             $now = [DateTime]::Now
-            $dueForPoll = ($null -eq $snapshot) -or (($now - $lastPoll).TotalSeconds -ge $Interval)
-
-            if ($dueForPoll) {
-                try {
-                    # Reconcile at every poll boundary so a refresh that
-                    # happened since the last poll is captured into the
-                    # tracked slot before we read its bytes for the
-                    # /api/oauth/usage call. Suppressed stdout; any
-                    # advisory the reconcile emits would print straight to
-                    # the alt buffer (outside the captured frame) and the
-                    # in-place repaint would not overwrite it cleanly anyway.
-                    Invoke-Reconcile 6>$null | Out-Null
-                    # 6>$null on Get-UsageSnapshot: Update-SlotTokens
-                    # (called via Get-SlotUsage when a token is within 60s
-                    # of expiry) emits yellow [Sync] advisories on its two
-                    # unhappy paths (propagation-to-.credentials.json
-                    # failure, or active slot sidecar-orphaned). Those
-                    # Write-Host calls would print to the alt buffer outside
-                    # the captured frame and linger (the in-place repaint
-                    # overwrites only the cells the frame occupies, never
-                    # ESC[2J-clears), producing a stray line the user cannot
-                    # dismiss. Suppress
-                    # them here; the user still sees the same condition
-                    # in non-watch contexts (`sca usage`, `sca list`).
-                    # Matches the Invoke-Reconcile 6>$null above and the
-                    # Invoke-SlotSwap 6>$null inside Invoke-AutoRotationStep.
-                    $snapshot      = Get-UsageSnapshot -Name $Name 6>$null
-                    $lastPollError = $null
-
-                    # Update the terminal title only on a successful poll;
-                    # on a failed poll the previous title (and body) persist
-                    # together until the next tick. OSC 0 ('ESC ] 0 ; <title>
-                    # BEL') sets both window and icon title; supported by
-                    # Windows Terminal, modern ConHost, VS Code, iTerm2,
-                    # kitty, alacritty, WezTerm, foot, gnome-terminal,
-                    # mintty. Routed through Write-VTSequence for parity
-                    # with DEC sequences (bypasses the
-                    # OutputRendering=PlainText filter; see Write-VTSequence
-                    # docblock).
-                    # -Aggregate is tied to -Auto: in -Auto mode the
-                    # active slot moves under the user as the script
-                    # rotates, so the active-slot title loses signal;
-                    # pool-mean matches the aggregate bars rendered
-                    # above the table. Bare -Watch keeps the per-slot
-                    # alarm-glance title. See Format-WatchTitle docblock.
-                    Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $snapshot -Aggregate:$Auto))
-
-                    # Auto-rotation decision happens after each successful
-                    # poll. The latched footer string is updated based on
-                    # the decision so it stays visible until the next
-                    # state change (the next 'rotate' / 'no-eligible'
-                    # outcome). Failures inside the swap are caught and
-                    # surfaced as 'Rotation failed!' / 'Rotation refused!'
-                    # lines; the loop never aborts because of an auto-
-                    # rotation issue (user can still quit with Ctrl-C
-                    # and inspect the table).
-                    if ($Auto) {
-                        $lastAutoFooter = Invoke-AutoRotationStep -Snapshot $snapshot -Threshold $Threshold -CurrentLatch $lastAutoFooter
-                    }
-
-                    # Keep-warm decision after auto-rotation so the slot
-                    # Invoke-WarmAllSlots restores to is the post-rotation
-                    # active one. Keep-warm and rotation cannot fight over a
-                    # slot: both gate on Get-RowMaxUtilization against the same
-                    # -Threshold, and Test-WarmEligible skips anything at or
-                    # above it, so a rotation source is never warm-eligible.
-                    # Re-opens any slot whose 5h window has closed; the latched
-                    # footer reports it.
-                    if ($Warmup) {
-                        $lastWarmupFooter = Invoke-KeepWarmStep -Snapshot $snapshot -WarmupTimes $warmupTimes `
-                                                               -Threshold $Threshold -CurrentLatch $lastWarmupFooter
-                    }
-                }
-                catch {
-                    # Keep the previous snapshot visible. If the very first
-                    # poll failed we still need to show SOMETHING below the
-                    # header, so render an empty frame and surface the
-                    # error in the footer; the user can still quit cleanly.
-                    $lastPollError = $_.Exception.Message
-                }
-                # Stamped AFTER the poll, not from the pre-poll $now: a poll
-                # that outruns -Interval (slow endpoint x N slots) would
-                # otherwise be pre-credited with its own duration and the next
-                # iteration would re-poll with zero delay, hammering a limiter
-                # that 429s after a handful of calls in a few seconds. Matches
-                # the post-warmup stamp above.
-                $lastPoll = [DateTime]::Now
+            if (($null -eq $session.Snapshot) -or (($now - $session.LastPoll).TotalSeconds -ge $Interval)) {
+                Invoke-WatchPoll -Session $session -Name $Name -Threshold $Threshold -Auto:$Auto -Warmup:$Warmup
             }
 
-            # Footer rebuilt every tick. The string is constant between
-            # poll boundaries (timestamp updates only on poll), but the
-            # rebuild is a cheap concat and keeps the redraw path single-
-            # branch. Multi-line only when the previous poll failed.
-            # Order: [Monitor] state (if -Auto) -> [Warmup] state (if -Warmup)
-            # -> [Watch] Last poll -> [Watch] Last poll failed (if any).
-            # The mode-state lines ([Monitor], [Warmup]) lead the block so the
-            # user's eye finds them first; transport-level details (poll
-            # timestamp, failure tail) follow underneath.
-            $footer = ''
-            if ($lastAutoFooter) {
-                $footer = $lastAutoFooter + "`n"
-            }
-            if ($lastWarmupFooter) {
-                $footer += $lastWarmupFooter + "`n"
-            }
-            $footer += "[Watch] Last poll at $($lastPoll.ToString('HH:mm:ss'))"
-            if ($lastPollError) {
-                # Collapse before interpolating: the footer is split on newlines
-                # by Format-UsageFooter, so a multi-line socket exception would
-                # otherwise fork one footer entry into several unprefixed lines.
-                $pollReason = Format-StatusErrorTail -Message $lastPollError
-                $footer += "`n[Watch] Last poll failed: $pollReason (keeping previous data; will retry on next tick)"
-            }
+            # Rebuilt every tick. The string only changes at poll
+            # boundaries, but rebuilding is a cheap join and keeps the
+            # redraw path single-branch.
+            $footer = Format-WatchFooter -AutoLatch $session.AutoLatch -WarmLatch $session.WarmLatch `
+                                         -LastPoll $session.LastPoll -LastPollError $session.LastPollError
 
             # Auto-mode threshold for the header tag. Passed only when
             # -Auto is set; otherwise 0 (Format-UsageTable interprets
             # 0 as "no tag").
             $autoHeaderThreshold = if ($Auto) { $Threshold } else { 0 }
 
-            # In-place-overwrite frame: render to a string, then paint it in
-            # a single write as cursor-home + per-line erase-to-EOL + trailing
-            # erase-below (ConvertTo-WatchFrameSequence), wrapped in the DEC
-            # 2026 sync envelope. The single write + the absence of ESC[2J is
-            # what makes this flicker-free even on a loaded machine or a
-            # terminal without DEC 2026: nothing is ever blanked to black, so
-            # a mid-paint render tick shows the previous (near-identical)
-            # frame underneath rather than the "black -> row for row" flash a
-            # clear-then-redraw produces. DEC 2026 (Win Terminal >= 1.23, VS
-            # Code, iTerm2, kitty, alacritty, WezTerm, foot, gnome-terminal,
-            # mintty, modern ConHost) is now a bonus that also suppresses
-            # sub-frame tearing, not the sole defense. The repaint runs every
-            # tick unconditionally, which also self-heals a terminal resize
-            # within ~1 s (the per-line ESC[K + trailing ESC[0J reclaim any
-            # stale cells from the old geometry).
-            $frameText = Get-WatchFrameText {
-                if ($null -ne $snapshot) {
-                    Format-UsageFrame -Name $Name -Snapshot $snapshot -Footer $footer -AutoThreshold $autoHeaderThreshold
+            Write-WatchFrame {
+                if ($null -ne $session.Snapshot) {
+                    Format-UsageFrame -Name $Name -Snapshot $session.Snapshot -Footer $footer -AutoThreshold $autoHeaderThreshold
                 } else {
                     # First poll failed and we have nothing to render yet.
                     # $footer already leads with the [Monitor] line (when -Auto
-                    # is set) via the composition above, so a single
-                    # Format-UsageFooter call places auto-mode state above
-                    # the 'Waiting...' advisory; no separate standalone
-                    # print needed.
+                    # is set), so a single Format-UsageFooter call places
+                    # auto-mode state above the 'Waiting...' advisory; no
+                    # separate standalone print needed.
                     Write-Color "[Watch] Waiting for first successful /api/oauth/usage response..." 'Yellow'
                     Format-UsageFooter $footer
                 }
             }
-            Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence $frameText) + "`e[?2026l")
 
             # 1-second inter-frame wait. Decoupling redraw cadence from
             # poll cadence lets the screen self-heal on terminal resize
@@ -6227,29 +7179,7 @@ function Invoke-UsageWatch {
         }
     }
     finally {
-        # Order matters: show cursor + leave alt buffer in one write so
-        # the user's pre-watch terminal state is restored atomically.
-        # The CursorVisible API restore is belt-and-suspenders for the
-        # .NET-side state.
-        if ($enteredAlt) {
-            # Restore the pre-watch terminal title via OSC 0. Empty
-            # payload when capture failed (RawUI unavailable); most
-            # terminals reset the tab label to their profile default
-            # (Windows Terminal: profile name; VS Code: shell name).
-            # Emitted before the alt-buffer leave so the title swap and
-            # screen restore land in the same frame.
-            $restoreTitle = if ($null -ne $origTitle) { [string]$origTitle } else { '' }
-            $restoreTitle = [regex]::Replace($restoreTitle, '[\x00-\x1F\x7F]', '')
-            Write-VTSequence ("`e]0;{0}`a" -f $restoreTitle)
-            Write-VTSequence "`e[?25h`e[?1049l"
-        }
-        [Console]::CursorVisible = $origCursor
-        # Restore the pre-watch console output encoding last, after the
-        # alt-buffer leave + title restore have been written through the
-        # UTF-8 writer (the original title may itself carry non-ASCII).
-        if ($origEncoding) {
-            try { [Console]::OutputEncoding = $origEncoding } catch { Write-Verbose "Restoring console encoding failed: $_" }
-        }
+        Exit-WatchTerminal -State $terminal
     }
 }
 
@@ -6308,11 +7238,11 @@ function Invoke-Main {
     }
 
     # Cross-action flag-misuse guards. Only the switch flags are guarded:
-    # -Watch / -Json belong to read-only `usage`, -KeepWarm to `monitor`.
+    # -Watch / -Json belong to `usage`, -KeepWarm to `monitor`.
     # The int flags (-Threshold / -Interval) live in __AllParameterSets and
     # are harmless when an action ignores them, so they need no guard.
     if ($Action -eq 'monitor' -and ($Watch -or $Json)) {
-        throw "'monitor' is always a live, side-effecting watch; -Watch / -Json do not apply. For a read-only live view use 'sca usage -Watch'."
+        throw "'monitor' is always a live, side-effecting watch; -Watch / -Json do not apply. For a live view that does not rotate use 'sca usage -Watch'."
     }
     if ($KeepWarm -and $Action -ne 'monitor') {
         throw "-KeepWarm applies only to 'sca monitor'. Did you mean 'sca monitor -KeepWarm'?"

@@ -629,6 +629,7 @@ Describe 'switch_claude_account' {
                 FromName = 'work'
                 ToName   = 'personal'
             } }
+            Mock Invoke-Reconcile { New-ReconcileResult }
             Mock Find-SlotByName  { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap  { }
 
@@ -638,19 +639,25 @@ Describe 'switch_claude_account' {
             $out | Should -Match '^\[Monitor\] Rotated from "work" to "personal" at \d{2}:\d{2}:\d{2}$'
         }
 
-        It 'on rotate with Claude Code running: refuses, does NOT call Invoke-SlotSwap' {
+        # Rotating under a live Claude Code is the supported case, not a race
+        # to dodge: 2.1.274 picks the swapped credentials up within a turn.
+        # Following the active account is the whole job of `sca monitor`, so a
+        # running Claude Code must not stop it.
+        It 'on rotate with Claude Code running: still rotates' {
             Mock Get-AutoRotationDecision { return [pscustomobject]@{
                 Action   = 'rotate'
                 FromName = 'work'
                 ToName   = 'personal'
             } }
             Mock Test-ClaudeRunning { $true }
+            Mock Invoke-Reconcile { New-ReconcileResult }
+            Mock Find-SlotByName  { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap    { }
 
             $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Monitor] Automatic slot switching is enabled.'
 
-            Should -Invoke Invoke-SlotSwap -Times 0
-            $out | Should -Be '[Monitor] Rotation refused! Claude Code is running.'
+            Should -Invoke Invoke-SlotSwap -Times 1
+            $out | Should -Match '^\[Monitor\] Rotated from "work" to "personal" at \d{2}:\d{2}:\d{2}$'
         }
 
         It 'on rotate when swap throws, returns Rotation failed!' {
@@ -659,6 +666,7 @@ Describe 'switch_claude_account' {
                 FromName = 'work'
                 ToName   = 'personal'
             } }
+            Mock Invoke-Reconcile { New-ReconcileResult }
             Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap { throw [System.IO.IOException]::new('locked file') }
 
@@ -675,6 +683,7 @@ Describe 'switch_claude_account' {
                 FromName = 'work'
                 ToName   = 'personal'
             } }
+            Mock Invoke-Reconcile { New-ReconcileResult }
             Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
             Mock Invoke-SlotSwap { throw [System.IO.IOException]::new("first line`r`nsecond line") }
 
@@ -690,12 +699,121 @@ Describe 'switch_claude_account' {
                 FromName = 'work'
                 ToName   = 'personal'
             } }
+            Mock Invoke-Reconcile { New-ReconcileResult }
             Mock Find-SlotByName { return $null }
             Mock Invoke-SlotSwap { }
 
             $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch '[Monitor] Automatic slot switching is enabled.'
             Should -Invoke Invoke-SlotSwap -Times 0
             $out | Should -Match '^\[Monitor\] Rotation failed! Slot ''personal'' not found'
+        }
+
+        # The regression this call exists for. The watch loop reconciles BEFORE
+        # Get-UsageSnapshot, then spends a full serial HTTP pass across every
+        # slot before reaching the swap. A Claude Code refresh landing in that
+        # window used to be overwritten by the swap and never mirrored, leaving
+        # the outgoing slot holding a refresh token the server already rotated.
+        # Real Invoke-Reconcile here, not a mock: the point is the capture.
+        It 'on rotate captures a refresh that landed since the poll reconciled' {
+            $cd = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $cd -Force | Out-Null
+            $credFile = Join-Path $cd '.credentials.json'
+
+            $workFile = New-SlotPair -CredDir $cd -Name 'work'     -Email 'alice@example.com' -Content 'OLD-WORK'
+            New-SlotPair -CredDir $cd -Name 'personal' -Email 'bob@example.com' -Content 'PERSONAL' | Out-Null
+            Set-SandboxClaudeJson -Email 'alice@example.com'
+
+            Set-Content -LiteralPath $credFile -Value 'OLD-WORK' -NoNewline
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash (Get-SHA256Hex -Path $credFile) | Out-Null
+
+            # Claude Code refreshes the active slot's tokens after the watch
+            # loop's own reconcile ran and while Get-UsageSnapshot is still
+            # walking the fleet.
+            Set-Content -LiteralPath $credFile -Value 'REFRESHED-WORK' -NoNewline
+
+            Mock Get-AutoRotationDecision { return [pscustomobject]@{
+                Action   = 'rotate'
+                FromName = 'work'
+                ToName   = 'personal'
+            } }
+
+            Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch 'x' 6>$null |
+                Should -Match '^\[Monitor\] Rotated from "work" to "personal"'
+
+            Get-Content -LiteralPath $workFile -Raw |
+                Should -Be 'REFRESHED-WORK' -Because 'the outgoing slot must capture the refresh before its bytes are replaced'
+            Get-Content -LiteralPath $credFile -Raw | Should -Be 'PERSONAL'
+        }
+
+        # That same reconcile is not only a capture. Three of its outcomes move
+        # state.active_slot, which invalidates the decision: it was computed
+        # from a snapshot taken before the call, judging a slot that is no
+        # longer active. Rotating on it moves off an account nobody measured.
+        It 'on rotate abandons the tick when reconcile moved the active slot' -ForEach @(
+            @{ Outcome = 'adopt' }
+            @{ Outcome = 'identity-change' }
+            @{ Outcome = 'auto-save' }
+        ) {
+            Mock Get-AutoRotationDecision { return [pscustomobject]@{
+                Action   = 'rotate'
+                FromName = 'work'
+                ToName   = 'personal'
+            } }
+            # Built outside the scriptblock: GetNewClosure captures the scope as
+            # it stands now, and Common.ps1's fixtures are not resolvable from
+            # inside it. Capturing the finished object sidesteps that.
+            $syncResult = New-ReconcileResult -Action $Outcome -Slot 'someone-else'
+            Mock Invoke-Reconcile { $syncResult }.GetNewClosure()
+            Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
+            Mock Invoke-SlotSwap { }
+
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch 'x'
+
+            Should -Invoke Invoke-SlotSwap -Times 0
+            $out | Should -Be "[Monitor] Active account changed to 'someone-else'; re-evaluating at the next poll."
+        }
+
+        # The capture is the reason that reconcile is there. An outcome that
+        # wrote nothing leaves the swap about to discard the refresh it was
+        # meant to preserve, so the tick is abandoned exactly as a throw would
+        # abandon it. Waiting costs nothing: the threshold is still crossed at
+        # the next poll.
+        It 'on rotate refuses when reconcile captured nothing' -ForEach @(
+            @{ Reason = 'identity-unresolved' }
+            @{ Reason = 'credentials-changed-mid-probe' }
+        ) {
+            Mock Get-AutoRotationDecision { return [pscustomobject]@{
+                Action   = 'rotate'
+                FromName = 'work'
+                ToName   = 'personal'
+            } }
+            $syncResult = New-ReconcileResult -Action 'noop' -Reason $Reason -Slot 'work' -Captured $false
+            Mock Invoke-Reconcile { $syncResult }.GetNewClosure()
+            Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
+            Mock Invoke-SlotSwap { }
+
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch 'x'
+
+            Should -Invoke Invoke-SlotSwap -Times 0
+            $out | Should -Be "[Monitor] Rotation refused! The active slot's latest tokens could not be captured; retrying at the next poll."
+        }
+
+        # The capture outcomes leave the active slot where it was, so the
+        # decision still holds and the rotation must proceed.
+        It 'on rotate proceeds when reconcile only mirrored' {
+            Mock Get-AutoRotationDecision { return [pscustomobject]@{
+                Action   = 'rotate'
+                FromName = 'work'
+                ToName   = 'personal'
+            } }
+            Mock Invoke-Reconcile { New-ReconcileResult -Action 'mirror' -Slot 'work' }
+            Mock Find-SlotByName { return [pscustomobject]@{ Name = 'personal'; Path = 'x'; Sidecar = $null } }
+            Mock Invoke-SlotSwap { }
+
+            $out = Invoke-AutoRotationStep -Snapshot (New-EmptySnapshot) -Threshold 100 -CurrentLatch 'x'
+
+            Should -Invoke Invoke-SlotSwap -Times 1
+            $out | Should -Match '^\[Monitor\] Rotated from "work" to "personal"'
         }
 
         It 'on no-eligible with a future reset, returns cooldown line with a delta' {

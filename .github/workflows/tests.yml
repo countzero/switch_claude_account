@@ -122,3 +122,24 @@ jobs:
         if: matrix.os != 'windows-latest'
         shell: pwsh
         run: ./tests/Invoke-Tests.ps1 -SkipCoverage
+
+      # The Pester suite runs with stdout redirected, because that is what a
+      # test host is, and under redirection the console cursor API is a no-op
+      # or throws and the alternate screen buffer is a string in a
+      # StringWriter. So the suite proves the watch lifecycle does not crash
+      # and cannot prove it works. That gap held a real bug:
+      # [Console]::CursorVisible's getter is Windows-only and aborted
+      # `sca usage -Watch` at startup on both these platforms, with the
+      # interactive guard refusing before that line whenever a test was
+      # watching. script(1) hands the probe a pseudo terminal, so the real
+      # guard passes and the real console handle is exercised.
+      #
+      # Windows is absent because it has no script(1) and ConPTY is
+      # disproportionate for one probe; it keeps the suite and the coverage
+      # gate. The probe bounds itself by counted redraws rather than a clock,
+      # so timeout-minutes is a backstop against a hang, not the mechanism.
+      - name: Probe the watch against a real terminal
+        if: matrix.os != 'windows-latest'
+        shell: pwsh
+        timeout-minutes: 3
+        run: ./tests/Invoke-WatchPtyProbe.ps1
