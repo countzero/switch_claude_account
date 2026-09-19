@@ -2814,6 +2814,64 @@ Describe 'switch_claude_account' {
         }
     }
 
+    # The contending writer is Claude Code, which holds ~/.claude.json.lock and
+    # merges under it while sca does not, so only sca's side can lose a write.
+    # Driven by mocking the transform and letting the mock move the file
+    # underneath, rather than by mocking Get-Content, which the whole suite
+    # depends on reading real sandbox files.
+    Context 'Set-OAuthAccountInClaudeJson (concurrent ~/.claude.json writes)' {
+        BeforeEach {
+            $script:original = '{"numStartups":1,"oauthAccount":{"emailAddress":"a@b.com"}}'
+            Set-Content -LiteralPath $ClaudeJsonPath -Value $script:original -NoNewline -Encoding utf8NoBOM
+            $script:oa = [pscustomobject]@{ emailAddress = 'c@d.com' }
+            $script:transformCalls = 0
+        }
+
+        It 'restarts the substitution when the file moves under it, then commits' {
+            $script:intruder = '{"numStartups":2,"oauthAccount":{"emailAddress":"a@b.com"}}'
+            Mock ConvertTo-UpdatedClaudeJson {
+                $script:transformCalls++
+                # Only the first pass races: Claude Code lands its own write
+                # while we are transforming the bytes we read.
+                if ($script:transformCalls -eq 1) {
+                    Set-Content -LiteralPath $ClaudeJsonPath -Value $script:intruder -NoNewline -Encoding utf8NoBOM
+                }
+                return 'COMMITTED'
+            }
+
+            Set-OAuthAccountInClaudeJson -OAuthAccount $script:oa
+
+            # Two passes: the first is discarded unwritten, the second sees the
+            # intruder's bytes and commits on top of them.
+            $script:transformCalls | Should -Be 2
+            Get-Content -LiteralPath $ClaudeJsonPath -Raw | Should -Be 'COMMITTED'
+        }
+
+        It 'gives up rather than overwrite a writer that keeps winning' {
+            Mock ConvertTo-UpdatedClaudeJson {
+                $script:transformCalls++
+                # A new value every pass, so the verify read never matches.
+                Set-Content -LiteralPath $ClaudeJsonPath -Value "intruder-$script:transformCalls" -NoNewline -Encoding utf8NoBOM
+                return 'COMMITTED'
+            }
+
+            { Set-OAuthAccountInClaudeJson -OAuthAccount $script:oa } |
+                Should -Throw -ExpectedMessage '*changed under all 3 attempts*'
+
+            $script:transformCalls | Should -Be 3
+            # The contending writer's bytes survive; ours are not forced on top.
+            Get-Content -LiteralPath $ClaudeJsonPath -Raw | Should -Be 'intruder-3'
+        }
+
+        It 'writes nothing when no whitelisted field actually changes' {
+            Mock ConvertTo-UpdatedClaudeJson { return $null }
+
+            Set-OAuthAccountInClaudeJson -OAuthAccount $script:oa
+
+            Get-Content -LiteralPath $ClaudeJsonPath -Raw | Should -Be $script:original
+        }
+    }
+
     Context 'Get-NextSlotName (single-slot active no-op)' {
         It "prints the 'Only one slot' advisory and returns null when one active slot exists" {
             $credDir = Join-Path $script:SandboxHome '.claude'

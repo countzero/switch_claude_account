@@ -257,7 +257,7 @@ Claude Code 2.1.274 follows both files on its own: it polls `~/.claude.json` onc
 
 That makes Claude Code equivalent to [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4** for this purpose, so `sca monitor` is no longer OpenCode-scoped.
 
-One residual difference from closing the app: `sca` does not take Claude Code's `~/.claude.json.lock`, so an `sca` read-modify-write can drop a config change Claude Code made in the same instant. What is at stake there is configuration and per-project prompt history, never a credential.
+One residual difference from closing the app: `sca` does not take Claude Code's `~/.claude.json.lock`. It re-reads that file immediately before writing and starts over, then gives up, rather than overwrite a change that landed while it was working. That narrows the window to the write itself without closing it. What is at stake there is configuration and per-project prompt history, never a credential.
 
 Credentials get a stronger guarantee, because losing one is not recoverable. Before overwriting a saved slot, `sca` checks that the active tokens really are that slot's account: byte-identical tokens are recognized as a slot that is already saved, accounts are matched on their uuid rather than their email (Claude Code records the same account under either of two email forms), and anything still in doubt is confirmed against `/api/oauth/profile` using those very tokens rather than against the email cached in `~/.claude.json`, which a `/login` updates a moment later than the tokens themselves.
 

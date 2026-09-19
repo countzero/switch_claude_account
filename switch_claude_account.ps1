@@ -328,6 +328,14 @@ $Script:ProfileTimeoutSec   = 10
 $Script:TokenRefreshRetryMax     = 3
 $Script:TokenRefreshRetryDelayMs = 2000
 
+# Attempts Set-OAuthAccountInClaudeJson makes to land its substitution on bytes
+# that have not moved under it. Three, matching Set-CredentialFileAtomic's
+# rename policy, and for the same reason: a contending writer that is still
+# winning after three tries is not a blip worth waiting out. No delay between
+# them, because the contending write is Claude Code's own atomic rename rather
+# than a lock we could wait on.
+$Script:ClaudeJsonWriteRetryMax  = 3
+
 # --- Where Claude Code actually keeps the active login ---
 #
 # Everything here rests on .credentials.json being the active login. That is an
@@ -1291,20 +1299,24 @@ function Get-SHA256Hex {
 # emailAddress and restarting Claude Code makes /status report the new
 # value, and the rest of the file round-trips byte-equal.
 #
+# The pair is split into this pure half and the write below it, so the write
+# can re-run the whole substitution against freshly read bytes (which is what
+# makes its compare-and-swap expressible) and so the brace scan is testable
+# without a file on disk.
+#
+# Returns the updated file text, or $null when no whitelisted field actually
+# changes, which the caller reads as "nothing to write".
+#
 # Errors:
-#   * file missing                  -> throw
 #   * oauthAccount block missing    -> throw
 #   * unbalanced braces in block    -> throw (never seen in practice;
 #                                            indicates a corrupt file
 #                                            and we refuse to touch it)
-function Set-OAuthAccountInClaudeJson {
-    Param ([Parameter(Mandatory)] [pscustomobject] $OAuthAccount)
-
-    if (-not (Test-Path -LiteralPath $ClaudeJsonPath)) {
-        throw "~/.claude.json not found at '$ClaudeJsonPath'. Sign in to Claude Code first ('claude /login')."
-    }
-
-    $raw = Get-Content -LiteralPath $ClaudeJsonPath -Raw -ErrorAction Stop
+function ConvertTo-UpdatedClaudeJson {
+    Param (
+        [Parameter(Mandatory)] [AllowEmptyString()] [string] $Raw,
+        [Parameter(Mandatory)] [pscustomobject]             $OAuthAccount
+    )
 
     # Locate the opening `"oauthAccount": {`. We accept whitespace variations
     # because Claude Code's serializer indents with 2 spaces but a hand-edited
@@ -1384,10 +1396,50 @@ function Set-OAuthAccountInClaudeJson {
         }, 1)
     }
 
-    if ($newBlock -eq $blockText) { return }  # no-op write
+    if ($newBlock -eq $blockText) { return $null }  # nothing to write
 
-    $newRaw = $raw.Substring(0, $openBrace) + $newBlock + $raw.Substring($i)
-    Set-CredentialFileAtomic -Path $ClaudeJsonPath -Bytes ([System.Text.Encoding]::UTF8.GetBytes($newRaw))
+    return $raw.Substring(0, $openBrace) + $newBlock + $raw.Substring($i)
+}
+
+# Write half. Claude Code takes ~/.claude.json.lock, re-reads under it and
+# merges, so its writes do not clobber ours; ours would clobber anything it
+# committed while we were transforming, and since `switch` stopped refusing
+# beside a live client this read-modify-write races routinely rather than
+# never. What is lost that way is configuration and per-project prompt
+# history, never a credential.
+#
+# So: re-read immediately before committing and start over when the file moved
+# under us. That narrows the window from the whole substitution (a regex and a
+# brace scan over an 18 KB+ file) to the gap between the check and the rename.
+# It does NOT close it. Taking the lock is the real fix and needs its protocol
+# pinned first (`docs/claude-code-internals.md`); this is the part that can be
+# done without guessing at semantics sca has not verified.
+#
+# Giving up beats overwriting: both callers already handle a throw, and a
+# refused identity update costs a stale /status email, which the next `sca
+# switch` repairs.
+function Set-OAuthAccountInClaudeJson {
+    Param ([Parameter(Mandatory)] [pscustomobject] $OAuthAccount)
+
+    if (-not (Test-Path -LiteralPath $ClaudeJsonPath)) {
+        throw "~/.claude.json not found at '$ClaudeJsonPath'. Sign in to Claude Code first ('claude /login')."
+    }
+
+    for ($attempt = 1; $attempt -le $Script:ClaudeJsonWriteRetryMax; $attempt++) {
+        # [string] cast: Get-Content -Raw yields $null for an empty file, and
+        # the transform reports that as the missing-block throw rather than a
+        # binder error.
+        $raw    = [string](Get-Content -LiteralPath $ClaudeJsonPath -Raw -ErrorAction Stop)
+        $newRaw = ConvertTo-UpdatedClaudeJson -Raw $raw -OAuthAccount $OAuthAccount
+        if ($null -eq $newRaw) { return }
+
+        if ([string](Get-Content -LiteralPath $ClaudeJsonPath -Raw -ErrorAction Stop) -ne $raw) { continue }
+
+        Set-CredentialFileAtomic -Path $ClaudeJsonPath -Bytes ([System.Text.Encoding]::UTF8.GetBytes($newRaw))
+        return
+    }
+
+    throw "~/.claude.json changed under all $Script:ClaudeJsonWriteRetryMax attempts to update its oauthAccount block, so it was left as Claude Code wrote it rather than overwritten. Re-run once the client is idle."
 }
 
 # --- Per-slot identity sidecar -------------------------------------------
