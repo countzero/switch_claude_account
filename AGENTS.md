@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file is the canonical agent-instructions source for this repository, read natively by OpenCode and loaded by Claude Code through the `CLAUDE.md` import shim. Single-file PowerShell tool: core logic lives in `switch_claude_account.ps1`; tests live in `tests/` and use Pester 5. It carries the always-on rules as one invariant per area; the contracts behind them are the documents under `docs/`, read on demand through *Reference* at the end.
+This file is the canonical agent-instructions source for this repository, read natively by both OpenCode and Claude Code (2.1.277+). Single-file PowerShell tool: core logic lives in `switch_claude_account.ps1`; tests live in `tests/` and use Pester 5. It carries the always-on rules as one invariant per area; the contracts behind them are the documents under `docs/`, read on demand through *Reference* at the end.
 
 ## Security Rules
 
