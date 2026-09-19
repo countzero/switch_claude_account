@@ -181,7 +181,7 @@ sca usage -Watch -NoColor         # strip ANSI color
 
 The terminal-tab title is updated on every poll so a backgrounded watch is glanceable from the taskbar / Alt-Tab:
 
-    22% | 62% | Switch Claude Account
+    18% | 42% | Switch Claude Account
 
 <p align="center">
   <img src="docs/images/usage-watch.svg" alt="sca usage -Watch: pool-aggregate Session bar at 40% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer" width="720">
