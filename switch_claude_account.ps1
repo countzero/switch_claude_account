@@ -6223,8 +6223,8 @@ $Script:ActivatorTimeoutSec = 90
 # -Names, else -Name, when set), each starting at Status='warming-up' with Data=$null,
 # transitioning through 'priming' (the claude -p call in flight) to its
 # real outcome. The end state is the first frame of the polling loop; the
-# caller wires it to $snapshot and sets $lastPoll = now. Returns $null
-# when no slots match.
+# caller wires it to the watch session's Snapshot and stamps its LastPoll.
+# Returns $null when no slots match.
 #
 # The original active slot is captured before the loop via Read-ScaState
 # + Find-SlotByName. A finally block restores it via one more Invoke-Slot-
@@ -6581,11 +6581,11 @@ function Invoke-KeepWarmStep {
     }
 }
 
-# Compute the $lastPoll value that schedules the next watch poll roughly
-# $DelaySec from now. The watch loop polls when (now - $lastPoll) >=
+# Compute the last-poll stamp that schedules the next watch poll roughly
+# $DelaySec from now. The watch loop polls when (now - LastPoll) >=
 # $Interval, so to fire $DelaySec out we must rewind by ($Interval -
 # $DelaySec), NOT by $DelaySec. Clamped at 0 so a $DelaySec >= $Interval
-# never pushes $lastPoll into the future (which would DELAY the poll);
+# never pushes the stamp into the future (which would DELAY the poll);
 # at the clamp the loop polls immediately. Pure; unit-tested in
 # Helpers.Tests.ps1.
 function Get-EarlyRepollLastPoll {
@@ -6677,6 +6677,40 @@ function Exit-WatchTerminal {
     }
 }
 
+# The watch loop's mutable state as one object, so the poll step and the
+# startup pass can be functions instead of inline blocks reading and writing
+# seven loose locals. Mutated in place by its consumers rather than returned
+# and reassigned, following Invoke-KeepWarmStep, which already mutates the
+# caller's WarmupTimes / WarmupFailures hashtables.
+#
+# WarmupTimes (slot name -> last re-warm attempt) and WarmupFailures (slot
+# name -> consecutive failed warms) are separate maps because a session that
+# never fails keeps the second empty. Neither is persisted; both live for
+# this watch only and feed the cooldown gate in Invoke-KeepWarmStep.
+function New-WatchSession {
+    Param (
+        [switch] $Auto,
+        [switch] $Warmup
+    )
+
+    return [pscustomobject]@{
+        Snapshot       = $null
+        # MinValue, not Now: the first loop iteration must fall into the poll
+        # branch. The -Warmup startup pass overwrites it with a real stamp
+        # because its own pass already produced a frame.
+        LastPoll       = [DateTime]::MinValue
+        LastPollError  = $null
+        # One latch per mode, each holding that mode's last state line until
+        # the next state change, so a frame rendered between poll boundaries
+        # still reports it. The initial values say the mode is engaged before
+        # the first event of its kind.
+        AutoLatch      = if ($Auto)   { $Script:MonitorSteadyLatch } else { $null }
+        WarmLatch      = if ($Warmup) { '[Warmup] Keeping all slots warm.' } else { $null }
+        WarmupTimes    = @{}
+        WarmupFailures = @{}
+    }
+}
+
 # Live `sca usage -Watch` loop: redraws once per second and re-polls the
 # endpoint every -Interval seconds. The redraw cadence is decoupled from
 # the poll cadence so the frame self-heals on terminal resize within
@@ -6765,32 +6799,11 @@ function Invoke-UsageWatch {
 
     $terminal = Enter-WatchTerminal
     try {
-        $snapshot      = $null
-        $lastPoll      = [DateTime]::MinValue
-        $lastPollError = $null
-
-        # -Auto footer-line latch. Updated at each poll boundary based on
-        # Get-AutoRotationDecision's verdict; the latched string is
-        # appended (in DarkGray, like the [Watch] lines) to every frame
-        # until the next state change. Initial value 'Enabled' shows the
-        # mode is engaged before the first rotation event.
-        $lastAutoFooter = if ($Auto) { $Script:MonitorSteadyLatch } else { $null }
-
-        # -Warmup footer-line latch + per-slot last-re-warm map. The latch
-        # parallels $lastAutoFooter (steady-state line until a keep-warm
-        # event replaces it). $warmupTimes (slot name -> last attempt
-        # [DateTime]) and $warmupFailures (slot name -> consecutive failed
-        # warms) live only for this watch session and feed the cooldown gate in
-        # Invoke-KeepWarmStep; neither is persisted. They are separate maps
-        # because the step mutates both and a session that never fails keeps
-        # the second empty.
-        $lastWarmupFooter = if ($Warmup) { '[Warmup] Keeping all slots warm.' } else { $null }
-        $warmupTimes      = @{}
-        $warmupFailures   = @{}
+        $session = New-WatchSession -Auto:$Auto -Warmup:$Warmup
 
         # -Warmup startup pass. Invoke-WarmAllSlots does the per-slot
         # swap-then-activate round-robin and returns a populated snapshot
-        # we hand off to the polling loop as its first frame ($lastPoll
+        # we hand off to the polling loop as its first frame (LastPoll
         # = now so the loop's first iteration falls into the redraw
         # branch, not the poll branch). Reconcile first so a cross-
         # account swap landed since the last sca call is captured before
@@ -6808,11 +6821,11 @@ function Invoke-UsageWatch {
             # -Auto's right-aligned "▶ switching slot at N%" header
             # indicator stays off when -Auto is absent.
             $autoHeader = if ($Auto) { $Threshold } else { 0 }
-            $snapshot = Invoke-WarmAllSlots -Name $Name -Repaint {
+            $session.Snapshot = Invoke-WarmAllSlots -Name $Name -Repaint {
                 Param ($snap)
                 $startupFooter = ''
-                if ($lastAutoFooter)   { $startupFooter = $lastAutoFooter + "`n" }
-                if ($lastWarmupFooter) { $startupFooter += $lastWarmupFooter }
+                if ($session.AutoLatch) { $startupFooter = $session.AutoLatch + "`n" }
+                if ($session.WarmLatch) { $startupFooter += $session.WarmLatch }
                 # Same in-place-overwrite single-write paint as the polling
                 # loop (no ESC[2J); the alt buffer is already blank on entry,
                 # so the first warmup repaint has nothing stale to clear and
@@ -6822,10 +6835,10 @@ function Invoke-UsageWatch {
                 }
                 Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence $frameText) + "`e[?2026l")
             }
-            if ($null -ne $snapshot) {
-                $lastPoll = [DateTime]::Now
+            if ($null -ne $session.Snapshot) {
+                $session.LastPoll = [DateTime]::Now
                 try {
-                    Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $snapshot -Aggregate:$Auto))
+                    Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $session.Snapshot -Aggregate:$Auto))
                 } catch { Write-Verbose "Warmup title set deferred: $_" }
             }
             # If warmup ended with rate-limited rows, the user sees dashes
@@ -6833,10 +6846,10 @@ function Invoke-UsageWatch {
             # ~$Script:WarmupRepollDelaySec from now (regardless of
             # -Interval) so the short 429 cooldown likely clears and real
             # data appears sooner. If the early repoll also gets 429,
-            # $lastPoll resets to now and we fall back to the normal
-            # interval — no worse than current behaviour.
-            if ($snapshot -and $snapshot.HasRateLimited) {
-                $lastPoll = Get-EarlyRepollLastPoll -Now ([DateTime]::Now) -Interval $Interval -DelaySec $Script:WarmupRepollDelaySec
+            # LastPoll resets to now and we fall back to the normal
+            # interval: no worse than current behaviour.
+            if ($session.Snapshot -and $session.Snapshot.HasRateLimited) {
+                $session.LastPoll = Get-EarlyRepollLastPoll -Now ([DateTime]::Now) -Interval $Interval -DelaySec $Script:WarmupRepollDelaySec
             }
 
             # Seed the cooldown map with the startup pass: every slot just
@@ -6844,15 +6857,15 @@ function Invoke-UsageWatch {
             # verify-read failed/lagged (still reporting a closed window) is
             # not immediately re-warmed on the first poll. The closed-window
             # check covers the healthy slots; this covers the laggy ones.
-            if ($null -ne $snapshot) {
+            if ($null -ne $session.Snapshot) {
                 $seed = [DateTime]::Now
-                foreach ($r in @($snapshot.Results)) { $warmupTimes[$r.Name] = $seed }
+                foreach ($r in @($session.Snapshot.Results)) { $session.WarmupTimes[$r.Name] = $seed }
             }
         }
 
         while ($true) {
             $now = [DateTime]::Now
-            $dueForPoll = ($null -eq $snapshot) -or (($now - $lastPoll).TotalSeconds -ge $Interval)
+            $dueForPoll = ($null -eq $session.Snapshot) -or (($now - $session.LastPoll).TotalSeconds -ge $Interval)
 
             if ($dueForPoll) {
                 try {
@@ -6878,8 +6891,8 @@ function Invoke-UsageWatch {
                     # in non-watch contexts (`sca usage`, `sca list`).
                     # Matches the Invoke-Reconcile 6>$null above and the
                     # Invoke-SlotSwap 6>$null inside Invoke-AutoRotationStep.
-                    $snapshot      = Get-UsageSnapshot -Name $Name 6>$null
-                    $lastPollError = $null
+                    $session.Snapshot      = Get-UsageSnapshot -Name $Name 6>$null
+                    $session.LastPollError = $null
 
                     # Update the terminal title only on a successful poll;
                     # on a failed poll the previous title (and body) persist
@@ -6897,7 +6910,7 @@ function Invoke-UsageWatch {
                     # pool-mean matches the aggregate bars rendered
                     # above the table. Bare -Watch keeps the per-slot
                     # alarm-glance title. See Format-WatchTitle docblock.
-                    Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $snapshot -Aggregate:$Auto))
+                    Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $session.Snapshot -Aggregate:$Auto))
 
                     # Auto-rotation decision happens after each successful
                     # poll. The latched footer string is updated based on
@@ -6908,7 +6921,7 @@ function Invoke-UsageWatch {
                     # aborts because of an auto-rotation issue (user can
                     # still quit with Ctrl-C and inspect the table).
                     if ($Auto) {
-                        $lastAutoFooter = Invoke-AutoRotationStep -Snapshot $snapshot -Threshold $Threshold -CurrentLatch $lastAutoFooter
+                        $session.AutoLatch = Invoke-AutoRotationStep -Snapshot $session.Snapshot -Threshold $Threshold -CurrentLatch $session.AutoLatch
                     }
 
                     # Keep-warm decision after auto-rotation so the slot
@@ -6920,9 +6933,9 @@ function Invoke-UsageWatch {
                     # Re-opens any slot whose 5h window has closed; the latched
                     # footer reports it.
                     if ($Warmup) {
-                        $lastWarmupFooter = Invoke-KeepWarmStep -Snapshot $snapshot -WarmupTimes $warmupTimes `
-                                                               -Threshold $Threshold -WarmupFailures $warmupFailures `
-                                                               -CurrentLatch $lastWarmupFooter
+                        $session.WarmLatch = Invoke-KeepWarmStep -Snapshot $session.Snapshot -WarmupTimes $session.WarmupTimes `
+                                                                 -Threshold $Threshold -WarmupFailures $session.WarmupFailures `
+                                                                 -CurrentLatch $session.WarmLatch
                     }
                 }
                 catch {
@@ -6930,7 +6943,7 @@ function Invoke-UsageWatch {
                     # poll failed we still need to show SOMETHING below the
                     # header, so render an empty frame and surface the
                     # error in the footer; the user can still quit cleanly.
-                    $lastPollError = $_.Exception.Message
+                    $session.LastPollError = $_.Exception.Message
                 }
                 # Stamped AFTER the poll, not from the pre-poll $now: a poll
                 # that outruns -Interval (slow endpoint x N slots) would
@@ -6938,7 +6951,7 @@ function Invoke-UsageWatch {
                 # iteration would re-poll with zero delay, hammering a limiter
                 # that 429s after a handful of calls in a few seconds. Matches
                 # the post-warmup stamp above.
-                $lastPoll = [DateTime]::Now
+                $session.LastPoll = [DateTime]::Now
             }
 
             # Footer rebuilt every tick. The string is constant between
@@ -6951,18 +6964,18 @@ function Invoke-UsageWatch {
             # user's eye finds them first; transport-level details (poll
             # timestamp, failure tail) follow underneath.
             $footer = ''
-            if ($lastAutoFooter) {
-                $footer = $lastAutoFooter + "`n"
+            if ($session.AutoLatch) {
+                $footer = $session.AutoLatch + "`n"
             }
-            if ($lastWarmupFooter) {
-                $footer += $lastWarmupFooter + "`n"
+            if ($session.WarmLatch) {
+                $footer += $session.WarmLatch + "`n"
             }
-            $footer += "[Watch] Last poll at $($lastPoll.ToString('HH:mm:ss'))"
-            if ($lastPollError) {
+            $footer += "[Watch] Last poll at $($session.LastPoll.ToString('HH:mm:ss'))"
+            if ($session.LastPollError) {
                 # Collapse before interpolating: the footer is split on newlines
                 # by Format-UsageFooter, so a multi-line socket exception would
                 # otherwise fork one footer entry into several unprefixed lines.
-                $pollReason = Format-StatusErrorTail -Message $lastPollError
+                $pollReason = Format-StatusErrorTail -Message $session.LastPollError
                 $footer += "`n[Watch] Last poll failed: $pollReason (keeping previous data; will retry on next tick)"
             }
 
@@ -6987,8 +7000,8 @@ function Invoke-UsageWatch {
             # within ~1 s (the per-line ESC[K + trailing ESC[0J reclaim any
             # stale cells from the old geometry).
             $frameText = Get-WatchFrameText {
-                if ($null -ne $snapshot) {
-                    Format-UsageFrame -Name $Name -Snapshot $snapshot -Footer $footer -AutoThreshold $autoHeaderThreshold
+                if ($null -ne $session.Snapshot) {
+                    Format-UsageFrame -Name $Name -Snapshot $session.Snapshot -Footer $footer -AutoThreshold $autoHeaderThreshold
                 } else {
                     # First poll failed and we have nothing to render yet.
                     # $footer already leads with the [Monitor] line (when -Auto

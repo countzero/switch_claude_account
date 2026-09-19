@@ -40,6 +40,7 @@ BeforeAll {
             'Invoke-UsageWatch'
             'Enter-WatchTerminal'
             'Exit-WatchTerminal'
+            'New-WatchSession'
         )
         $ast = [System.Management.Automation.Language.Parser]::ParseFile(
             $Path, [ref]$null, [ref]$null)
@@ -1298,6 +1299,47 @@ Describe 'switch_claude_account' {
             } finally {
                 [Console]::OutputEncoding = $orig
             }
+        }
+
+        It 'New-WatchSession starts due for a poll with both latches off' {
+            # MinValue is load-bearing: the loop's poll gate is
+            # (now - LastPoll) >= Interval, so anything near "now" would
+            # make a bare `sca usage -Watch` sit on an empty frame for a
+            # full interval before its first request.
+            $s = New-WatchSession
+            $s.Snapshot       | Should -BeNullOrEmpty
+            $s.LastPoll       | Should -Be ([DateTime]::MinValue)
+            $s.LastPollError  | Should -BeNullOrEmpty
+            $s.AutoLatch      | Should -BeNullOrEmpty
+            $s.WarmLatch      | Should -BeNullOrEmpty
+            $s.WarmupTimes    | Should -BeOfType ([hashtable])
+            $s.WarmupFailures | Should -BeOfType ([hashtable])
+            $s.WarmupTimes.Count    | Should -Be 0
+            $s.WarmupFailures.Count | Should -Be 0
+        }
+
+        It 'New-WatchSession latches each mode on before its first event' {
+            # The latches are what the footer renders between poll
+            # boundaries; an unset one would leave `sca monitor` silent
+            # about being engaged until the first rotation.
+            (New-WatchSession -Auto).AutoLatch   | Should -Be $Script:MonitorSteadyLatch
+            (New-WatchSession -Auto).WarmLatch   | Should -BeNullOrEmpty
+            (New-WatchSession -Warmup).WarmLatch | Should -Be '[Warmup] Keeping all slots warm.'
+            (New-WatchSession -Warmup).AutoLatch | Should -BeNullOrEmpty
+
+            $both = New-WatchSession -Auto -Warmup
+            $both.AutoLatch | Should -Not -BeNullOrEmpty
+            $both.WarmLatch | Should -Not -BeNullOrEmpty
+        }
+
+        It 'New-WatchSession hands out independent warmup maps per session' {
+            # Both maps are mutated in place by Invoke-KeepWarmStep; a
+            # shared reference would leak one watch's cooldowns into the
+            # next.
+            $a = New-WatchSession -Warmup
+            $b = New-WatchSession -Warmup
+            $a.WarmupTimes['slot'] = [DateTime]::Now
+            $b.WarmupTimes.Count | Should -Be 0
         }
 
         It 'Enter-WatchTerminal guards the Windows-only CursorVisible getter' {
