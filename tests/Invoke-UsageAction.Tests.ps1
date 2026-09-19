@@ -1094,7 +1094,11 @@ Describe 'switch_claude_account' {
             # The em-dash data cells stay (no data to show), but the advisory
             # names the throttled slot and states the condition without
             # promising recovery (the renderer is shared with one-shot).
-            $out | Should -Match "'throttled' is currently rate-limited or at a plan limit\."
+            # Never read, so the honest line is the one that names the check
+            # rather than the one asserting a limit sca cannot substantiate.
+            $out | Should -Match "'throttled' could not be read, and sca cannot tell a throttle from an expired login"
+            $out | Should -Match "sca warmup <slot>"
+            $out | Should -Not -Match 'currently rate-limited or at a plan limit'
             # The cached-data wording must NOT fire (no cache here).
             $out | Should -Not -Match 'last known usage'
         }
@@ -1127,8 +1131,8 @@ Describe 'switch_claude_account' {
             # block, leading the [Watch] line (and, when present, [Monitor]).
             # 'throttled' appears first in the table row, then again in the
             # advisory; the advisory-only phrase anchors the ordering check.
-            ($out.IndexOf('throttled')) | Should -BeLessThan ($out.IndexOf('currently rate-limited'))
-            ($out.IndexOf('currently rate-limited')) | Should -BeLessThan ($out.IndexOf('[Watch]'))
+            ($out.IndexOf('throttled')) | Should -BeLessThan ($out.IndexOf('sca warmup'))
+            ($out.IndexOf('sca warmup')) | Should -BeLessThan ($out.IndexOf('[Watch]'))
         }
 
         It 'Invoke-UsageAction -Watch -Json throws (mutually exclusive)' {
@@ -2572,6 +2576,65 @@ Describe 'switch_claude_account' {
             # The whole point: the second poll adds no traffic.
             $script:tokCount | Should -Be $after
         }
+
+        # sca's 429 arrives before the server reads the grant, so on its own it
+        # cannot distinguish a throttle from a revoked login, and 'rate-limited'
+        # tells the user to wait for something that will never clear. claude -p
+        # does reach the grant; where it has ruled, that ruling wins.
+        It 'prefers a recorded auth verdict over a rate-limited it cannot substantiate' {
+            $expired = [DateTimeOffset]::UtcNow.AddHours(-2).ToUnixTimeMilliseconds()
+            $payload = @{ claudeAiOauth = @{ accessToken='AT'; refreshToken='RT'; expiresAt=$expired } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $script:boSlot -Value $payload -NoNewline
+            $Script:SlotUsageCache.Remove($script:boSlot)
+
+            Set-SlotAuthVerdict -SlotName 'bo' -SlotPath $script:boSlot `
+                                -Status 'expired' -ErrorMessage 'OAuth session expired and could not be refreshed'
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $resp = [pscustomobject]@{ StatusCode = 429 }
+                $e = [System.Exception]::new('429'); $e | Add-Member -NotePropertyName Response -NotePropertyValue $resp; throw $e
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:boSlot
+
+            $r.Status | Should -Be 'expired'
+            $r.Error  | Should -Match 'could not be refreshed'
+        }
+
+        It 'reports rate-limited again once the verdict no longer matches the slot bytes' {
+            $expired = [DateTimeOffset]::UtcNow.AddHours(-2).ToUnixTimeMilliseconds()
+            $payload = @{ claudeAiOauth = @{ accessToken='AT'; refreshToken='RT'; expiresAt=$expired } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $script:boSlot -Value $payload -NoNewline
+            $Script:SlotUsageCache.Remove($script:boSlot)
+
+            Set-SlotAuthVerdict -SlotName 'bo' -SlotPath $script:boSlot -Status 'expired' -ErrorMessage 'stale'
+            # Stands in for a re-login followed by `sca save`.
+            $fresh = @{ claudeAiOauth = @{ accessToken='NEW'; refreshToken='NEW'; expiresAt=$expired } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $script:boSlot -Value $fresh -NoNewline
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $resp = [pscustomobject]@{ StatusCode = 429 }
+                $e = [System.Exception]::new('429'); $e | Add-Member -NotePropertyName Response -NotePropertyValue $resp; throw $e
+            }
+
+            (Get-SlotUsage -SlotPath $script:boSlot).Status | Should -Be 'rate-limited'
+        }
+
+        It 'prefers the verdict on the backoff short-circuit too (no HTTP at all)' {
+            $script:rmCount3 = 0
+            Mock Invoke-RestMethod -MockWith { $script:rmCount3++; throw 'must not be called' }
+            Set-SlotAuthVerdict -SlotName 'bo' -SlotPath $script:boSlot -Status 'unauthorized' -ErrorMessage 'revoked'
+            $Script:SlotUsageCache[$script:boSlot] = @{
+                Data             = $null
+                Timestamp        = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:boSlot
+
+            $r.Status        | Should -Be 'unauthorized'
+            $script:rmCount3 | Should -Be 0
+        }
     }
 
     Context 'Get-SlotUsage (generic HTTP error surfaces the status code)' {
@@ -3725,6 +3788,57 @@ Describe 'switch_claude_account' {
             # The mirror runs once per ok activation so the slot file picks
             # up the token claude refreshed.
             Should -Invoke Invoke-Reconcile -Times 1 -Exactly
+        }
+
+        # claude reached the token endpoint and the grant was refused. Recording
+        # that is the only way a later plain `sca usage`, which never runs
+        # claude and whose own probe can be turned away before the grant is
+        # read, can report a dead login instead of a throttle.
+        It 'records an auth verdict when the activator reports the grant refused' {
+            New-WarmupSlot -Name 'dead' | Out-Null
+            Mock Invoke-SlotActivator -MockWith {
+                [pscustomobject]@{ Status = 'expired'; Error = 'OAuth session expired and could not be refreshed' }
+            }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            $v = Read-ScaState
+            $v.auth_verdicts['dead'].status | Should -Be 'expired'
+            $v.auth_verdicts['dead'].error  | Should -Match 'could not be refreshed'
+        }
+
+        It 'records the verdict for an unauthorized activation too' {
+            New-WarmupSlot -Name 'revoked' | Out-Null
+            Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'unauthorized'; Error = 'forbidden' } }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            (Read-ScaState).auth_verdicts['revoked'].status | Should -Be 'unauthorized'
+        }
+
+        It 'does NOT record a verdict for a throttled activation' {
+            # A rate limit says nothing about the grant; recording it would
+            # relabel a healthy slot as dead for as long as its bytes stand.
+            New-WarmupSlot -Name 'limited2' | Out-Null
+            Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'rate-limited' } }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            $state = Read-ScaState
+            if ($state -and $state.auth_verdicts) {
+                $state.auth_verdicts.ContainsKey('limited2') | Should -BeFalse
+            }
+        }
+
+        It 'clears a recorded verdict once the slot activates successfully' {
+            # New-SlotPair returns the slot PATH as a string, not an object.
+            $slotPath = New-WarmupSlot -Name 'healed'
+            Set-SlotAuthVerdict -SlotName 'healed' -SlotPath $slotPath -Status 'expired' -ErrorMessage 'was dead'
+            Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'ok' } }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            Get-SlotAuthVerdict -SlotPath $slotPath | Should -BeNullOrEmpty
         }
 
         It 'activator no-oauth: row ends Status="no-oauth", no mirror or usage read' {

@@ -530,10 +530,10 @@ $Script:AdvisoryReasonMaxWidth = 200
 # terminal with five slots that is enough to push the table off screen on its
 # own.
 #
-# Eight is four condition lines plus three remedies plus one, so the two groups
+# Nine is five condition lines plus three remedies plus one, so the two groups
 # that carry coverage always fit and the per-slot reasons spend whatever is
 # left; see Format-UsageAdvisory for why those are the droppable ones.
-$Script:AdvisoryMaxLines = 8
+$Script:AdvisoryMaxLines = 9
 
 # --- Atomic credential-file write primitives ------------------------------
 #
@@ -906,6 +906,31 @@ function Repair-CredentialFileModes {
 # the loser's changes are silently dropped. Acceptable for an interactive
 # tool that is rarely (and never deliberately) invoked in parallel.
 
+# Normalize the parsed auth_verdicts block into a plain hashtable of
+# slot name -> @{ status; error; cred_hash }. Always returns a hashtable, so
+# every caller can index it without a null check.
+#
+# Entries missing a status or a cred_hash are dropped rather than repaired: a
+# verdict with no cred_hash can never be matched against a slot file, so it
+# would sit in the file forever, and one with no status carries nothing.
+function ConvertTo-AuthVerdictMap {
+    Param ($Parsed)
+
+    $map = @{}
+    if (-not $Parsed) { return $map }
+
+    foreach ($prop in $Parsed.PSObject.Properties) {
+        $v = $prop.Value
+        if (-not $v -or -not $v.status -or -not $v.cred_hash) { continue }
+        $map[$prop.Name] = @{
+            status    = [string]$v.status
+            error     = if ($v.error) { [string]$v.error } else { $null }
+            cred_hash = [string]$v.cred_hash
+        }
+    }
+    return $map
+}
+
 # Persist $State to $StateFile via atomic rename. The schema field is
 # enforced to 1 here so callers cannot accidentally write a stale or
 # missing version. last_sync_hash and active_slot may be $null (initial
@@ -920,7 +945,14 @@ function Write-ScaState {
         active_slot    = $State.active_slot
         last_sync_hash = $State.last_sync_hash
     }
-    $json  = $payload | ConvertTo-Json -Compress
+    # Omitted entirely when empty, so a state file for a healthy pool keeps the
+    # shape it has always had and an older script reading it sees nothing new.
+    if ($State.auth_verdicts -and @($State.auth_verdicts.Keys).Count -gt 0) {
+        $payload['auth_verdicts'] = $State.auth_verdicts
+    }
+    # Depth: the verdict map nests one level deeper than ConvertTo-Json's
+    # default of 2, which would otherwise serialize each entry as its type name.
+    $json  = $payload | ConvertTo-Json -Compress -Depth 5
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
 
     Set-CredentialFileAtomic -Path $StateFile -Bytes $bytes
@@ -961,6 +993,7 @@ function Read-ScaState {
                 schema         = [int]$obj.schema
                 active_slot    = if ($obj.active_slot)    { [string]$obj.active_slot }    else { $null }
                 last_sync_hash = if ($obj.last_sync_hash) { [string]$obj.last_sync_hash } else { $null }
+                auth_verdicts  = ConvertTo-AuthVerdictMap -Parsed $obj.auth_verdicts
             }
         }
         catch {
@@ -989,6 +1022,7 @@ function Read-ScaState {
                     schema         = 1
                     active_slot    = $parsed.Name
                     last_sync_hash = $activeHash
+                    auth_verdicts  = @{}
                 }
                 # Persist the migration so subsequent reads are O(1).
                 # Failure here is non-fatal; callers see correct behavior
@@ -1002,16 +1036,17 @@ function Read-ScaState {
     return $null
 }
 
-# Read-modify-write helper. Pass any subset of -ActiveSlot / -LastSyncHash;
-# parameters not bound are left at their current state-file value (or null
-# when no state file existed). -ClearActiveSlot wins over -ActiveSlot in
-# the unusual case both are bound, so callers expressing "forget the
-# active slot" cannot accidentally re-set it.
+# Read-modify-write helper. Pass any subset of -ActiveSlot / -LastSyncHash /
+# -AuthVerdicts; parameters not bound are left at their current state-file
+# value (or null when no state file existed). -ClearActiveSlot wins over
+# -ActiveSlot in the unusual case both are bound, so callers expressing
+# "forget the active slot" cannot accidentally re-set it.
 function Update-ScaState {
     Param (
-        [String] $ActiveSlot,
-        [String] $LastSyncHash,
-        [switch] $ClearActiveSlot
+        [String]    $ActiveSlot,
+        [String]    $LastSyncHash,
+        [hashtable] $AuthVerdicts,
+        [switch]    $ClearActiveSlot
     )
 
     $current = Read-ScaState
@@ -1020,11 +1055,18 @@ function Update-ScaState {
             schema         = 1
             active_slot    = $null
             last_sync_hash = $null
+            auth_verdicts  = @{}
         }
+    }
+    # A state object read before auth_verdicts existed, or built by a caller
+    # that predates it, has no such property to assign to.
+    if (-not $current.PSObject.Properties['auth_verdicts']) {
+        $current | Add-Member -NotePropertyName auth_verdicts -NotePropertyValue @{}
     }
 
     if ($PSBoundParameters.ContainsKey('ActiveSlot'))   { $current.active_slot    = $ActiveSlot }
     if ($PSBoundParameters.ContainsKey('LastSyncHash')) { $current.last_sync_hash = $LastSyncHash }
+    if ($PSBoundParameters.ContainsKey('AuthVerdicts')) { $current.auth_verdicts  = $AuthVerdicts }
     if ($ClearActiveSlot)                               { $current.active_slot    = $null }
 
     Write-ScaState -State $current
@@ -3550,6 +3592,93 @@ function Test-TokenEndpointThrottled {
     return $false
 }
 
+# --- Auth verdicts: what `claude -p` concluded about a slot's grant --------
+#
+# sca's own /v1/oauth/token request can be refused before the server looks at
+# the grant (measured 2026-09-19: a deliberately invalid refresh token drew the
+# same 429 as a real one). When that happens sca cannot tell a dead login from
+# a live-but-throttled one, and reporting 'rate-limited' implies a temporary
+# condition that clears on its own. For a revoked grant that is false, and it
+# sends the user to wait instead of to re-login.
+#
+# `claude -p` reaches the endpoint when sca cannot, so Invoke-WarmAllSlots'
+# activation result is the better evidence. It is recorded here so a later
+# plain `sca usage`, which never runs claude, can still report the truth.
+#
+# Keyed on a hash of the credential file, not a timestamp: a verdict is about
+# specific bytes. Re-login plus `sca save` rewrites the file, the hash stops
+# matching, and the verdict is ignored without anyone having to remember to
+# clear it. That is the one failure mode a stale-by-age scheme cannot avoid.
+
+# Record claude's auth verdict for a slot. Never throws: a state-file write
+# failure costs a label, not the command.
+function Set-SlotAuthVerdict {
+    Param (
+        [Parameter(Mandatory)] [string] $SlotName,
+        [Parameter(Mandatory)] [string] $SlotPath,
+        [Parameter(Mandatory)] [string] $Status,
+        [AllowNull()] [AllowEmptyString()] [string] $ErrorMessage
+    )
+
+    try {
+        $hash  = Get-SHA256Hex -Path $SlotPath
+        $state = Read-ScaState
+        $map   = if ($state -and $state.auth_verdicts) { $state.auth_verdicts } else { @{} }
+        $map[$SlotName] = @{ status = $Status; error = $ErrorMessage; cred_hash = $hash }
+        Update-ScaState -AuthVerdicts $map | Out-Null
+    }
+    catch { Write-Verbose "Auth verdict for '$SlotName' not recorded: $_" }
+}
+
+# Drop a slot's verdict. Called when anything proves the grant works again.
+function Clear-SlotAuthVerdict {
+    Param ([Parameter(Mandatory)] [string] $SlotName)
+
+    try {
+        $state = Read-ScaState
+        if (-not $state -or -not $state.auth_verdicts) { return }
+        if (-not $state.auth_verdicts.ContainsKey($SlotName)) { return }
+        $map = $state.auth_verdicts
+        $map.Remove($SlotName)
+        Update-ScaState -AuthVerdicts $map | Out-Null
+    }
+    catch { Write-Verbose "Auth verdict for '$SlotName' not cleared: $_" }
+}
+
+# The stored verdict for a slot, but only while it still describes the bytes
+# on disk. $null otherwise, which is also what an unreadable slot file or a
+# missing state file returns: without a verdict the caller keeps its own label.
+function Get-SlotAuthVerdict {
+    Param ([Parameter(Mandatory)] [string] $SlotPath)
+
+    try {
+        $parsed = Get-SlotFileInfo -FileName (Split-Path -Leaf $SlotPath)
+        if (-not $parsed) { return $null }
+
+        $state = Read-ScaState
+        if (-not $state -or -not $state.auth_verdicts) { return $null }
+        $verdict = $state.auth_verdicts[$parsed.Name]
+        if (-not $verdict) { return $null }
+
+        if ($verdict.cred_hash -ne (Get-SHA256Hex -Path $SlotPath)) { return $null }
+        return $verdict
+    }
+    catch { return $null }
+}
+
+# The recorded verdict as a usage row, or $null when there is none. Used at the
+# two points where Get-SlotUsage would otherwise report a 'rate-limited' it
+# cannot substantiate: sca's request was refused before the grant was read, so
+# 'rate-limited' there means only "sca was turned away", and claude's verdict
+# is the better answer where one exists.
+function Resolve-AuthVerdictResult {
+    Param ([Parameter(Mandatory)] [string] $SlotPath)
+
+    $verdict = Get-SlotAuthVerdict -SlotPath $SlotPath
+    if (-not $verdict) { return $null }
+    return New-UsageResult -Status $verdict.status -ErrorMessage $verdict.error
+}
+
 # Read a slot's OAuth tokens and return a non-expired access token,
 # refreshing via /v1/oauth/token first if the cached token is past or
 # within 60s of its expiry. Shared prelude for Get-SlotUsage and
@@ -3705,7 +3834,11 @@ function Get-SlotUsage {
         # On a throttle-only entry, or one past the age ceiling, there is no
         # last known usage and the row renders em-dashes, so claiming it would
         # describe the screen wrongly.
-        if ($null -eq $data) { return New-UsageResult -Status 'rate-limited' }
+        if ($null -eq $data) {
+            $verdict = Resolve-AuthVerdictResult -SlotPath $SlotPath
+            if ($verdict) { return $verdict }
+            return New-UsageResult -Status 'rate-limited'
+        }
         return New-UsageResult -Status 'rate-limited' -Data $data -CachedReason 'rate-limit'
     }
 
@@ -3725,6 +3858,11 @@ function Get-SlotUsage {
             # 429 retry loop inside Update-SlotTokens.
             $fallback = Resolve-UsageFailureFallback -SlotPath $SlotPath -Reason 'rate-limit'
             if ($fallback) { return $fallback }
+            # Nothing cached, so the row would carry sca's own guess and nothing
+            # else. Prefer a recorded verdict: claude reached the endpoint when
+            # this probe could not.
+            $verdict = Resolve-AuthVerdictResult -SlotPath $SlotPath
+            if ($verdict) { return $verdict }
         }
         elseif ($tok.Status -eq 'expired' -and $tok.Transport) {
             # The refresh POST died in transport, not on its merits. Its budget
@@ -4447,7 +4585,7 @@ function Get-StatusRationale {
         'limited'           { return 'no prompts until both 5h and 7d windows reset' }
         'near limit'        { return "at or above $($Script:UtilWarnPct)% on at least one bucket" }
         'ok (no plan data)' { return 'HTTP ok but response carried no bucket data' }
-        'expired'           { return 'token refresh failed; run sca switch to refresh' }
+        'expired'           { return 'token refresh failed; run sca switch, then /login if it persists' }
         'unauthorized'      { return 'token revoked; run sca switch then /login' }
         'no-oauth'          { return 'api key or non-claude.ai slot' }
         default             { return $null }
@@ -5139,9 +5277,19 @@ function Format-UsageAdvisory {
     # carries a non-ok Status too, and reporting it twice would contradict
     # itself (once as "unreadable", once as "showing last known usage").
     $bareError  = @($rows | Where-Object { $_.Status -eq 'error'        -and -not $_.IsCachedFallback })
-    $bareLimit  = @($rows | Where-Object { $_.Status -eq 'rate-limited' -and -not $_.IsCachedFallback })
     $cachedNet  = @($rows | Where-Object { $_.IsCachedFallback -and $_.FallbackReason -eq 'network' })
     $cachedLim  = @($rows | Where-Object { $_.IsCachedFallback -and $_.FallbackReason -ne 'network' })
+
+    # Throttled rows split on whether sca has ever actually read the slot. One
+    # carrying numbers was read at some point, so "rate-limited or at a plan
+    # limit" describes it. One with nothing to show has never been read, and
+    # sca's own token request can be refused before the server looks at the
+    # grant (measured 2026-09-19), so from here a throttle and a revoked login
+    # are indistinguishable. Claiming the first sends the user off to wait out
+    # something that will never clear; naming the command that can tell them
+    # apart is the only honest line available.
+    $bareLimit  = @($rows | Where-Object { $_.Status -eq 'rate-limited' -and -not $_.IsCachedFallback -and $_.Data })
+    $unverified = @($rows | Where-Object { $_.Status -eq 'rate-limited' -and -not $_.IsCachedFallback -and -not $_.Data })
 
     $conditions = [System.Collections.Generic.List[string]]::new()
 
@@ -5159,8 +5307,9 @@ function Format-UsageAdvisory {
     # session limit" is a plan limit and not a rate limit. The per-slot reason
     # line below carries the real cause, which is accurate for both producers.
     foreach ($bucket in @(
-        @{ Rows = $bareError; NeedsCopula = $false; Tail = 'could not be read; usage unknown.' },
-        @{ Rows = $bareLimit; NeedsCopula = $true;  Tail = 'currently rate-limited or at a plan limit.' },
+        @{ Rows = $bareError;  NeedsCopula = $false; Tail = 'could not be read; usage unknown.' },
+        @{ Rows = $unverified; NeedsCopula = $false; Tail = "could not be read, and sca cannot tell a throttle from an expired login; run 'sca warmup <slot>' to check." },
+        @{ Rows = $bareLimit;  NeedsCopula = $true;  Tail = 'currently rate-limited or at a plan limit.' },
         @{ Rows = $cachedNet; NeedsCopula = $false; Tail = 'could not be read live; showing last known usage.' },
         @{ Rows = $cachedLim; NeedsCopula = $true;  Tail = 'currently rate-limited or at a plan limit; showing last known usage.' }
     )) {
@@ -5249,7 +5398,7 @@ function Format-UsageAdvisory {
     }
 
     # Conditions and remedies always fit, by construction: their worst case is
-    # 4 + 3 and $Script:AdvisoryMaxLines is set above that, which is what makes
+    # 5 + 3 and $Script:AdvisoryMaxLines is set above that, which is what makes
     # "every failing slot is named" a property of the block rather than of the
     # pool that happened to fail.
     $lines = [System.Collections.Generic.List[string]]::new()
@@ -6273,6 +6422,11 @@ function Invoke-WarmAllSlots {
                     # must probe live rather than be short-circuited by the
                     # backoff it is recovering from.
                     Clear-SlotRateLimitBackoff -SlotPath $row.Path
+                    # And any recorded auth verdict: claude just authenticated
+                    # as this slot, which is the proof that retires it. Must
+                    # precede the read below, or Get-SlotUsage would answer
+                    # from the verdict this activation has just disproved.
+                    Clear-SlotAuthVerdict -SlotName $row.Name
                     $u = Get-SlotUsage -SlotPath $row.Path 6>$null
                     $row.Status           = $u.Status
                     $row.Data             = $u.Data
@@ -6288,6 +6442,16 @@ function Invoke-WarmAllSlots {
                     # must not incur extra refresh calls.
                     $row.Status = $r.Status
                     $row.Error  = $r.Error
+
+                    # claude reached the token endpoint and the grant itself was
+                    # refused. Record it: a later `sca usage` never runs claude,
+                    # and its own probe can be turned away before the server
+                    # looks at the grant, so this is the only way that command
+                    # can tell a dead login from a throttle.
+                    if ($r.Status -in @('expired', 'unauthorized')) {
+                        Set-SlotAuthVerdict -SlotName $row.Name -SlotPath $row.Path `
+                                            -Status $r.Status -ErrorMessage $r.Error
+                    }
                 }
             }
             catch {

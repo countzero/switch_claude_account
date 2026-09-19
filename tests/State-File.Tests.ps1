@@ -648,6 +648,110 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Auth verdicts (what claude -p concluded about a grant)' {
+        # sca's own token request can be refused before the server looks at the
+        # grant, so it cannot tell a revoked login from a throttle. claude -p
+        # can, and its verdict is recorded here so a later plain `sca usage`,
+        # which never runs claude, can still report the truth.
+
+        BeforeEach {
+            $script:vCredDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $script:vCredDir -Force | Out-Null
+            $script:vSlot = Join-Path $script:vCredDir '.credentials.work(a@b.c).json'
+            Set-Content -LiteralPath $script:vSlot -Value '{"claudeAiOauth":{"accessToken":"AT","refreshToken":"RT","expiresAt":1}}' -NoNewline
+        }
+
+        It 'round-trips a verdict through the state file' {
+            Set-SlotAuthVerdict -SlotName 'work' -SlotPath $script:vSlot -Status 'expired' -ErrorMessage 'OAuth session expired'
+
+            $r = Read-ScaState
+            $r.auth_verdicts['work'].status | Should -Be 'expired'
+            $r.auth_verdicts['work'].error  | Should -Be 'OAuth session expired'
+            $r.auth_verdicts['work'].cred_hash | Should -Not -BeNullOrEmpty
+        }
+
+        It 'omits the block entirely when no verdict is recorded' {
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'h' | Out-Null
+            (Get-Content -LiteralPath $StateFile -Raw) | Should -Not -Match 'auth_verdicts'
+        }
+
+        It 'keeps active_slot and last_sync_hash intact alongside a verdict' {
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'h-keep' | Out-Null
+            Set-SlotAuthVerdict -SlotName 'work' -SlotPath $script:vSlot -Status 'expired' -ErrorMessage 'boom'
+
+            $r = Read-ScaState
+            $r.active_slot    | Should -Be 'work'
+            $r.last_sync_hash | Should -Be 'h-keep'
+        }
+
+        It 'returns the verdict while the credential file is unchanged' {
+            Set-SlotAuthVerdict -SlotName 'work' -SlotPath $script:vSlot -Status 'expired' -ErrorMessage 'boom'
+            (Get-SlotAuthVerdict -SlotPath $script:vSlot).status | Should -Be 'expired'
+        }
+
+        # The self-healing property, and the reason the verdict is keyed on a
+        # content hash rather than a timestamp: re-login plus `sca save`
+        # rewrites the file, and nothing has to remember to clear the verdict.
+        It 'ignores the verdict once the credential file changes' {
+            Set-SlotAuthVerdict -SlotName 'work' -SlotPath $script:vSlot -Status 'expired' -ErrorMessage 'boom'
+            Set-Content -LiteralPath $script:vSlot -Value '{"claudeAiOauth":{"accessToken":"NEW","refreshToken":"NEW","expiresAt":2}}' -NoNewline
+
+            Get-SlotAuthVerdict -SlotPath $script:vSlot | Should -BeNullOrEmpty
+        }
+
+        It 'clears a verdict on request' {
+            Set-SlotAuthVerdict -SlotName 'work' -SlotPath $script:vSlot -Status 'expired' -ErrorMessage 'boom'
+            Clear-SlotAuthVerdict -SlotName 'work'
+
+            Get-SlotAuthVerdict -SlotPath $script:vSlot | Should -BeNullOrEmpty
+            (Get-Content -LiteralPath $StateFile -Raw) | Should -Not -Match 'auth_verdicts'
+        }
+
+        It 'clearing an unrecorded slot is a no-op rather than an error' {
+            { Clear-SlotAuthVerdict -SlotName 'never-seen' } | Should -Not -Throw
+        }
+
+        It 'returns null for a slot with no verdict' {
+            Get-SlotAuthVerdict -SlotPath $script:vSlot | Should -BeNullOrEmpty
+        }
+
+        It 'survives an unreadable credential file rather than throwing' {
+            Set-SlotAuthVerdict -SlotName 'work' -SlotPath $script:vSlot -Status 'expired' -ErrorMessage 'boom'
+            Remove-Item -LiteralPath $script:vSlot -Force
+
+            Get-SlotAuthVerdict -SlotPath $script:vSlot | Should -BeNullOrEmpty
+        }
+
+        It 'drops entries that carry no status or no cred_hash' {
+            # Such an entry could never be matched against a slot file, so it
+            # would otherwise sit in the state file forever.
+            #
+            # NOT named $json: the dot-sourced script declares -Json as a
+            # [switch], so that name is already bound in this scope and
+            # assigning a string to it fails at the binder.
+            $stateJson = '{"schema":1,"active_slot":"work","last_sync_hash":"h","auth_verdicts":{' +
+                         '"good":{"status":"expired","error":"e","cred_hash":"abc"},' +
+                         '"no-status":{"error":"e","cred_hash":"abc"},' +
+                         '"no-hash":{"status":"expired","error":"e"}}}'
+            Set-Content -LiteralPath $StateFile -Value $stateJson -NoNewline -Encoding utf8NoBOM
+
+            $r = Read-ScaState
+            $r.auth_verdicts.Count | Should -Be 1
+            $r.auth_verdicts.ContainsKey('good') | Should -BeTrue
+        }
+
+        It 'tolerates a state file with no auth_verdicts block at all' {
+            Set-Content -LiteralPath $StateFile -Value '{"schema":1,"active_slot":"w","last_sync_hash":"h"}' -NoNewline -Encoding utf8NoBOM
+
+            # Always a hashtable, so every caller can index it without a null
+            # check. Asserted on the type rather than -Not -BeNullOrEmpty,
+            # which treats an empty hashtable as empty.
+            $r = Read-ScaState
+            $r.auth_verdicts       | Should -BeOfType [hashtable]
+            $r.auth_verdicts.Count | Should -Be 0
+        }
+    }
+
     AfterAll {
         $env:USERPROFILE       = $script:OriginalUserProfile
         $global:PROFILE        = $script:OriginalProfile

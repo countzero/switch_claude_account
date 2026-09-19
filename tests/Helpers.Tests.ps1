@@ -1488,7 +1488,7 @@ Describe 'switch_claude_account' {
             # Hard-failure statuses. Keyed on the raw Status value, because
             # Format-UsageAdvisory's reason lines are where these remedies
             # render now that the Status column carries only a bare label.
-            @{ Case = 'expired';           Label = 'expired';           Expected = 'token refresh failed; run sca switch to refresh' }
+            @{ Case = 'expired';           Label = 'expired';           Expected = 'token refresh failed; run sca switch, then /login if it persists' }
             @{ Case = 'unauthorized';      Label = 'unauthorized';      Expected = 'token revoked; run sca switch then /login' }
             @{ Case = 'no-oauth';          Label = 'no-oauth';          Expected = 'api key or non-claude.ai slot' }
         ) {
@@ -1547,15 +1547,22 @@ Describe 'switch_claude_account' {
                     [string] $Name,
                     [string] $Status = 'rate-limited',
                     [bool]   $Cached = $false,
-                    [string] $Reason = 'rate-limit'
+                    [string] $Reason = 'rate-limit',
+                    # A throttled row that HAS numbers was read successfully at
+                    # some point, which is what separates the "rate-limited or
+                    # at a plan limit" condition from the unverified one.
+                    [switch] $WithData
                 )
                 $fallbackReason = if ($Cached) { $Reason } else { $null }
+                $data = if ($WithData) {
+                    [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 12.0 }; seven_day = $null }
+                } else { $null }
                 [pscustomobject]@{
                     Name             = $Name
                     Status           = $Status
                     IsCachedFallback = $Cached
                     FallbackReason   = $fallbackReason
-                    Data             = $null
+                    Data             = $data
                     Error            = $null
                     Email            = $null
                     IsActive         = $false
@@ -1578,22 +1585,33 @@ Describe 'switch_claude_account' {
         }
 
         It 'no-cache, one slot: names it with "is" and no last-known clause' {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'))
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -WithData))
             Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'slot-1' is currently rate-limited or at a plan limit."
         }
 
         It 'no-cache, multiple slots: names them with "are"' {
-            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'), (New-RlRow -Name 'slot-3'))
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -WithData), (New-RlRow -Name 'slot-3' -WithData))
             Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'slot-1', 'slot-3' are currently rate-limited or at a plan limit."
         }
 
         It 'no-cache, >3 slots: collapses to "and N more" with plural verb' {
-            $rows = @('a','b','c','d') | ForEach-Object { New-RlRow -Name $_ }
+            $rows = @('a','b','c','d') | ForEach-Object { New-RlRow -Name $_ -WithData }
             $snap = New-RlSnapshot -Results $rows
             Format-UsageAdvisory -Snapshot $snap |
                 Should -Be "[Usage] 'a', 'b', 'c' and 1 more are currently rate-limited or at a plan limit."
+        }
+
+        # sca's own token request can be refused before the server looks at the
+        # grant, so a throttled row it has never read could equally be a revoked
+        # login. Claiming the former sent the user off to wait out something
+        # that never clears.
+        It 'throttled row it has never read: names the check instead of guessing' {
+            $snap = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'))
+            $out  = Format-UsageAdvisory -Snapshot $snap
+            $out | Should -Be "[Usage] 'slot-1' could not be read, and sca cannot tell a throttle from an expired login; run 'sca warmup <slot>' to check."
+            $out | Should -Not -Match 'currently rate-limited or at a plan limit'
         }
 
         It 'cache branch: names the cached slot and adds the last-known clause' {
@@ -1689,7 +1707,7 @@ Describe 'switch_claude_account' {
         }
 
         It 'falls back to the canned remedy for a hard failure with no message: <Case>' -ForEach @(
-            @{ Case = 'expired';      Status = 'expired';      Expected = 'token refresh failed; run sca switch to refresh' }
+            @{ Case = 'expired';      Status = 'expired';      Expected = 'token refresh failed; run sca switch, then /login if it persists' }
             @{ Case = 'unauthorized'; Status = 'unauthorized'; Expected = 'token revoked; run sca switch then /login' }
             @{ Case = 'no-oauth';     Status = 'no-oauth';     Expected = 'api key or non-claude.ai slot' }
         ) {
@@ -1720,12 +1738,12 @@ Describe 'switch_claude_account' {
             $lines.Count | Should -Be 2
             # Fixed worst-first status order, matching the condition lines
             # above, rather than whichever status the caller listed first.
-            $lines[0] | Should -Be "[Usage] 'b': token refresh failed; run sca switch to refresh"
+            $lines[0] | Should -Be "[Usage] 'b': token refresh failed; run sca switch, then /login if it persists"
             $lines[1] | Should -Be "[Usage] 'a', 'c': api key or non-claude.ai slot"
         }
 
         It 'stays silent for a rate-limited row with no message (the condition line already says it)' {
-            $snap  = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1'))
+            $snap  = New-RlSnapshot -Results @((New-RlRow -Name 'slot-1' -WithData))
             $lines = @((Format-UsageAdvisory -Snapshot $snap) -split "`n")
             $lines.Count | Should -Be 1
             $lines[0]    | Should -Match 'currently rate-limited or at a plan limit'
@@ -1828,7 +1846,7 @@ Describe 'switch_claude_account' {
             # 1 condition line + 1 grouped remedy + 3 capped messages.
             $lines.Count | Should -Be 5
             @($lines | Where-Object { $_ -match 'z-expired' }).Count | Should -Be 1
-            $lines[1] | Should -Be "[Usage] 'z-expired': token refresh failed; run sca switch to refresh"
+            $lines[1] | Should -Be "[Usage] 'z-expired': token refresh failed; run sca switch, then /login if it persists"
         }
 
         It 'prefers the message over the remedy when the slot fits inside the cap' {
@@ -1868,12 +1886,13 @@ Describe 'switch_claude_account' {
         # $Script:AdvisoryReasonMaxWidth, is enough to push the table off a
         # 24-row screen on its own.
         It 'never exceeds AdvisoryMaxLines, and drops only per-slot detail' {
-            # Four distinct conditions (one slot each) so every condition line
+            # Five distinct conditions (one slot each) so every condition line
             # fires, plus three hard-failure statuses for three remedies, plus
             # enough messages to overflow.
             $rows = @()
             $e = New-RlRow -Name 'bare-err' -Status 'error';        $e.Error = 'boom bare-err';   $rows += $e
-            $l = New-RlRow -Name 'bare-lim' -Status 'rate-limited'; $rows += $l
+            $l = New-RlRow -Name 'bare-lim' -Status 'rate-limited' -WithData; $rows += $l
+            $u = New-RlRow -Name 'unverif'  -Status 'rate-limited'; $rows += $u
             $n = New-RlRow -Name 'cach-net' -Status 'error';        $n.Error = 'boom cach-net'
             $n.IsCachedFallback = $true; $n.FallbackReason = 'network';  $rows += $n
             $c = New-RlRow -Name 'cach-lim' -Status 'rate-limited'
@@ -1886,13 +1905,14 @@ Describe 'switch_claude_account' {
 
             $lines.Count | Should -BeLessOrEqual $Script:AdvisoryMaxLines
 
-            # Coverage survives the cap: all four condition lines and all three
+            # Coverage survives the cap: all five condition lines and all three
             # remedies are present, so no failing slot goes unmentioned.
             @($lines | Where-Object { $_ -match 'could not be read; usage unknown' }).Count      | Should -Be 1
             @($lines | Where-Object { $_ -match 'currently rate-limited or at a plan limit\.' }).Count | Should -Be 1
+            @($lines | Where-Object { $_ -match "run 'sca warmup <slot>' to check" }).Count      | Should -Be 1
             @($lines | Where-Object { $_ -match 'could not be read live; showing last known usage' }).Count | Should -Be 1
             @($lines | Where-Object { $_ -match 'plan limit; showing last known usage' }).Count            | Should -Be 1
-            $lines | Should -Contain "[Usage] 'gone-exp': token refresh failed; run sca switch to refresh"
+            $lines | Should -Contain "[Usage] 'gone-exp': token refresh failed; run sca switch, then /login if it persists"
             $lines | Should -Contain "[Usage] 'gone-401': token revoked; run sca switch then /login"
             $lines | Should -Contain "[Usage] 'gone-key': api key or non-claude.ai slot"
 
