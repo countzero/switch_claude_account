@@ -88,8 +88,8 @@ if ($Inner) {
                     IsActive = $true
                     Email    = $null
                     Data     = [pscustomobject]@{
-                        five_hour = [pscustomobject]@{ utilization = 10 }
-                        seven_day = [pscustomobject]@{ utilization = 20 }
+                        five_hour = [pscustomobject]@{ utilization = 10; resets_at = $null }
+                        seven_day = [pscustomobject]@{ utilization = 20; resets_at = $null }
                     }
                     Error            = $null
                     IsCachedFallback = $false
