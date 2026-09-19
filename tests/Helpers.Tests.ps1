@@ -44,6 +44,7 @@ BeforeAll {
             'Invoke-WatchPoll'
             'Format-WatchFooter'
             'Write-WatchFrame'
+            'Invoke-WatchStartupWarm'
         )
         $ast = [System.Management.Automation.Language.Parser]::ParseFile(
             $Path, [ref]$null, [ref]$null)
@@ -1605,6 +1606,111 @@ Describe 'switch_claude_account' {
             $out = Get-CapturedFramePaint { Write-WatchFrame { Write-Host 'hello'; Write-Host 'world' } }
             $out | Should -Match 'hello'
             $out | Should -Match 'world'
+        }
+    }
+
+    Context 'Invoke-WatchStartupWarm' {
+        # The -Warmup startup pass, previously inline in the watch loop and
+        # so unreachable. Invoke-WarmAllSlots is mocked throughout: the real
+        # one spawns `claude -p` per slot and is billable.
+
+        BeforeEach {
+            Mock Invoke-Reconcile  -MockWith { [pscustomobject]@{ Captured = $true } }
+            Mock Write-VTSequence  -MockWith { }
+            Mock Format-WatchTitle -MockWith { 'title' }
+            Mock Invoke-WarmAllSlots -MockWith {
+                [pscustomobject]@{
+                    Results = @(
+                        [pscustomobject]@{ Name = 'alpha' }
+                        [pscustomobject]@{ Name = 'beta' }
+                    )
+                    NoSlots        = $false
+                    HasRateLimited = $false
+                }
+            }
+        }
+
+        It 'refuses to warm on top of credentials nothing captured' {
+            # The round-robin overwrites .credentials.json once per slot, so
+            # running it over uncaptured bytes would destroy them.
+            Mock Invoke-Reconcile -MockWith { [pscustomobject]@{ Captured = $false } }
+            { Invoke-WatchStartupWarm -Session (New-WatchSession -Warmup) -Interval 300 -Threshold 95 } |
+                Should -Throw
+            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+        }
+
+        It 'stamps the last-poll time so the loop redraws instead of re-polling' {
+            # The pass already produced a frame; leaving LastPoll at MinValue
+            # would make the loop's first iteration fire a second full poll
+            # immediately.
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+            $s.LastPoll | Should -BeGreaterThan ([DateTime]::Now.AddSeconds(-10))
+        }
+
+        It 'seeds the cooldown map with every slot it warmed' {
+            # A slot whose startup verify-read lagged still reports a closed
+            # window; without the seed the first poll would re-warm it
+            # immediately, at a billable ~$0.004 a time.
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+            $s.WarmupTimes.Keys | Sort-Object | Should -Be @('alpha', 'beta')
+        }
+
+        It 'schedules an early repoll when the pass ended rate-limited' {
+            # Otherwise the user stares at dashes for a whole -Interval when
+            # the 429 cooldown is only seconds long.
+            Mock Invoke-WarmAllSlots -MockWith {
+                [pscustomobject]@{
+                    Results        = @([pscustomobject]@{ Name = 'alpha' })
+                    NoSlots        = $false
+                    HasRateLimited = $true
+                }
+            }
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+            # Rewound by (Interval - WarmupRepollDelaySec), so the next poll
+            # is due ~WarmupRepollDelaySec out rather than a full interval.
+            ([DateTime]::Now - $s.LastPoll).TotalSeconds | Should -BeGreaterThan 280
+        }
+
+        It 'leaves the session alone when no slots matched' {
+            # Invoke-WarmAllSlots returns $null rather than an empty
+            # snapshot; stamping LastPoll off that would park the loop on an
+            # empty frame for a full interval.
+            Mock Invoke-WarmAllSlots -MockWith { $null }
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+            $s.LastPoll          | Should -Be ([DateTime]::MinValue)
+            $s.WarmupTimes.Count | Should -Be 0
+            Should -Invoke Format-WatchTitle -Times 0 -Exactly
+        }
+
+        It 'survives a host that refuses the title write' {
+            # RawUI-less hosts throw here; the warm pass has already done its
+            # billable work by then and must not be lost to a cosmetic
+            # failure.
+            Mock Write-VTSequence -MockWith { throw 'no title for you' }
+            $s = New-WatchSession -Warmup
+            { Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95 } | Should -Not -Throw
+            $s.WarmupTimes.Count | Should -Be 2
+        }
+
+        It 'passes the threshold to the header only under -Auto' {
+            # The "switching slot at N%" indicator is auto-rotation state; a
+            # bare warm pass has nothing to announce.
+            Mock Invoke-WarmAllSlots -MockWith {
+                # Drive the repaint so the header argument is actually built.
+                & $Repaint ([pscustomobject]@{ Results = @(); NoSlots = $true; HasRateLimited = $false })
+                $null
+            }
+            Mock Format-UsageFrame -MockWith { }
+
+            Invoke-WatchStartupWarm -Session (New-WatchSession -Warmup) -Interval 300 -Threshold 95
+            Should -Invoke Format-UsageFrame -Times 1 -Exactly -ParameterFilter { $AutoThreshold -eq 0 }
+
+            Invoke-WatchStartupWarm -Session (New-WatchSession -Auto -Warmup) -Interval 300 -Threshold 95 -Auto
+            Should -Invoke Format-UsageFrame -Times 1 -Exactly -ParameterFilter { $AutoThreshold -eq 95 }
         }
     }
 

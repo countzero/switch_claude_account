@@ -6867,6 +6867,72 @@ function Write-WatchFrame {
     Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence $frameText) + "`e[?2026l")
 }
 
+# The -Warmup startup pass, run once before the polling loop. Mutates
+# $Session in place (see New-WatchSession); returns nothing.
+#
+# Invoke-WarmAllSlots does the per-slot swap-then-activate round-robin and
+# returns a populated snapshot, which becomes the loop's first frame: the
+# LastPoll stamp below is what makes the loop's first iteration fall into
+# the redraw branch rather than polling again immediately.
+#
+# Throws on uncaptured credentials, which aborts the watch. That is the
+# point: the round-robin overwrites .credentials.json once per slot, so
+# warming on top of bytes nothing has captured would destroy them.
+function Invoke-WatchStartupWarm {
+    Param (
+        [Parameter(Mandatory)] [pscustomobject] $Session,
+        [String] $Name,
+        [int]    $Interval,
+        [int]    $Threshold,
+        [switch] $Auto
+    )
+
+    # Reconcile first so a cross-account swap landed since the last sca call
+    # is captured before any slot bytes are read; matches the polling loop's
+    # per-poll contract. See Invoke-Reconcile's `Captured`.
+    $sync = Invoke-Reconcile 6>$null
+    if (-not $sync.Captured) {
+        throw (Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca monitor -KeepWarm')
+    }
+
+    # -Auto's right-aligned "▶ switching slot at N%" header indicator stays
+    # off when -Auto is absent.
+    $autoHeader = if ($Auto) { $Threshold } else { 0 }
+    $Session.Snapshot = Invoke-WarmAllSlots -Name $Name -Repaint {
+        Param ($snap)
+        # No -LastPoll: the startup pass has not polled yet, so the footer
+        # is the two latches alone.
+        $startupFooter = Format-WatchFooter -AutoLatch $Session.AutoLatch -WarmLatch $Session.WarmLatch
+        Write-WatchFrame {
+            Format-UsageFrame -Name $Name -Snapshot $snap -Footer $startupFooter -AutoThreshold $autoHeader
+        }
+    }
+    if ($null -eq $Session.Snapshot) { return }
+
+    $Session.LastPoll = [DateTime]::Now
+    try {
+        Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $Session.Snapshot -Aggregate:$Auto))
+    } catch { Write-Verbose "Warmup title set deferred: $_" }
+
+    # If warmup ended with rate-limited rows, the user sees dashes for the
+    # full poll interval. Schedule an early repoll ~$Script:WarmupRepollDelaySec
+    # from now (regardless of -Interval) so the short 429 cooldown likely
+    # clears and real data appears sooner. If the early repoll also gets 429,
+    # LastPoll resets to now and we fall back to the normal interval: no
+    # worse than not trying.
+    if ($Session.Snapshot.HasRateLimited) {
+        $Session.LastPoll = Get-EarlyRepollLastPoll -Now ([DateTime]::Now) -Interval $Interval -DelaySec $Script:WarmupRepollDelaySec
+    }
+
+    # Seed the cooldown map with the startup pass: every slot just warmed
+    # counts as a re-warm at "now", so a slot whose startup verify-read
+    # failed or lagged (still reporting a closed window) is not immediately
+    # re-warmed on the first poll. The closed-window check covers the
+    # healthy slots; this covers the laggy ones.
+    $seed = [DateTime]::Now
+    foreach ($r in @($Session.Snapshot.Results)) { $Session.WarmupTimes[$r.Name] = $seed }
+}
+
 # Live `sca usage -Watch` loop: redraws once per second and re-polls the
 # endpoint every -Interval seconds. The redraw cadence is decoupled from
 # the poll cadence so the frame self-heals on terminal resize within
@@ -6911,11 +6977,11 @@ function Invoke-UsageWatch {
         # -Auto fires a rotation. Ignored when -Auto is absent.
         [int]    $Threshold = 95,
         # -Warmup: keep every saved slot warm for the life of the watch.
-        # The startup pass (Invoke-WarmAllSlots, below the alt-screen entry)
-        # activates every slot via the real Claude Code CLI (`claude -p`)
-        # before the first poll; thereafter Invoke-KeepWarmStep re-opens any
-        # slot whose 5h window has closed at each poll boundary. Driven only
-        # by `sca monitor -KeepWarm` (which always sets -Auto too).
+        # Invoke-WatchStartupWarm activates every slot via the real Claude
+        # Code CLI (`claude -p`) before the first poll; thereafter
+        # Invoke-KeepWarmStep re-opens any slot whose 5h window has closed at
+        # each poll boundary. Driven only by `sca monitor -KeepWarm` (which
+        # always sets -Auto too).
         [switch] $Warmup
     )
 
@@ -6942,61 +7008,8 @@ function Invoke-UsageWatch {
     try {
         $session = New-WatchSession -Auto:$Auto -Warmup:$Warmup
 
-        # -Warmup startup pass. Invoke-WarmAllSlots does the per-slot
-        # swap-then-activate round-robin and returns a populated snapshot
-        # we hand off to the polling loop as its first frame (LastPoll
-        # = now so the loop's first iteration falls into the redraw
-        # branch, not the poll branch). Reconcile first so a cross-
-        # account swap landed since the last sca call is captured before
-        # any slot bytes are read; matches the polling loop's per-poll
-        # contract below.
         if ($Warmup) {
-            # Refuse rather than warm on top of bytes nothing captured; the
-            # round-robin below overwrites .credentials.json once per slot.
-            # See Invoke-Reconcile's `Captured`.
-            $sync = Invoke-Reconcile 6>$null
-            if (-not $sync.Captured) {
-                throw (Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca monitor -KeepWarm')
-            }
-
-            # -Auto's right-aligned "▶ switching slot at N%" header
-            # indicator stays off when -Auto is absent.
-            $autoHeader = if ($Auto) { $Threshold } else { 0 }
-            $session.Snapshot = Invoke-WarmAllSlots -Name $Name -Repaint {
-                Param ($snap)
-                # No -LastPoll: the startup pass has not polled yet, so the
-                # footer is the two latches alone.
-                $startupFooter = Format-WatchFooter -AutoLatch $session.AutoLatch -WarmLatch $session.WarmLatch
-                Write-WatchFrame {
-                    Format-UsageFrame -Name $Name -Snapshot $snap -Footer $startupFooter -AutoThreshold $autoHeader
-                }
-            }
-            if ($null -ne $session.Snapshot) {
-                $session.LastPoll = [DateTime]::Now
-                try {
-                    Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $session.Snapshot -Aggregate:$Auto))
-                } catch { Write-Verbose "Warmup title set deferred: $_" }
-            }
-            # If warmup ended with rate-limited rows, the user sees dashes
-            # for the full poll interval. Schedule an early repoll
-            # ~$Script:WarmupRepollDelaySec from now (regardless of
-            # -Interval) so the short 429 cooldown likely clears and real
-            # data appears sooner. If the early repoll also gets 429,
-            # LastPoll resets to now and we fall back to the normal
-            # interval: no worse than current behaviour.
-            if ($session.Snapshot -and $session.Snapshot.HasRateLimited) {
-                $session.LastPoll = Get-EarlyRepollLastPoll -Now ([DateTime]::Now) -Interval $Interval -DelaySec $Script:WarmupRepollDelaySec
-            }
-
-            # Seed the cooldown map with the startup pass: every slot just
-            # warmed counts as a re-warm at "now", so a slot whose startup
-            # verify-read failed/lagged (still reporting a closed window) is
-            # not immediately re-warmed on the first poll. The closed-window
-            # check covers the healthy slots; this covers the laggy ones.
-            if ($null -ne $session.Snapshot) {
-                $seed = [DateTime]::Now
-                foreach ($r in @($session.Snapshot.Results)) { $session.WarmupTimes[$r.Name] = $seed }
-            }
+            Invoke-WatchStartupWarm -Session $session -Name $Name -Interval $Interval -Threshold $Threshold -Auto:$Auto
         }
 
         while ($true) {
