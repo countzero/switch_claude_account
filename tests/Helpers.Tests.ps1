@@ -38,6 +38,8 @@ BeforeAll {
 
         $family = @(
             'Invoke-UsageWatch'
+            'Enter-WatchTerminal'
+            'Exit-WatchTerminal'
         )
         $ast = [System.Management.Automation.Language.Parser]::ParseFile(
             $Path, [ref]$null, [ref]$null)
@@ -1184,6 +1186,143 @@ Describe 'switch_claude_account' {
                     'the poll interval must be measured from when the poll ' +
                     'finished, not from the timestamp captured before it ran')
             }
+        }
+    }
+
+    Context 'Watch-mode terminal lifecycle' {
+        # Exit-WatchTerminal is the half worth driving directly: it is the
+        # restore path, it is where a leaked alt buffer or a hidden cursor
+        # would strand the user's shell after Ctrl-C, and it is reachable
+        # without touching the real terminal (its VT writes go through
+        # [Console]::Out, which the StringWriter swap below captures, and a
+        # $null Cursor / Encoding skips both console-API calls).
+        # Enter-WatchTerminal cannot be driven the same way -- it switches
+        # the real console into the alternate screen buffer -- so its
+        # contract is pinned statically.
+
+        BeforeAll {
+            # Run $Body with [Console]::Out swapped for a StringWriter and
+            # return what was written. Same technique as the Write-VTSequence
+            # test above; restores Console.Out before Pester's own output.
+            function Get-CapturedConsoleOut {
+                Param ([Parameter(Mandatory)] [scriptblock] $Body)
+
+                $origOut = [Console]::Out
+                $sw      = [System.IO.StringWriter]::new()
+                try {
+                    [Console]::SetOut($sw)
+                    & $Body
+                } finally {
+                    [Console]::SetOut($origOut)
+                }
+                return $sw.ToString()
+            }
+        }
+
+        It 'Exit-WatchTerminal restores the title, then shows the cursor and leaves the alt buffer' {
+            # Exact-match rather than two -Match assertions: the ORDER is the
+            # contract. Title first so the title swap and the screen restore
+            # land in the same frame.
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = 'my shell'; EnteredAlt = $true
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -Be "`e]0;my shell`a`e[?25h`e[?1049l"
+        }
+
+        It 'Exit-WatchTerminal emits an empty title payload when the capture failed' {
+            # $null Title means RawUI was unavailable (test runner, ssh
+            # without a tty). Most terminals reset the tab label to their
+            # profile default on an empty OSC 0 payload, which beats leaving
+            # the watch's own title behind.
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = $null; EnteredAlt = $true
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -Be "`e]0;`a`e[?25h`e[?1049l"
+        }
+
+        It 'Exit-WatchTerminal strips control bytes from the restored title' {
+            # Defense in depth against an OSC-envelope breakout: a title
+            # carrying its own BEL would terminate the sequence early and
+            # let the rest execute as a new one.
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = "my`e]0;spoof`ashell"; EnteredAlt = $true
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -Be "`e]0;my]0;spoofshell`a`e[?25h`e[?1049l"
+        }
+
+        It 'Exit-WatchTerminal emits nothing when the alt buffer was never entered' {
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = 'my shell'; EnteredAlt = $false
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -BeNullOrEmpty
+        }
+
+        It 'Exit-WatchTerminal tolerates a $null state' {
+            # Enter-WatchTerminal throwing leaves the caller's token unset,
+            # and the finally runs regardless.
+            { Exit-WatchTerminal -State $null } | Should -Not -Throw
+        }
+
+        It 'Exit-WatchTerminal still emits the VT cursor restore when the cursor capture failed' {
+            # The API restore is skipped on a $null capture, but ESC[?25h is
+            # what the user's cursor actually depends on, so it must still
+            # go out. Pins that the $null guard does not short-circuit the
+            # visible half.
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = ''; EnteredAlt = $true
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -Match ([regex]::Escape("`e[?25h"))
+        }
+
+        It 'Exit-WatchTerminal restores a captured console encoding and skips a null one' {
+            $orig = [Console]::OutputEncoding
+            try {
+                $target = [System.Text.UTF8Encoding]::new($false)
+                [Console]::OutputEncoding = [System.Text.ASCIIEncoding]::new()
+                Exit-WatchTerminal -State ([pscustomobject]@{
+                    Cursor = $null; Encoding = $target; Title = $null; EnteredAlt = $false
+                })
+                [Console]::OutputEncoding.CodePage | Should -Be $target.CodePage
+
+                # $null Encoding must leave the current one alone rather than
+                # clearing it.
+                Exit-WatchTerminal -State ([pscustomobject]@{
+                    Cursor = $null; Encoding = $null; Title = $null; EnteredAlt = $false
+                })
+                [Console]::OutputEncoding.CodePage | Should -Be $target.CodePage
+            } finally {
+                [Console]::OutputEncoding = $orig
+            }
+        }
+
+        It 'Enter-WatchTerminal guards the Windows-only CursorVisible getter' {
+            # [Console]::CursorVisible's GETTER carries
+            # [SupportedOSPlatform("windows")] and throws
+            # PlatformNotSupportedException on Linux and macOS; only the
+            # setter is portable. An unguarded read aborted the entire watch
+            # engine at startup on two of the three supported platforms, and
+            # no test caught it because the IsOutputRedirected guard fires
+            # first under CI.
+            $attrs = [Console].GetProperty('CursorVisible').GetMethod.GetCustomAttributes($false)
+            $platforms = @(
+                $attrs |
+                    Where-Object { $_ -is [System.Runtime.Versioning.SupportedOSPlatformAttribute] } |
+                    ForEach-Object { $_.PlatformName }
+            )
+            $platforms | Should -Contain 'windows' -Because (
+                'the guard below exists only for this restriction; if .NET ever ' +
+                'makes the getter portable, both can go')
+
+            $funcs = Get-WatchFamilyAst -Path $script:ScriptPath
+            $enter = @($funcs | Where-Object { $_.Name -eq 'Enter-WatchTerminal' })[0]
+            $enter.Extent.Text | Should -Match 'try\s*\{\s*\[Console\]::CursorVisible\s*\}\s*catch' -Because (
+                'reading it unguarded throws PlatformNotSupportedException on ' +
+                'Linux and macOS, which kills sca usage -Watch and sca monitor there')
         }
     }
 

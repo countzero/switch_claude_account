@@ -6597,6 +6597,86 @@ function Get-EarlyRepollLastPoll {
     return $Now.AddSeconds(-[Math]::Max(0, $Interval - $DelaySec))
 }
 
+# Terminal-state lifecycle for the watch loop, split into a capture-and-
+# mutate half and a restore half so the caller's try/finally spans three
+# lines instead of the entire loop body. Enter- returns the token Exit-
+# consumes; nothing else may read it.
+#
+# [Console]::CursorVisible's GETTER carries [SupportedOSPlatform("windows")]
+# and throws PlatformNotSupportedException on Linux and macOS, while the
+# setter is portable. Reading it unguarded therefore aborted the whole watch
+# engine at startup on two of the three supported platforms. A $null Cursor
+# means "not captured", and Exit-WatchTerminal skips the API restore on it:
+# $null would coerce to $false through the setter and leave the user's
+# cursor hidden. The ESC[?25h in the alt-buffer leave restores it anyway,
+# so the API call is only belt-and-suspenders for the .NET-side state.
+#
+# The alt-buffer entry is the LAST mutation on purpose: it is the one that
+# needs undoing, and the caller's finally cannot run for a throw raised
+# before its try is entered. Nothing after it can fail.
+function Enter-WatchTerminal {
+    $origCursor = try { [Console]::CursorVisible } catch { $null }
+    # The frame body is painted via Write-VTSequence -> [Console]::Out.Write,
+    # which encodes through [Console]::OutputEncoding; on Windows that
+    # defaults to a legacy OEM codepage (e.g. CP850) that cannot represent
+    # the bar glyphs (█ ▓), the auto-mode glyph (▶), the ellipsis (…), or the
+    # em dash (—), so they render as '?'. Write-Host did not hit this because
+    # the PowerShell host writes UTF-16 to the console (WriteConsoleW),
+    # bypassing the codepage.
+    $origEncoding = [Console]::OutputEncoding
+    # $Host.UI.RawUI.WindowTitle is the only portable read path; no terminal
+    # protocol reliably reports the current OSC 0 title back. Some hosts throw
+    # when RawUI is unavailable (test runners, ssh-without-tty); $null then
+    # signals "no restore" to Exit-WatchTerminal.
+    $origTitle = try { $Host.UI.RawUI.WindowTitle } catch { $null }
+
+    # Wrapped so a host that forbids the change (rare) does not abort the
+    # watch; the glyphs degrade to '?' but the loop still runs.
+    try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { Write-Verbose "UTF-8 console encoding not settable: $_" }
+    [Console]::CursorVisible = $false
+
+    # Alt screen buffer + cursor hide in one write. The alt buffer gives a
+    # clean canvas and restores the user's pre-watch scrollback on exit;
+    # cursor-hide stops the caret blinking inside the table during the
+    # (atomic) repaint.
+    Write-VTSequence "`e[?1049h`e[?25l"
+
+    return [pscustomobject]@{
+        Cursor     = $origCursor
+        Encoding   = $origEncoding
+        Title      = $origTitle
+        EnteredAlt = $true
+    }
+}
+
+# Restore half of Enter-WatchTerminal; see its docblock for the token's
+# fields and the CursorVisible asymmetry. Tolerates a $null token so the
+# caller's finally is unconditional.
+function Exit-WatchTerminal {
+    Param ([pscustomobject] $State)
+
+    if (-not $State) { return }
+
+    if ($State.EnteredAlt) {
+        # Title restore before the alt-buffer leave, so the title swap and
+        # the screen restore land in the same frame. Empty payload when the
+        # capture failed; most terminals then reset the tab label to their
+        # profile default (Windows Terminal: profile name; VS Code: shell
+        # name).
+        $restoreTitle = if ($null -ne $State.Title) { [string]$State.Title } else { '' }
+        $restoreTitle = [regex]::Replace($restoreTitle, '[\x00-\x1F\x7F]', '')
+        Write-VTSequence ("`e]0;{0}`a" -f $restoreTitle)
+        Write-VTSequence "`e[?25h`e[?1049l"
+    }
+    if ($null -ne $State.Cursor) { [Console]::CursorVisible = $State.Cursor }
+    # Encoding last, after the alt-buffer leave and title restore have been
+    # written through the UTF-8 writer (the original title may itself carry
+    # non-ASCII).
+    if ($State.Encoding) {
+        try { [Console]::OutputEncoding = $State.Encoding } catch { Write-Verbose "Restoring console encoding failed: $_" }
+    }
+}
+
 # Live `sca usage -Watch` loop: redraws once per second and re-polls the
 # endpoint every -Interval seconds. The redraw cadence is decoupled from
 # the poll cadence so the frame self-heals on terminal resize within
@@ -6683,40 +6763,8 @@ function Invoke-UsageWatch {
         $Interval = $Script:UsageWatchMinInterval
     }
 
-    $origCursor = [Console]::CursorVisible
-    # Capture the pre-watch console output encoding. The frame body is
-    # painted via Write-VTSequence -> [Console]::Out.Write, which encodes
-    # the string through [Console]::OutputEncoding; on Windows that defaults
-    # to a legacy OEM codepage (e.g. CP850) that cannot represent the bar
-    # glyphs (█ ▓), the auto-mode glyph (▶), the ellipsis (…), or the em
-    # dash (—), so they render as '?'. Write-Host did not hit this because
-    # the PowerShell host writes UTF-16 to the console (WriteConsoleW),
-    # bypassing the codepage. Forcing UTF-8 for the watch's duration makes
-    # [Console]::Out.Write emit those glyphs correctly; the finally restores
-    # the original encoding so the user's post-watch shell is unaffected.
-    $origEncoding = [Console]::OutputEncoding
-    # Capture the pre-watch terminal title so the `finally` block can
-    # restore it on Ctrl-C. $Host.UI.RawUI.WindowTitle is the only
-    # portable read path (no terminal protocol reliably reports the
-    # current OSC 0 title back). Some hosts throw when RawUI is not
-    # available (test runners, ssh-without-tty); $null then signals
-    # "no restore" to the finally block.
-    $origTitle  = try { $Host.UI.RawUI.WindowTitle } catch { $null }
-    $enteredAlt = $false
+    $terminal = Enter-WatchTerminal
     try {
-        # UTF-8 so [Console]::Out.Write renders the non-ASCII frame glyphs
-        # (see $origEncoding capture above). Wrapped in try so a host that
-        # forbids the change (rare) does not abort the watch; the glyphs
-        # would degrade to '?' but the loop still runs.
-        try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { Write-Verbose "UTF-8 console encoding not settable: $_" }
-        # Enter alt screen buffer + hide cursor in one write. The alt
-        # buffer gives a clean canvas and ensures the user's pre-watch
-        # scrollback is restored on exit. Cursor-hide stops the caret
-        # from blinking inside the table during the (atomic) repaint.
-        Write-VTSequence "`e[?1049h`e[?25l"
-        $enteredAlt = $true
-        [Console]::CursorVisible = $false
-
         $snapshot      = $null
         $lastPoll      = [DateTime]::MinValue
         $lastPollError = $null
@@ -6964,29 +7012,7 @@ function Invoke-UsageWatch {
         }
     }
     finally {
-        # Order matters: show cursor + leave alt buffer in one write so
-        # the user's pre-watch terminal state is restored atomically.
-        # The CursorVisible API restore is belt-and-suspenders for the
-        # .NET-side state.
-        if ($enteredAlt) {
-            # Restore the pre-watch terminal title via OSC 0. Empty
-            # payload when capture failed (RawUI unavailable); most
-            # terminals reset the tab label to their profile default
-            # (Windows Terminal: profile name; VS Code: shell name).
-            # Emitted before the alt-buffer leave so the title swap and
-            # screen restore land in the same frame.
-            $restoreTitle = if ($null -ne $origTitle) { [string]$origTitle } else { '' }
-            $restoreTitle = [regex]::Replace($restoreTitle, '[\x00-\x1F\x7F]', '')
-            Write-VTSequence ("`e]0;{0}`a" -f $restoreTitle)
-            Write-VTSequence "`e[?25h`e[?1049l"
-        }
-        [Console]::CursorVisible = $origCursor
-        # Restore the pre-watch console output encoding last, after the
-        # alt-buffer leave + title restore have been written through the
-        # UTF-8 writer (the original title may itself carry non-ASCII).
-        if ($origEncoding) {
-            try { [Console]::OutputEncoding = $origEncoding } catch { Write-Verbose "Restoring console encoding failed: $_" }
-        }
+        Exit-WatchTerminal -State $terminal
     }
 }
 
