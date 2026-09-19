@@ -4651,22 +4651,33 @@ function Get-AggregateBarColor {
 #                  list.
 #   * $BucketKey - 'five_hour' or 'seven_day'.
 #
-# A row at the 7d hard cap ($Script:UtilLimitPct) contributes 100 to the
-# five_hour mean whatever its own 5h bucket reads: a 5h window is nested in
-# the 7d one, so while the week refuses prompts none of that slot's session
-# capacity is reachable. One-way on purpose -- a 5h cap costs the week at
-# most 5h of 168 -- so the seven_day mean keeps each row's own number.
+# The five_hour average covers reachable capacity only, so a row at the 7d
+# hard cap ($Script:UtilLimitPct) leaves it entirely, numerator and
+# denominator both: that slot serves no prompt until its week resets, and its
+# idle 5h reading describes capacity nobody can spend. The number answers "of
+# the session capacity I can still reach, how much is spent", which is why the
+# row is dropped rather than scored 100 -- scoring it would answer "of nominal
+# capacity, how much is gone", a different question the Week bar already
+# covers. One-way on purpose: a capped 5h window costs the week at most 5h of
+# 168, so the seven_day average keeps every measurable row, including one the
+# week itself has capped, at its own number.
+#
+# The cost, accepted deliberately: this average improves as the pool dies. Two
+# of three slots week-capped and the survivor idle reads 0%. The shrinking
+# pool is signalled by the seven_day bar and the red rows, not here.
 #
 # Return:
 #   * Integer in [0, 100], rounded with [math]::Round, when at least one
-#     eligible row exists. Math: sum of per-row effective utilization (each
-#     clamped to [0,100]; null or missing counted as 0, which by
-#     Select-LiveBuckets also covers a window that has rolled) divided by
-#     cap = N*100, scaled to percent. Equivalently the mean effective
-#     utilization across all eligible rows.
-#   * $null when zero eligible rows. Callers decide what to render for
-#     the empty case (Format-AggregateBars emits nothing; Format-WatchTitle
-#     collapses to bare suffix).
+#     eligible row exists. Math: sum of per-row utilization (each clamped
+#     to [0,100]; null or missing counted as 0, which by Select-LiveBuckets
+#     also covers a window that has rolled) divided by cap = N*100, scaled
+#     to percent. Equivalently the mean utilization across all eligible rows.
+#   * 100 when rows are measurable but the week has capped every one of them:
+#     nothing is reachable, so the pool is spent. Returning $null there would
+#     blank the bar and the title at the moment they matter most.
+#   * $null when zero rows are measurable at all. Callers decide what to
+#     render for the empty case (Format-AggregateBars emits nothing;
+#     Format-WatchTitle collapses to bare suffix).
 function Get-PoolMeanUtilization {
     Param (
         [object[]] $Results,
@@ -4675,8 +4686,18 @@ function Get-PoolMeanUtilization {
 
     if (-not $Results) { return $null }
 
-    $eligible = @($Results | Where-Object { Test-RowIsMeasurable -Row $_ })
-    if ($eligible.Count -eq 0) { return $null }
+    $measurable = @($Results | Where-Object { Test-RowIsMeasurable -Row $_ })
+    if ($measurable.Count -eq 0) { return $null }
+
+    # A capped week takes its slot out of the session pool; see the docblock.
+    $eligible = if ($BucketKey -eq 'five_hour') {
+        @($measurable | Where-Object {
+            (Get-BucketUtilizationOrZero -Bucket $_.Data.seven_day) -lt $Script:UtilLimitPct
+        })
+    } else {
+        $measurable
+    }
+    if ($eligible.Count -eq 0) { return 100 }
 
     $n   = $eligible.Count
     $cap = $n * 100
@@ -4688,13 +4709,6 @@ function Get-PoolMeanUtilization {
         # A bucket whose window has rolled is already gone (Select-LiveBuckets)
         # and therefore counts 0 here, exactly as a missing one does.
         $u = Get-BucketUtilizationOrZero -Bucket $r.Data.$BucketKey
-
-        # A capped week takes the session down with it; see the docblock.
-        if ($BucketKey -eq 'five_hour' -and
-            (Get-BucketUtilizationOrZero -Bucket $r.Data.seven_day) -ge $Script:UtilLimitPct) {
-            $u = 100
-        }
-
         if ($u -lt 0)   { $u = 0 }
         if ($u -gt 100) { $u = 100 }
         $usedSum += $u
@@ -4749,8 +4763,10 @@ function Test-RowIsMeasurable {
 # Slot inclusion rules (Test-RowIsMeasurable):
 #   * Status='ok', or any row carrying Data from the cache fallback.
 #   * Buckets with null/missing utilization counted as 0% used.
-#   * A row at the 7d hard cap counts 100% used on the Session bar too; see
-#     Get-PoolMeanUtilization for why the rule runs one way only.
+#   * A row at the 7d hard cap leaves the Session bar's average entirely,
+#     denominator included, because its session capacity is unreachable; the
+#     Week bar keeps it at its own 100%. See Get-PoolMeanUtilization for why
+#     the rule runs one way only, and for the all-capped case.
 #
 # Color thresholds via $Script:AggregateRedPct / $Script:AggregateYellowPct.
 #

@@ -714,14 +714,17 @@ Describe 'switch_claude_account' {
             # Regression contrast: without -Aggregate the same snapshot
             # renders the active row (10% | 10%, see "ignores non-active
             # rows" test above). With -Aggregate it averages all three:
-            # 5h mean = (100+10+100)/3 = 70, 7d mean = (100+10+100)/3 = 70.
+            # 5h mean = (100+10+100)/3 = 70, 7d mean = (95+10+95)/3 = 67.
+            # The peers sit at 95% on the week rather than 100% so every row
+            # stays in both denominators; what the weekly cap does to the
+            # Session average is pinned separately at the end of this block.
             $snap = New-FakeSnapshot -Rows @(
-                @{ Name = 'a'; FiveUtil = 100; SevenUtil = 100 }
+                @{ Name = 'a'; FiveUtil = 100; SevenUtil = 95 }
                 @{ Name = 'b'; FiveUtil = 10;  SevenUtil = 10; IsActive = $true }
-                @{ Name = 'c'; FiveUtil = 100; SevenUtil = 100 }
+                @{ Name = 'c'; FiveUtil = 100; SevenUtil = 95 }
             )
             Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
-                Should -Be '[~] 70% | 70% | Switch Claude Account'
+                Should -Be '[~] 70% | 67% | Switch Claude Account'
         }
 
         It '-Aggregate excludes HTTP-failure rows with no data from the mean' {
@@ -743,13 +746,15 @@ Describe 'switch_claude_account' {
             # carrying last-known percentages. Format-UsageTable prints those
             # numbers and Get-RowMaxUtilization rotates on them, so the pool
             # mean has to see them too or the bars contradict the table right
-            # beneath them. Mean = (40+100)/2 = 70.
+            # beneath them. 5h = (40+100)/2 = 70, 7d = (40+40)/2 = 40. Row 'b'
+            # is kept under the weekly cap on purpose so this pins the
+            # cached-row rule and not the exclusion tested below.
             $snap = New-FakeSnapshot -Rows @(
                 @{ Name = 'a'; FiveUtil = 40;  SevenUtil = 40; IsActive = $true }
-                @{ Name = 'b'; Status = 'error'; FiveUtil = 100; SevenUtil = 100 }
+                @{ Name = 'b'; Status = 'error'; FiveUtil = 100; SevenUtil = 40 }
             )
             Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
-                Should -Be '[~] 70% | 70% | Switch Claude Account'
+                Should -Be '[~] 70% | 40% | Switch Claude Account'
         }
 
         It '-Aggregate counts null buckets as 0 (denominator stays N)' {
@@ -836,18 +841,19 @@ Describe 'switch_claude_account' {
                 Should -Be '[~] 89% | 89% | Switch Claude Account'
         }
 
-        It '-Aggregate counts a 7d-capped row as fully burned in the Session number' {
-            # 5h = (100 + 0)/2 = 50: row 'a' reads 0% on its own 5h bucket but
-            # is at the weekly cap, so that session capacity is unreachable.
-            # 7d = (100 + 20)/2 = 60, untouched. Shares Get-PoolMeanUtilization
-            # with the bar above the table, so the two cannot drift; the math
-            # itself is pinned in Invoke-UsageAction.Tests.ps1.
+        It '-Aggregate drops a 7d-capped row from the Session number only' {
+            # 5h = 40/1 = 40: row 'a' is at the weekly cap, so it leaves the
+            # Session average and row 'b' carries it alone. 7d = (100+20)/2 =
+            # 60 still counts both, because dropping 'a' there would hide the
+            # weekly exhaustion. Shares Get-PoolMeanUtilization with the bar
+            # above the table so the two cannot drift; the math itself is
+            # pinned in Invoke-UsageAction.Tests.ps1.
             $snap = New-FakeSnapshot -Rows @(
-                @{ Name = 'a'; FiveUtil = 0; SevenUtil = 100; IsActive = $true }
-                @{ Name = 'b'; FiveUtil = 0; SevenUtil = 20 }
+                @{ Name = 'a'; FiveUtil =  0; SevenUtil = 100; IsActive = $true }
+                @{ Name = 'b'; FiveUtil = 40; SevenUtil =  20 }
             )
             Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
-                Should -Be '[~] 50% | 60% | Switch Claude Account'
+                Should -Be '[~] 40% | 60% | Switch Claude Account'
         }
     }
 

@@ -5,7 +5,7 @@
 A zero-dependency PowerShell utility for Claude Code on Windows, Linux, and macOS that combines secure multi-account management with a live usage dashboard and automated limit-based rotation.
 
 <p align="center">
-  <img src="docs/images/monitor.svg" alt="sca monitor: pool-aggregate Session bar at 40% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, a right-aligned '▶ switching slot at 95%' header indicator, and a '[Monitor] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
+  <img src="docs/images/monitor.svg" alt="sca monitor: pool-aggregate Session bar at 25% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, a right-aligned '▶ switching slot at 95%' header indicator, and a '[Monitor] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
 </p>
 
 ## Features
@@ -143,7 +143,7 @@ The output shows the 5-hour session limit (`Session` column, "Current session" i
 
 Decoding the output:
 
-- **Pool-aggregate bars**: sum utilization over `N × 100%` across every slot with numbers to show, whether read live or served from the cache after a failed read. A slot at the 100% `Week` cap counts as fully burned on the `Session` bar too, because every session window sits inside the week its account can no longer use; that is why the `Session` bar can read higher than the `Session` cells below it. One way only: a slot at the `Session` cap keeps its real `Week` number, since a 5-hour block costs at most 5 hours of a 168-hour week. Bar color: green &lt;50%, yellow ≥50%, red ≥90%.
+- **Pool-aggregate bars**: sum utilization over `N × 100%` across every slot with numbers to show, whether read live or served from the cache after a failed read. The `Session` bar reports the capacity you can still reach, so a slot at the 100% `Week` cap leaves it entirely, denominator included: that account serves nothing until its week resets, and its idle `Session` cell describes capacity nobody can spend. The `Week` bar keeps the same slot at its real 100%, because dropping it there would hide the exhaustion. Worth knowing: the `Session` bar therefore improves as slots fall out of the pool, and reaches 100% only once the week has capped every one of them. Bar color: green &lt;50%, yellow ≥50%, red ≥90%.
 - **Active marker (`*`)**: sourced from `~/.claude/.sca-state.json`; appears at the start of the row and inherits the row's color.
 - **`Account` column**: the OAuth email captured at save time. Shows `—` when the email equals the slot name (deduped filename), the actual email otherwise.
 - **`Session` / `Week` cells**: `<pct>% <delta>`. The delta is `(2h 11m)` under 24h with minute precision, `(102h)` at 24h+ with integer hours, or `—` when there is no data. A bucket whose window has already rolled also shows `—`: the percentage it carried describes a window the account has left, so it is dropped rather than shown as stale.
@@ -184,7 +184,7 @@ The terminal-tab title is updated on every poll so a backgrounded watch is glanc
     18% | 42% | Switch Claude Account
 
 <p align="center">
-  <img src="docs/images/usage-watch.svg" alt="sca usage -Watch: pool-aggregate Session bar at 40% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer" width="720">
+  <img src="docs/images/usage-watch.svg" alt="sca usage -Watch: pool-aggregate Session bar at 25% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer" width="720">
 </p>
 
 > [!NOTE]

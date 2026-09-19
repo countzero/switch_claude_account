@@ -1410,17 +1410,18 @@ Describe 'switch_claude_account' {
             $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+100%\s*$'
         }
 
-        It 'renders a 7d-capped row as fully burned on the Session bar' {
-            # Keeps the rendered bar wired to Get-PoolMeanUtilization's cap
-            # substitution, which is unit-tested on its own below: both rows
-            # read 0% in their own 5h bucket, yet 'a' is at the weekly cap so
-            # Session = (100 + 0)/200 = 50% used, matching Week.
+        It 'drops a 7d-capped row from the Session bar but keeps it on the Week bar' {
+            # Keeps the rendered bars wired to Get-PoolMeanUtilization's
+            # exclusion, unit-tested on its own below. Row 'a' is at the
+            # weekly cap, so Session = 20/100 = 20% over row 'b' alone while
+            # Week = (100 + 0)/200 = 50% still counts both. One fixture, both
+            # directions of the rule.
             $rows = @(
-                (New-OkRow -Name 'a' -FiveUtil 0 -SevenUtil 100)
-                (New-OkRow -Name 'b' -FiveUtil 0 -SevenUtil 0)
+                (New-OkRow -Name 'a' -FiveUtil  0 -SevenUtil 100)
+                (New-OkRow -Name 'b' -FiveUtil 20 -SevenUtil 0)
             )
             $out = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
-            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+50%\s*$'
+            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+20%\s*$'
             $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+50%\s*$'
         }
 
@@ -1622,33 +1623,63 @@ Describe 'switch_claude_account' {
         }
 
         # A slot at the weekly hard cap serves no prompt until the week
-        # resets, so the session capacity nested inside that week is
-        # unreachable and the pool has none of it left to offer. These four
-        # pin the substitution, its boundary, and the direction it does not
-        # run in.
+        # resets, so it leaves the Session average entirely, denominator
+        # included: the number reports reachable capacity, and that slot's
+        # idle 5h reading describes capacity nobody can spend. These six pin
+        # the exclusion, its boundary, the all-capped floor, and the two
+        # directions the rule does NOT run in.
 
-        It 'counts a 7d-capped row as fully burned in the Session mean' {
-            # 5h mean = (100 + 0)/2 = 50, not (0 + 0)/2 = 0. Row 'a' reads 0%
-            # on its own 5h bucket and still cannot serve a single prompt.
+        It 'drops a 7d-capped row from the Session average' {
+            # 5h = 20/1 = 20. Not 10 (which would keep row 'a' in the
+            # denominator at its idle 0%) and not 60 (which would score it
+            # 100 and answer a question about nominal rather than reachable
+            # capacity). The three candidate rules are distinguishable here.
             $rows = @(
-                (New-OkRow -Name 'a' -FiveUtil 0 -SevenUtil 100)
-                (New-OkRow -Name 'b' -FiveUtil 0 -SevenUtil 0)
+                (New-OkRow -Name 'a' -FiveUtil  0 -SevenUtil 100)
+                (New-OkRow -Name 'b' -FiveUtil 20 -SevenUtil 0)
             )
-            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 50
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 20
         }
 
-        It 'counts a 7d-capped row as fully burned with no five_hour bucket at all' {
-            # The missing-bucket path: 'no 5h reading' and 'a 5h reading of 0'
-            # are the same unreachable capacity once the week is capped.
-            $rows = @( New-OkRow -Name 'a' -SevenUtil 100 )
+        It 'drops a 7d-capped row that carries no five_hour bucket at all' {
+            # The missing-bucket path: once the week is capped it makes no
+            # difference whether the 5h bucket reads 0 or is absent, because
+            # the row is gone from the average either way.
+            $rows = @(
+                (New-OkRow -Name 'a' -SevenUtil 100)
+                (New-OkRow -Name 'b' -FiveUtil 20 -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 20
+        }
+
+        It 'returns 100 when the week has capped every measurable row' {
+            # Nothing is reachable, so the pool is spent. Must not be $null:
+            # that blanks the bar and the title at the moment they matter
+            # most, and it is the one case where this average is allowed to
+            # disagree with the direction of travel described above.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 0 -SevenUtil 100)
+                (New-OkRow -Name 'b' -FiveUtil 0 -SevenUtil 100)
+            )
             Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 100
         }
 
-        It 'leaves the Week mean alone for a 5h-capped row (the rule is one-way)' {
-            # 7d mean = (20 + 0)/2 = 10, NOT (100 + 0)/2 = 50. A capped 5h
-            # window costs the week at most 5h of 168, so row 'a' keeps its
-            # 80% of weekly headroom. Inverse-axis check on the Session test
-            # above: without it, a symmetric rule would pass both.
+        It 'keeps a 7d-capped row in the Week average at its own number' {
+            # 7d = (100 + 20)/2 = 60, NOT 20. Excluding it here would hide
+            # weekly exhaustion, which is the signal the Week bar exists for
+            # and the reason the exclusion is confined to the Session bar.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 0 -SevenUtil 100)
+                (New-OkRow -Name 'b' -FiveUtil 0 -SevenUtil  20)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'seven_day' | Should -Be 60
+        }
+
+        It 'leaves the Week average alone for a 5h-capped row (the rule is one-way)' {
+            # 7d = (20 + 0)/2 = 10. A capped 5h window costs the week at most
+            # 5h of 168, so row 'a' keeps its 80% of weekly headroom and its
+            # place in the denominator. Inverse-axis check: a symmetric rule
+            # would drop or score it and fail here.
             $rows = @(
                 (New-OkRow -Name 'a' -FiveUtil 100 -SevenUtil 20)
                 (New-OkRow -Name 'b' -FiveUtil 0   -SevenUtil 0)
@@ -1656,13 +1687,21 @@ Describe 'switch_claude_account' {
             Get-PoolMeanUtilization -Results $rows -BucketKey 'seven_day' | Should -Be 10
         }
 
-        It 'fires at UtilLimitPct (100) exactly, not one point below' {
+        It 'excludes at UtilLimitPct (100) exactly, not one point below' {
             # 99% of a week still leaves reachable session capacity, so the
-            # substitution must not creep down into the 'near limit' tier.
-            $near = @( New-OkRow -Name 'a' -FiveUtil 0 -SevenUtil  99 )
-            $at   = @( New-OkRow -Name 'a' -FiveUtil 0 -SevenUtil 100 )
-            Get-PoolMeanUtilization -Results $near -BucketKey 'five_hour' | Should -Be 0
-            Get-PoolMeanUtilization -Results $at   -BucketKey 'five_hour' | Should -Be 100
+            # exclusion must not creep down into the 'near limit' tier.
+            # near: (0 + 40)/2 = 20, both rows counted.
+            # at:   40/1 = 40, row 'a' gone.
+            $near = @(
+                (New-OkRow -Name 'a' -FiveUtil  0 -SevenUtil 99)
+                (New-OkRow -Name 'b' -FiveUtil 40 -SevenUtil 0)
+            )
+            $at = @(
+                (New-OkRow -Name 'a' -FiveUtil  0 -SevenUtil 100)
+                (New-OkRow -Name 'b' -FiveUtil 40 -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $near -BucketKey 'five_hour' | Should -Be 20
+            Get-PoolMeanUtilization -Results $at   -BucketKey 'five_hour' | Should -Be 40
         }
     }
 
