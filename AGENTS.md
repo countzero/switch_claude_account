@@ -45,11 +45,11 @@ The top-level dispatcher is wrapped in `Invoke-Main` and guarded by `if ($MyInvo
 
 ## Unofficial endpoints
 
-The `usage` action and the identity-fallback path depend on constants extracted from `claude.exe` 2.1.278, pinned at the top of `switch_claude_account.ps1` under `# --- Unofficial Claude Code OAuth-flow constants ---`. That block also carries the response schema, the per-endpoint HTTP budgets, and the re-extraction recipe.
+The `usage` action and the identity-fallback path depend on constants extracted from `claude.exe`, pinned in `switch_claude_account.ps1` under `# --- Unofficial Claude Code OAuth-flow constants ---` with the measured HTTP budgets and retry policy.
 
-**Undocumented and unsupported by Anthropic.** When the calls start returning 4xx after a Claude Code upgrade, re-extract using the recipe in that comment, bump the constants, and re-run the suite. The tests mock `Invoke-RestMethod` by `$Uri` and verify shape contract only; they will not catch the constants drifting out of date. Only a live `sca usage` will.
+`docs/claude-code-internals.md` holds the findings behind them: provenance, the re-extraction recipe, the response schemas, why the identity guard compares uuid and not email, and where Claude Code keeps the active login. It takes facts about **someone else's binary** only, version-stamped and re-verifiable; rules and measured constants stay at their point of use. Its admission rule is at its top, and `.github/workflows/tests.yml` re-scans the darwin build for the credential-backend markers on `workflow_dispatch`.
 
-The block below it, `# --- Where Claude Code actually keeps the active login ---`, records the same kind of finding for credential storage: the two backends Claude Code ships, why macOS is not a Keychain platform, and the `tengu_windows_credman` flag that would move Windows credentials into the Credential Manager and delete `.credentials.json`. The Tests workflow re-checks it against the darwin build on `workflow_dispatch`.
+**Undocumented and unsupported by Anthropic.** When the calls start returning 4xx after a Claude Code upgrade, re-extract with that recipe, bump the constants, and re-run the suite. The tests mock `Invoke-RestMethod` by `$Uri` and verify shape contract only; they will not catch the constants drifting out of date. Only a live `sca usage` will.
 
 ## Platform gotchas
 

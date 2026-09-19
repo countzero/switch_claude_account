@@ -259,76 +259,23 @@ $MarkerEnd   = "# === End Switch Claude Account ==="
 
 # --- Unofficial Claude Code OAuth-flow constants ---
 #
-# These values power the `usage` action, which replicates the live 5h /
-# 7d rate-limit read that Claude Code's own `/usage` slash command
-# performs. Extracted from claude.exe 2.1.119 (a Bun-compiled binary
-# that embeds the JS source) by string-scanning the file, and re-verified
-# unchanged against 2.1.278 on 2026-09-19: TOKEN_URL, CLIENT_ID and the beta
-# flag below all still match that build.
+# These power the `usage` action, which replicates the live 5h / 7d rate-limit
+# read Claude Code's own `/usage` performs, and the identity fallback.
 #
-# These endpoints are UNDOCUMENTED and unsupported by Anthropic. Expect
-# them to break when Anthropic bumps the beta flag, rotates the OAuth
-# client id, or reshapes the response body. To re-extract after an
-# upstream change, from a PowerShell 7 prompt:
+# UNDOCUMENTED and unsupported by Anthropic. Expect breakage when Anthropic
+# bumps the beta flag, rotates the client id, or reshapes a response body.
 #
-#   $bin   = (Get-Command claude -ErrorAction Stop).Source
-#   $bytes = [IO.File]::ReadAllBytes($bin)
-#   $text  = [Text.Encoding]::ASCII.GetString($bytes)
-#   # Usage endpoint path:    $text | Select-String '/api/oauth/usage'
-#   # Profile endpoint path:  $text | Select-String '/api/oauth/profile' (function Ql)
-#   # Base API URL + TOKEN_URL + CLIENT_ID: Select-String 'TOKEN_URL:"'
-#   # Beta header value:      Select-String 'lj="oauth-'
-#   # API version header:     Select-String 'anthropic-version'
-#   # UA version convention:  Select-String 'claude-code/\$\{'
-#
-# The client id below is the Claude.ai subscription flow's client id
-# (matches the `user:sessions:claude_code` scope slot files carry); the
-# other client id in the binary (22422756-...) is for the Console API-key
-# flow and does not accept our refresh tokens.
-#
-# GET /api/oauth/usage response body, verified against a live Team-plan call
-# on 2026-04-24. Every branch is optional; free-tier and API-key accounts
-# receive `{}`:
-#
-#   five_hour        { utilization: 0..100, resets_at: <ISO-8601>|null }
-#   seven_day        { utilization: 0..100, resets_at: <ISO-8601>|null }
-#   seven_day_opus   null | { utilization, resets_at }
-#   seven_day_sonnet null | { utilization, resets_at }
-#   extra_usage      { is_enabled, monthly_limit, used_credits,
-#                      utilization, currency }  (all nullable)
-#
-# Plus internal/unreleased buckets that are null for external subscriptions
-# and are NOT rendered in any view (they round-trip only via -Json):
-# seven_day_oauth_apps, seven_day_cowork, seven_day_omelette,
-# iguana_necktie, omelette_promotional. Only five_hour (Session) and
-# seven_day (Week) are rendered, matching Claude Code's own /usage bars.
+# Provenance, the re-extraction recipe, the full response schemas and the
+# client-id disambiguation: docs/claude-code-internals.md -> OAuth flow.
 $Script:UsageEndpoint       = "https://api.anthropic.com/api/oauth/usage"
-# GET /api/oauth/profile response body, extracted from claude.exe 2.1.276.
-# The client validates it with a Zod schema before use, which is the
-# authoritative statement of the shape (locate it via `Select-String 'api/
-# oauth/profile'`, then the `safeParse` call one function above it):
+# Of the response, only five_hour (Session) and seven_day (Week) are rendered,
+# matching Claude Code's own /usage bars. Every other bucket round-trips to
+# -Json untouched, so no view has to know it exists.
 #
-#   et({ account:      et({ uuid: ce(), email: ce() }).passthrough(),
-#        organization: et({ uuid: ce() }).passthrough() }).passthrough()
-#
-# So `account.uuid`, `account.email` and `organization.uuid` are required
-# strings; everything else (`account.display_name`, `account.full_name`,
-# `organization.billing_type`, `organization.rate_limit_tier`, ...) passes
-# through unvalidated and is optional.
-#
-# Load-bearing for Test-CredentialAccountMatch: the same binary assigns this
-# response straight into ~/.claude.json, `accountUuid: M.account.uuid` and
-# `emailAddress: M.account.email`, so `oauthAccount.accountUuid` IS this
-# endpoint's `account.uuid` and the two are directly comparable. The email is
-# NOT equally safe to compare: a login that never fetched a profile takes the
-# binary's other path and fills `emailAddress` from the access token's own
-# embedded `account_email`, which need not equal `account.email` here. The
-# uuid is the one field both paths agree on, which is why the identity guard
-# compares uuids and not emails.
-#
-# Compare those uuids case-INSENSITIVELY (PowerShell's default -eq): the same
-# binary lowercases them on some of its own comparison paths, so two records
-# of one account can differ in case alone.
+# The identity guard compares `account.uuid` and never `account.email`, and
+# compares it case-insensitively. Both halves of that rule are load-bearing and
+# neither is obvious; the evidence is in docs/claude-code-internals.md ->
+# Why the identity guard compares uuid and not email.
 $Script:ProfileEndpoint     = "https://api.anthropic.com/api/oauth/profile"
 $Script:TokenEndpoint       = "https://platform.claude.com/v1/oauth/token"
 $Script:OAuthClientId       = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -340,10 +287,10 @@ $Script:AnthropicBeta       = "oauth-2025-04-20"
 # an emergency patch. Pinned to the stable 2023-06-01 API version that
 # Claude Code itself ships with.
 $Script:AnthropicApiVersion = "2023-06-01"
-# Re-pinned to the client version the endpoints were last re-verified against
-# (2026-09-19). Claiming a version 159 releases old is the kind of detail an
+# Claiming a client version many releases old is the kind of detail an
 # unofficial-endpoint operator can reasonably fingerprint, and it costs nothing
-# to keep current. Bump it whenever the re-extraction recipe above is re-run.
+# to keep current. Bump whenever the re-extraction recipe is re-run
+# (docs/claude-code-internals.md).
 $Script:UsageUserAgent      = "claude-code/2.1.278"
 # Per-endpoint HTTP budgets. Measured /api/oauth/usage round-trips against
 # a live subscription span 46-2108 ms, so a shared 5 s budget left under
@@ -383,43 +330,16 @@ $Script:TokenRefreshRetryDelayMs = 2000
 
 # --- Where Claude Code actually keeps the active login ---
 #
-# Everything this tool does rests on .credentials.json being the active login,
-# so it is worth recording what that premise is and how it could stop holding.
-# Extracted from claude.exe 2.1.274 with the same string-scan recipe as above.
+# Everything here rests on .credentials.json being the active login. That is an
+# observation about someone else's binary, not a contract: a server-controlled
+# flag can move Windows credentials into the Credential Manager and delete the
+# file, at which point `sca switch` would report success while the previous
+# account stayed authenticated and billing.
 #
-# Claude Code's secureStorage module defines exactly two credential backends:
-#
-#   name:"plaintext"        <CredDir>/.credentials.json, every platform
-#   name:"windows-credman"  Windows Credential Manager, via Bun.secrets
-#
-# There is no macOS Keychain credential backend. The Keychain holds only the
-# device key, under service "Claude Code-device-keys", and the one Keychain
-# API-key path is behind a hardcoded `let s=!1`. macOS reads and writes the
-# same .credentials.json as Linux, which is why `sca` supports it.
-#
-# windows-credman is NOT active by default. It is selected by
-#
-#   $env:CLAUDE_CODE_FORCE_WINDOWS_CREDMAN -eq '1'
-#     -or (.claude.json).cachedGrowthBookFeatures.tengu_windows_credman -eq $true
-#
-# a server-controlled GrowthBook flag, so it can turn on without the user doing
-# anything. When it does, storage becomes credman-primary with plaintext as
-# fallback, and the first successful credman write DELETES .credentials.json.
-# From that point `sca switch` writes a file Claude Code no longer reads: it
-# would report success while the previous account stayed authenticated and
-# billing, which is the exact failure this tool exists to prevent.
-#
-# The credman item is service "Claude Code" + OAUTH_FILE_SUFFIX ("" in
-# production) + "-credentials", suffixed with -<sha256(CLAUDE_CONFIG_DIR)[0..8]>
-# when that variable is set, under account "claude-code-user"; payloads over
-# 2400 bytes are split into base64 chunks named <service>#0..#n with a #m
-# manifest. Reading it back would mean P/Invoking CredRead/CredWrite and
-# reimplementing that chunking, which is not worth building against a flag
-# nobody has been observed to receive.
-#
-# Symptom to watch for: .credentials.json missing or stale on Windows while
-# Claude Code is logged in and `sca switch` silently fails to change /status.
-# Check with `cmdkey /list` for a "Claude Code-credentials" entry.
+# The backends, the flag, the symptom to watch for, and why the Credential
+# Manager path is not implemented: docs/claude-code-internals.md ->
+# Credential storage. .github/workflows/tests.yml re-scans the darwin build for
+# those markers on workflow_dispatch, so the premise is checked, not assumed.
 
 # Per-slot record of the last /api/oauth/usage attempt, keyed by slot path.
 # One structure (not two parallel maps) so the data and the throttle state
@@ -836,7 +756,7 @@ function Get-CredentialFilePaths {
 }
 
 # True when a mode grants any group or other bit. [UnixFileMode] is a flags
-# enum, so this reads as one test rather than six comparisons; kept separate
+# enum, so this reads as one test rather than a comparison per bit; kept separate
 # from the repair loop below so the rule is checkable on a platform that has no
 # modes to read.
 function Test-UnixModeIsShared {
@@ -1315,8 +1235,8 @@ function Get-SHA256Hex {
 # via a single regex replace (a MatchEvaluator, not a replacement string, so
 # a value containing $1 / $& cannot be reinterpreted as a capture token).
 # The non-whitelisted fields (billingType, claudeCodeTrialEndsAt, etc.)
-# inside oauthAccount are also preserved byte-equal; we only touch the five
-# identity fields.
+# inside oauthAccount are also preserved byte-equal; we touch only the
+# whitelisted identity fields.
 #
 # Why not parse and reserialize: ~/.claude.json is large and structurally
 # complex, and a ConvertTo-Json round-trip silently shifts key ordering,
@@ -1365,8 +1285,8 @@ function Set-OAuthAccountInClaudeJson {
     # an oauthAccount value like `"organizationName": "Acme {LLC}"`.
     #
     # Why this is acceptable in practice (NOT by JSON-spec construction):
-    #   * Of the five whitelisted identity fields, three are UUIDs and
-    #     one is an RFC 5321 email; none can contain `{` / `}`.
+    #   * The whitelisted identity fields are UUIDs and an RFC 5321
+    #     email; none can contain `{` / `}`.
     #   * `displayName` / `organizationName` are user-set in Anthropic's
     #     console, but braces in those values are vanishingly rare.
     #   * Non-whitelisted oauthAccount fields Claude Code emits today
@@ -1403,7 +1323,7 @@ function Set-OAuthAccountInClaudeJson {
         $value = $OAuthAccount.$field
         # Skip null values: preserve the existing ~/.claude.json field rather
         # than nulling it out. This handles /api/oauth/profile-fallback
-        # sidecars that captured only emailAddress (the other four
+        # sidecars that captured only emailAddress (the other
         # whitelisted fields default to $null in that path). The asymmetry
         # is deliberate: a null value carries no information about Claude
         # Code's actual identity, so the existing cached value is the better
@@ -2162,8 +2082,8 @@ function Remove-From-Profile {
 # Returns the generated slot name on success.
 #
 # Caller owns the user-visible advisory message and the return-object
-# `Action` discriminator. Invoke-Reconcile has two auto-save callers
-# (cross-account swap detection vs unknown-state recovery) whose
+# `Action` discriminator. Invoke-Reconcile's auto-save callers
+# (cross-account swap detection vs unknown-state recovery) have
 # advisory text and return shape differ enough that merging them into
 # one helper would conflate semantically distinct events; keeping the
 # advisory + return at the call sites preserves that distinction while
@@ -2203,7 +2123,7 @@ function New-AutoSaveSlot {
 # writes a sidecar that silently exempts its slot from the mirror-overwrite
 # guard forever, and the slot still looks valid to Read-Sidecar.
 #
-# The three remaining fields stay $null because the endpoint does not carry
+# The remaining fields stay $null because the endpoint does not carry
 # them. Set-OAuthAccountInClaudeJson skips nulls, so a later switch to this
 # slot preserves whatever ~/.claude.json already had for them.
 #
@@ -2234,9 +2154,9 @@ function New-OAuthAccountFromProfile {
 # so its answer cannot lag them; it is the only probe that settles the question
 # rather than guessing at it.
 #
-# Compares accountUuid, never email, and case-insensitively. See the
-# $Script:ProfileEndpoint docblock for why the email is not interchangeable
-# and why the case must not matter.
+# Compares accountUuid, never email, and case-insensitively. Why the email is
+# not interchangeable and why the case must not matter:
+# docs/claude-code-internals.md -> Why the identity guard compares uuid.
 #
 # -NoRefresh on the probe is not optional: this runs while a live Claude Code
 # may be mid-request on those exact tokens, and refreshing would rotate the
@@ -2278,9 +2198,9 @@ function Test-CredentialAccountMatch {
 # Compares accountUuid when both carry one, and falls back to emailAddress
 # otherwise, because Read-Sidecar requires an email but not a uuid: a sidecar
 # written before uuid capture has only the email to offer. That fallback is a
-# concession to those sidecars, not a second opinion; see the
-# $Script:ProfileEndpoint docblock for why the email is the weaker answer and
-# why both comparisons are case-insensitive.
+# concession to those sidecars, not a second opinion. Why the email is the
+# weaker answer and why both comparisons are case-insensitive:
+# docs/claude-code-internals.md -> Why the identity guard compares uuid.
 function Test-SameOAuthAccount {
     Param (
         [AllowNull()] [pscustomobject] $Left,
@@ -2321,9 +2241,9 @@ function Test-SameOAuthAccount {
 # them.
 #
 # Split out of Invoke-Reconcile because this is the one decision there that is
-# neither a guard nor a write: three ways of answering a single question, one
-# of them costing a network round trip. Keeping it whole here is also what lets
-# the caller read as a flat dispatch over the three verdicts.
+# neither a guard nor a write, and the only one whose answer can cost a network
+# round trip. Keeping it whole here is also what lets the caller read as a flat
+# dispatch over the verdicts it returns.
 function Confirm-TrackedSlotIdentity {
     Param (
         [Parameter(Mandatory)] [pscustomobject] $Slot,
@@ -2418,26 +2338,26 @@ function Confirm-TrackedSlotIdentity {
 #                                                      under the identity probe)
 #   7. no tracked slot, OR slot file is gone       -> auto-save under new name
 #
-# Outcomes 3 and 4 guard the three that write, and are ordered ahead of all of
-# them. Outcome 5 is the worst of the three: it overwrites a slot file, the one
-# artifact a login cannot be recovered from. 6 and 7 are not free either, each
+# The guard outcomes are ordered ahead of every outcome that writes. Of those
+# writes, the mirror is the worst: it overwrites a slot file, the one artifact
+# a login cannot be recovered from. The auto-saves are not free either, each
 # moving active tracking onto a slot it just minted.
 #
 # Identity probe: ~/.claude.json's oauthAccount.emailAddress. Same source
 # Claude Code uses for /status, so reconcile and Claude Code can never disagree
 # about the active identity, and it is offline. Preferred over
-# /api/oauth/profile's email, which is not interchangeable with it; see the
-# $Script:ProfileEndpoint docblock. When ~/.claude.json has no oauthAccount yet
+# /api/oauth/profile's email, which is not interchangeable with it
+# (docs/claude-code-internals.md). When ~/.claude.json has no oauthAccount yet
 # (fresh install, never logged into Claude Code), the profile endpoint answers
 # instead, because some identity beats none for LABELLING a new slot.
 #
 # That probe reads a different file than the one that changed, and the window
-# this opens (see Test-ClaudeRunning) is what outcomes 3 and 5 are built
-# around. Outcome 3 settles the case where the incoming account is already
-# saved, by byte equality, offline and without consulting any email. Outcome 5
-# settles the rest by asking /api/oauth/profile whose tokens these are, but
-# only while a client is running and therefore able to be mid-login; see
-# Test-CredentialAccountMatch for why that answer cannot lag.
+# this opens (see Test-ClaudeRunning) is what the adopt and mirror outcomes are
+# built around. Adopt settles the case where the incoming account is already
+# saved, by byte equality, offline and without consulting any email. The mirror
+# settles the rest by asking /api/oauth/profile whose tokens these are; see
+# Test-CredentialAccountMatch for why that answer cannot lag, and why it is
+# asked on every host rather than only where a client can be detected.
 #
 # Tracked slot's identity comes from the slot's sidecar (which was
 # captured at save time from ~/.claude.json or /api/oauth/profile). This
@@ -2450,13 +2370,13 @@ function Confirm-TrackedSlotIdentity {
 #
 # Returns a [pscustomobject] describing the outcome so tests and callers
 # can assert on the action without parsing stdout. Stdout still carries
-# the user-visible advisory for the two non-silent branches (auto-save,
+# the user-visible advisory for the non-silent branches (auto-save,
 # identity-change).
 #
 # `Captured` on that object answers the one question every caller that goes on
 # to overwrite .credentials.json has to ask: are the bytes currently in it
-# safely represented on disk? It is $false for exactly the two outcomes that
-# saw changed bytes and deliberately wrote nothing (identity-unresolved,
+# safely represented on disk? It is $false for the outcomes that saw changed
+# bytes and deliberately wrote nothing (identity-unresolved,
 # credentials-changed-mid-probe). Swapping on top of those discards a refresh
 # the tracked slot never received, leaving it holding a refresh token the
 # server has already rotated: a dead login, and the one loss here that no
@@ -2672,9 +2592,9 @@ function Invoke-Reconcile {
 # Build the refusal an action throws when it was about to overwrite
 # .credentials.json and Invoke-Reconcile reported `Captured = $false`.
 #
-# Self-contained on purpose: two of the three callers suppress reconcile's own
-# advisory (6>$null, to keep JSON parseable and watch frames intact), so this
-# is the only thing the user sees. It names the recovery for the same reason
+# Self-contained on purpose: most callers suppress reconcile's own advisory
+# (6>$null, to keep JSON parseable and watch frames intact), so this is the
+# only thing the user sees. It names the recovery for the same reason
 # the adopt advisory does: nothing retries a refused action on its own.
 #
 # Branches on Reason because the two outcomes have different recoveries. A
@@ -2992,7 +2912,7 @@ function Invoke-SwitchAction {
     Invoke-SlotSwap -Slot $slot
 
     # DarkYellow header line; matches the `[List] Saved slots` /
-    # `[Usage] Plan usage` convention so all three actions present a
+    # `[Usage] Plan usage` convention so the table-rendering actions present a
     # consistent table-header look. No trailing period: this is a
     # header, not a complete sentence.
     $toIdent = Format-SlotIdentity -Name $slot.Name -Email $slot.Email
