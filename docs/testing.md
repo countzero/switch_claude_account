@@ -48,6 +48,27 @@ pass whether or not the pinned OAuth constants still match the shipping Claude C
 build. Only a live `sca usage` detects that drift
 (`docs/claude-code-internals.md` → *Re-extraction recipe*).
 
+### Watch smoke test
+
+The suite and the real-terminal probe between them cover whether the watch runs, what
+it writes and that it restores the terminal. What neither can judge is how a frame
+*looks* to a person, because a flicker is a property of two frames a few milliseconds
+apart and a wrong glyph is still a character. Run these by hand after changing the
+watch engine, the frame paint or a renderer it calls:
+
+| Check                    | Command                        | Looking for                                                                     |
+| ------------------------ | ------------------------------ | ------------------------------------------------------------------------------- |
+| No flicker               | `sca usage -Watch`             | Numbers update in place. No black flash, no row-by-row redraw, no scroll        |
+| No flicker without color | `sca usage -Watch -NoColor`    | The same. `PlainText` must not strip the DEC envelope or the alt-buffer toggle  |
+| Glyphs                   | `sca usage -Watch`             | Bars, `▶`, `…` and `—` render as themselves, never as `?`                       |
+| Resize self-heals        | drag the window while watching | Layout reflows within about a second, no stale cells from the old geometry      |
+| Ctrl-C returns the shell | Ctrl-C out of any of the above | Prompt back, cursor visible, pre-watch scrollback and window title restored     |
+| Keep-warm startup        | `sca monitor -KeepWarm`        | Each slot in turn, then the table. **Billable, about $0.004 per slot**          |
+
+Ctrl-C is on the list rather than in the suite because PowerShell models it as a
+pipeline stop, not a terminating error. The loop tests unwind through the same
+`try`/`finally` by throwing, which is a proxy and not the thing.
+
 ## Real-terminal probe
 
 ```powershell
