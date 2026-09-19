@@ -1195,15 +1195,17 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Watch-mode terminal lifecycle' {
-        # Exit-WatchTerminal is the half worth driving directly: it is the
-        # restore path, it is where a leaked alt buffer or a hidden cursor
-        # would strand the user's shell after Ctrl-C, and it is reachable
-        # without touching the real terminal (its VT writes go through
-        # [Console]::Out, which the StringWriter swap below captures, and a
-        # $null Cursor / Encoding skips both console-API calls).
-        # Enter-WatchTerminal cannot be driven the same way -- it switches
-        # the real console into the alternate screen buffer -- so its
-        # contract is pinned statically.
+        # Both halves are driven for real, against the live [Console], with
+        # only the output stream swapped. That is the point rather than an
+        # accident: the conditions that break these two are exactly the
+        # conditions a test runs in -- no attached console -- so executing
+        # them here reproduces the platform failure instead of describing it.
+        # A static assertion that a guard is present passes just as happily
+        # against a function nothing ever calls.
+        #
+        # Enter-WatchTerminal mutates real process state ([Console]::
+        # OutputEncoding), so every test that calls it restores through
+        # Exit-WatchTerminal in a finally.
 
         BeforeAll {
             # Run $Body with [Console]::Out swapped for a StringWriter and
@@ -1221,6 +1223,28 @@ Describe 'switch_claude_account' {
                     [Console]::SetOut($origOut)
                 }
                 return $sw.ToString()
+            }
+
+            # Enter the watch terminal with output captured, then hand the
+            # token and everything written during entry to $Assert. Always
+            # restores, including when $Assert fails, so one red test cannot
+            # leave the rest of the suite writing into an alt buffer.
+            function Invoke-WithEnteredWatchTerminal {
+                Param ([Parameter(Mandatory)] [scriptblock] $Assert)
+
+                $origOut   = [Console]::Out
+                $sw        = [System.IO.StringWriter]::new()
+                $term      = $null
+                $enterText = ''
+                try {
+                    [Console]::SetOut($sw)
+                    $term      = Enter-WatchTerminal
+                    $enterText = $sw.ToString()
+                } finally {
+                    if ($term) { Exit-WatchTerminal -State $term }
+                    [Console]::SetOut($origOut)
+                }
+                & $Assert $term $enterText
             }
         }
 
@@ -1346,29 +1370,74 @@ Describe 'switch_claude_account' {
             $b.WarmupTimes.Count | Should -Be 0
         }
 
-        It 'Enter-WatchTerminal guards the Windows-only CursorVisible getter' {
-            # [Console]::CursorVisible's GETTER carries
+        It 'Enter-WatchTerminal survives a host with no attached console' {
+            # THE regression test for the platform bug. Both
+            # [Console]::CursorVisible halves throw here: the getter carries
             # [SupportedOSPlatform("windows")] and throws
-            # PlatformNotSupportedException on Linux and macOS; only the
-            # setter is portable. An unguarded read aborted the entire watch
-            # engine at startup on two of the three supported platforms, and
-            # no test caught it because the IsOutputRedirected guard fires
-            # first under CI.
-            $attrs = [Console].GetProperty('CursorVisible').GetMethod.GetCustomAttributes($false)
-            $platforms = @(
-                $attrs |
-                    Where-Object { $_ -is [System.Runtime.Versioning.SupportedOSPlatformAttribute] } |
-                    ForEach-Object { $_.PlatformName }
-            )
-            $platforms | Should -Contain 'windows' -Because (
-                'the guard below exists only for this restriction; if .NET ever ' +
-                'makes the getter portable, both can go')
+            # PlatformNotSupportedException on Linux and macOS, and off an
+            # attached console on Windows the getter throws IOException and
+            # the setter SetValueInvocationException. Unguarded, this call
+            # aborted the whole watch engine at startup on two of the three
+            # supported platforms.
+            #
+            # Running under Pester IS the broken condition, on every CI leg,
+            # so the guards are proven by execution rather than by a regex
+            # over the source. docs/architecture.md -> Console APIs.
+            Invoke-WithEnteredWatchTerminal {
+                Param ($term, $enterText)
+                $term | Should -Not -BeNullOrEmpty
+            }
+        }
 
-            $funcs = Get-WatchFamilyAst -Path $script:ScriptPath
-            $enter = @($funcs | Where-Object { $_.Name -eq 'Enter-WatchTerminal' })[0]
-            $enter.Extent.Text | Should -Match 'try\s*\{\s*\[Console\]::CursorVisible\s*\}\s*catch' -Because (
-                'reading it unguarded throws PlatformNotSupportedException on ' +
-                'Linux and macOS, which kills sca usage -Watch and sca monitor there')
+        It 'Enter-WatchTerminal enters the alt buffer and hides the cursor in one write' {
+            # One write, not two: a caller that sees the alt buffer without
+            # the cursor hide gets a caret blinking inside the table.
+            Invoke-WithEnteredWatchTerminal {
+                Param ($term, $enterText)
+                $enterText | Should -Be "`e[?1049h`e[?25l"
+            }
+        }
+
+        It 'Enter-WatchTerminal reports the alt buffer as entered so the restore fires' {
+            # Exit-WatchTerminal skips the whole restore on a falsy
+            # EnteredAlt, which would strand the user in the alt buffer.
+            Invoke-WithEnteredWatchTerminal {
+                Param ($term, $enterText)
+                $term.EnteredAlt | Should -BeTrue
+            }
+        }
+
+        It 'Enter-WatchTerminal records a failed cursor capture as null, never as a value' {
+            # $null means "no API restore". A defaulted $false would be
+            # written back through the setter on exit and leave the user's
+            # cursor hidden. Under Pester the capture always fails, so this
+            # pins the failure path specifically.
+            Invoke-WithEnteredWatchTerminal {
+                Param ($term, $enterText)
+                $term.Cursor | Should -BeNullOrEmpty
+            }
+        }
+
+        It 'Enter-WatchTerminal forces UTF-8 and Exit-WatchTerminal puts the old encoding back' {
+            # The frame is painted through [Console]::Out.Write, which
+            # encodes via OutputEncoding; on a legacy OEM codepage the bar,
+            # play and ellipsis glyphs become '?'. The restore matters just
+            # as much: the watch must not leak UTF-8 into the user's shell.
+            $before  = [Console]::OutputEncoding
+            $origOut = [Console]::Out
+            $sw      = [System.IO.StringWriter]::new()
+            $term    = $null
+            $during  = $null
+            try {
+                [Console]::SetOut($sw)
+                $term   = Enter-WatchTerminal
+                $during = [Console]::OutputEncoding
+            } finally {
+                if ($term) { Exit-WatchTerminal -State $term }
+                [Console]::SetOut($origOut)
+            }
+            $during.CodePage | Should -Be ([System.Text.UTF8Encoding]::new($false).CodePage)
+            [Console]::OutputEncoding.CodePage | Should -Be $before.CodePage
         }
     }
 

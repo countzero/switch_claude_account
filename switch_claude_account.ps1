@@ -6602,14 +6602,14 @@ function Get-EarlyRepollLastPoll {
 # lines instead of the entire loop body. Enter- returns the token Exit-
 # consumes; nothing else may read it.
 #
-# [Console]::CursorVisible's GETTER carries [SupportedOSPlatform("windows")]
-# and throws PlatformNotSupportedException on Linux and macOS, while the
-# setter is portable. Reading it unguarded therefore aborted the whole watch
-# engine at startup on two of the three supported platforms. A $null Cursor
-# means "not captured", and Exit-WatchTerminal skips the API restore on it:
-# $null would coerce to $false through the setter and leave the user's
-# cursor hidden. The ESC[?25h in the alt-buffer leave restores it anyway,
-# so the API call is only belt-and-suspenders for the .NET-side state.
+# Both [Console]::CursorVisible halves are guarded: neither is reliable off
+# an attached Windows console, and an unguarded read aborted the whole watch
+# engine at startup on Linux and macOS. A $null Cursor means "not captured",
+# and Exit-WatchTerminal skips the API restore on it rather than coercing
+# $null to $false and leaving the user's cursor hidden. The ESC[?25h in the
+# alt-buffer leave is what the cursor actually depends on; the API call is
+# belt-and-suspenders for the .NET-side state.
+# `docs/architecture.md` → *Console APIs*.
 #
 # The alt-buffer entry is the LAST mutation on purpose: it is the one that
 # needs undoing, and the caller's finally cannot run for a throw raised
@@ -6633,7 +6633,7 @@ function Enter-WatchTerminal {
     # Wrapped so a host that forbids the change (rare) does not abort the
     # watch; the glyphs degrade to '?' but the loop still runs.
     try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { Write-Verbose "UTF-8 console encoding not settable: $_" }
-    [Console]::CursorVisible = $false
+    try { [Console]::CursorVisible = $false } catch { Write-Verbose "Cursor hide via console API not available: $_" }
 
     # Alt screen buffer + cursor hide in one write. The alt buffer gives a
     # clean canvas and restores the user's pre-watch scrollback on exit;

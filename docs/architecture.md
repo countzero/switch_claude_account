@@ -118,6 +118,30 @@ of open handles and a reader keeps the old inode. Share-mode tests are therefore
 `-Skip:(-not $IsWindows)`, paired with a Unix test asserting the inode property
 instead.
 
+### Console APIs
+
+`System.Console` is not uniformly portable, and the watch engine is the only consumer
+that depends on the difference. `[Console]::CursorVisible`'s **getter** carries
+`[SupportedOSPlatform("windows")]` and throws `PlatformNotSupportedException` on Linux
+and macOS; only its setter is attributed portable. Off an attached console neither
+half holds: with stdout redirected on Windows the getter throws `IOException` and the
+setter `SetValueInvocationException`. `[Console]::WindowWidth` throws in hosts with no
+console at all, and `[Console]::OutputEncoding` carries no platform attribute and is
+the one that is safe to read anywhere.
+
+Every one of them is therefore wrapped at its call site, and a failed capture is
+recorded as `$null` rather than a default. That distinction is load-bearing in
+`Exit-WatchTerminal`: writing a `$null` capture back through the setter would coerce
+to `$false` and leave the user's cursor hidden after the watch exits. The visible
+restore rides on the `ESC[?25h` in the alt-buffer leave instead, so the console API is
+only ever belt-and-suspenders for the .NET-side state.
+
+Verification is by execution, not inspection. `Enter-WatchTerminal` and
+`Exit-WatchTerminal` are unit-tested with `[Console]::Out` swapped for a
+`StringWriter`, which means the suite runs them under redirected output on all three
+CI legs: the conditions that break them are the conditions the tests run in. A static
+assertion that a guard is present would have passed against code that never executed.
+
 ### Token expiry
 
 OAuth tokens refresh after roughly an hour of inactivity. Without a daemon a slot file
