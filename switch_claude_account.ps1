@@ -4632,6 +4632,151 @@ function Format-AggregateBars {
     }
 }
 
+# The Status column's vocabulary, for one row. Plan-usability when HTTP was
+# ok, HTTP state otherwise.
+#
+# Every label is a short fixed string, because this column's width also sizes
+# the aggregate bars above the header: one long cell wrapped both its own row
+# AND the two bars. Reasons (an exception tail, or the remedy for a hard
+# failure) therefore live on Format-UsageAdvisory's per-slot lines below the
+# table, which own a full terminal line. The one bounded exception is
+# 'error <code>', short enough to read at a glance and the single most useful
+# discriminator between a transient 5xx and everything else.
+function Get-UsageStatusLabel {
+    Param ([Parameter(Mandatory)] [object] $Row)
+
+    switch ($Row.Status) {
+        'ok'           { Get-PlanStatus $Row.Data }
+        'no-oauth'     { 'no-oauth' }
+        'expired'      { 'expired' }
+        'unauthorized' { 'unauthorized' }
+        'error'        {
+            if ($Row.PSObject.Properties['HttpStatus'] -and $Row.HttpStatus) {
+                "error $($Row.HttpStatus)"
+            } else {
+                'error'
+            }
+        }
+        'rate-limited' { 'rate-limited' }
+        # Both are warmup-pass transients: Invoke-WarmAllSlots seeds every row
+        # 'warming-up', flips the one it is activating to 'priming' while
+        # `claude -p` is in flight, then to the real outcome. They render
+        # space-separated to match the existing label convention ('rate
+        # limited' / 'limited 5h' / 'near limit').
+        'warming-up'   { 'warming up' }
+        'priming'      { 'priming' }
+        default        { [string]$Row.Status }
+    }
+}
+
+# One usage row to its rendered cells. Pure: every branch is a function of
+# $Row alone, which is what lets the table's cell rules be tested without
+# rendering a table and matching stdout.
+function ConvertTo-UsageTableRow {
+    Param ([Parameter(Mandatory)] [object] $Row)
+
+    $fiveCell  = '   —'
+    $sevenCell = '   —'
+
+    # Percentages render whenever the row carries data, not only on 'ok'. A
+    # 'rate-limited' row served from the (possibly stale) cache fallback
+    # carries last-known Data, and showing those numbers keeps it from looking
+    # like a dead slot during a transient throttle. Rows with no Data keep the
+    # em-dash.
+    if (Test-RowHasUsableData -Row $Row) {
+        if ($Row.Data.five_hour -and $null -ne $Row.Data.five_hour.utilization) {
+            $fiveCell = Format-BucketCell $Row.Data.five_hour.utilization $Row.Data.five_hour.resets_at
+        }
+        if ($Row.Data.seven_day -and $null -ne $Row.Data.seven_day.utilization) {
+            $sevenCell = Format-BucketCell $Row.Data.seven_day.utilization $Row.Data.seven_day.resets_at
+        }
+    }
+
+    $email = if ($Row.PSObject.Properties['Email']) { $Row.Email } else { $null }
+
+    return [pscustomobject]@{
+        Row     = $Row
+        Marker  = if ($Row.IsActive) { '*' } else { ' ' }
+        Name    = $Row.Name
+        Account = Format-AccountCell -SlotName $Row.Name -Email $email
+        Five    = $fiveCell
+        Seven   = $sevenCell
+        Status  = Get-UsageStatusLabel -Row $Row
+    }
+}
+
+# Column widths for a batch of rendered rows, plus the total line width the
+# aggregate bars fit themselves to.
+#
+# Minimums are the header label lengths so a 1-2 slot table never clips its
+# own headers; the data-driven max keeps such a table narrow. TotalWidth
+# mirrors the format string in Format-UsageTable: 2 (indent) + 1 (marker)
+# + 1 (sep) + each column + 2 between each.
+function Measure-UsageTableColumns {
+    Param ([Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Rows)
+
+    $w = @{ Name = 4; Account = 7; Five = 7; Seven = 4; Status = 6 }
+    foreach ($e in $Rows) {
+        if ($e.Name.Length    -gt $w.Name)    { $w.Name    = $e.Name.Length }
+        if ($e.Account.Length -gt $w.Account) { $w.Account = $e.Account.Length }
+        if ($e.Five.Length    -gt $w.Five)    { $w.Five    = $e.Five.Length }
+        if ($e.Seven.Length   -gt $w.Seven)   { $w.Seven   = $e.Seven.Length }
+        if ($e.Status.Length  -gt $w.Status)  { $w.Status  = $e.Status.Length }
+    }
+    $w.TotalWidth = 2 + 1 + 1 + $w.Name + 2 + $w.Account + 2 + $w.Five + 2 + $w.Seven + 2 + $w.Status
+    return $w
+}
+
+# The '[Usage] Plan usage' header line, with -Auto's optional right-aligned
+# '▶ switching slot at N%' indicator.
+#
+# The indicator anchors to the terminal's right edge less one column, and is
+# dropped entirely when the terminal cannot fit the left header plus a 2-space
+# gap plus the indicator plus that margin. Dropping loses nothing: the
+# footer's [Monitor] line carries the same state. An unknown width (0) counts
+# as narrow.
+#
+# Rendered as three -NoNewline segments so each carries its own SGR: white
+# glyph (U+25B6, a high-contrast lozenge so the auto-mode signal pops) and
+# DarkGray text (the footer's ambient-metadata weight, so the indicator
+# recedes). The trailing blank Write-Host terminates the logical row.
+function Write-UsageTableHeader {
+    Param ([int] $AutoThreshold = 0)
+
+    $headerLeft = '[Usage] Plan usage'
+    $glyph      = $null
+    $text       = $null
+    $padding    = $null
+
+    if ($AutoThreshold -gt 0) {
+        $glyph     = "$([char]0x25B6)"
+        $text      = " switching slot at $AutoThreshold%"
+        $termWidth = Get-ConsoleWidth
+        if ($termWidth -ge ($headerLeft.Length + 2 + $glyph.Length + $text.Length + 1)) {
+            $padding = ' ' * ($termWidth - $headerLeft.Length - $glyph.Length - $text.Length - 1)
+        } else {
+            $glyph = $null
+            $text  = $null
+        }
+    }
+
+    if ($glyph) {
+        Write-Color $headerLeft 'DarkYellow' -NoNewline
+        Write-Host  $padding               -NoNewline
+        Write-Color $glyph      'Gray'      -NoNewline
+        Write-Color $text       'DarkGray'
+    } else {
+        Write-Color $headerLeft 'DarkYellow'
+    }
+    Write-Host ''
+
+    # Extra breathing room under the header when -Auto is engaged: the
+    # right-side indicator makes the row visually busier, so an additional
+    # blank balances it. Without -Auto the one-blank cadence is preserved
+    # (matches the committed screenshots / SVGs).
+    if ($AutoThreshold -gt 0) { Write-Host '' }
+}
+
 # Render per-slot usage rows as a fixed-width table. Uses Write-Host (the
 # information stream) to match the other Invoke-*Action functions so the
 # existing `$out = Invoke-*Action 6>&1 | Out-String` test pattern keeps
@@ -4660,173 +4805,21 @@ function Format-UsageTable {
     Param (
         [object[]] $Results,
         [switch]   $IncludeAggregateBars,
-        # When > 0, append a right-aligned '▶ switching slot at N%'
-        # indicator to the '[Usage] Plan usage' header line. Used by
-        # the watch loop's -Auto mode to indicate auto-rotation is
-        # engaged. The indicator's right edge anchors to the terminal
-        # width minus 1 (preserves a 1-char right margin); when the
-        # terminal is too narrow to fit the left header AND a 2-space
-        # gap AND the indicator, the indicator is silently dropped
-        # (the footer's [Monitor] line still carries the state). When
-        # -Auto is set, an extra blank line is inserted under the
-        # header to balance the visually-busier right-aligned indicator.
+        # When > 0, the '[Usage] Plan usage' header carries -Auto's
+        # right-aligned indicator; see Write-UsageTableHeader.
         [int]      $AutoThreshold = 0
     )
 
     if (-not $Results) { return }
 
-    # Precompute per-row cell content so column widths can auto-fit.
-    $rows = foreach ($r in $Results) {
-        $fiveCell  = '   —'
-        $sevenCell = '   —'
+    $rows = @(foreach ($r in $Results) { ConvertTo-UsageTableRow -Row $r })
+    $w    = Measure-UsageTableColumns -Rows $rows
 
-        # Render bucket percentages whenever the row carries data, not only
-        # on 'ok'. A 'rate-limited' row served from the (possibly stale)
-        # cache fallback carries last-known Data; showing those numbers
-        # keeps the row from looking like a dead/unused slot during a
-        # transient throttle. Rows with no Data (expired / unauthorized /
-        # error / no-oauth / no-cache rate-limited) keep the em-dash.
-        if (Test-RowHasUsableData -Row $r) {
-            if ($r.Data.five_hour -and $null -ne $r.Data.five_hour.utilization) {
-                $fiveCell = Format-BucketCell $r.Data.five_hour.utilization $r.Data.five_hour.resets_at
-            }
-            if ($r.Data.seven_day -and $null -ne $r.Data.seven_day.utilization) {
-                $sevenCell = Format-BucketCell $r.Data.seven_day.utilization $r.Data.seven_day.resets_at
-            }
-        }
+    $fmt = "  {0} {1,-$($w.Name)}  {2,-$($w.Account)}  {3,-$($w.Five)}  {4,-$($w.Seven)}  {5}"
+    $totalLineWidth = $w.TotalWidth
 
-        $email = if ($r.PSObject.Properties['Email']) { $r.Email } else { $null }
-        $accountCell = Format-AccountCell -SlotName $r.Name -Email $email
+    Write-UsageTableHeader -AutoThreshold $AutoThreshold
 
-        # Status: plan-usability when HTTP was ok, HTTP-state otherwise.
-        # Every label is a short fixed string, because this is the last
-        # column and its width also sizes the aggregate bars above the
-        # header: one long cell wrapped both its own row AND the two bars.
-        # Reasons (an exception tail, or the remedy for a hard failure)
-        # therefore live on Format-UsageAdvisory's per-slot lines below the
-        # table, which own a full terminal line. The one bounded exception
-        # is 'error <code>', short enough to read at a glance and the single
-        # most useful discriminator between transient 5xx and everything else.
-        $statusText = switch ($r.Status) {
-            'ok'           { Get-PlanStatus $r.Data }
-            'no-oauth'     { 'no-oauth' }
-            'expired'      { 'expired' }
-            'unauthorized' { 'unauthorized' }
-            'error'        {
-                if ($r.PSObject.Properties['HttpStatus'] -and $r.HttpStatus) {
-                    "error $($r.HttpStatus)"
-                } else {
-                    'error'
-                }
-            }
-            'rate-limited' { 'rate-limited' }
-            # 'warming-up' is the transient initial label rendered when
-            # Invoke-WarmAllSlots starts iterating slots on `sca warmup`
-            # or `sca monitor -KeepWarm` startup. Synthetic snapshot rows carry
-            # it; the warmup pass mutates each row's Status to 'priming'
-            # while its `claude -p` activation is in flight, then to the
-            # real outcome ('ok' / 'rate-limited' / 'no-oauth' /
-            # 'expired' / 'unauthorized' / 'error') once it returns. The
-            # hyphenated internal value renders space-separated to match
-            # the existing label convention ('rate limited' / 'limited
-            # 5h' / 'near limit').
-            'warming-up'    { 'warming up' }
-            'priming'       { 'priming' }
-            default         { [string]$r.Status }
-        }
-
-        [pscustomobject]@{
-            Row     = $r
-            Marker  = if ($r.IsActive) { '*' } else { ' ' }
-            Name    = $r.Name
-            Account = $accountCell
-            Five    = $fiveCell
-            Seven   = $sevenCell
-            Status  = $statusText
-        }
-    }
-
-    # Minimum widths are the header label lengths so headers never get
-    # clipped. Data-driven max keeps narrow tables narrow for 1-2 slots.
-    # 'Session' (7) / 'Week' (4) are the new header literals; min widths
-    # match. Status header is 6 chars but the column flows; track the
-    # widest rendered status so $totalLineWidth below is accurate.
-    $nameW = 4; $acctW = 7; $fiveW = 7; $sevenW = 4; $statusW = 6
-    foreach ($e in $rows) {
-        if ($e.Name.Length    -gt $nameW)   { $nameW   = $e.Name.Length }
-        if ($e.Account.Length -gt $acctW)   { $acctW   = $e.Account.Length }
-        if ($e.Five.Length    -gt $fiveW)   { $fiveW   = $e.Five.Length }
-        if ($e.Seven.Length   -gt $sevenW)  { $sevenW  = $e.Seven.Length }
-        if ($e.Status.Length  -gt $statusW) { $statusW = $e.Status.Length }
-    }
-
-    $fmt = "  {0} {1,-$nameW}  {2,-$acctW}  {3,-$fiveW}  {4,-$sevenW}  {5}"
-
-    # Total rendered line width; used to fit-to-table the aggregate
-    # bars above the header. Mirrors the $fmt pattern: 2 (indent) + 1
-    # (marker) + 1 (sep) + nameW + 2 + acctW + 2 + fiveW + 2 + sevenW
-    # + 2 + statusW.
-    $totalLineWidth = 2 + 1 + 1 + $nameW + 2 + $acctW + 2 + $fiveW + 2 + $sevenW + 2 + $statusW
-
-    # Header: '[Usage] Plan usage' left-anchored, optional right-aligned
-    # auto-mode indicator. The indicator is computed against the terminal
-    # width (Get-ConsoleWidth) so it floats to the right edge with
-    # a 1-column right margin. Width-aware fallback: when the terminal
-    # is too narrow to fit both segments with a 2-space minimum gap, the
-    # indicator is silently dropped (the footer's [Monitor] line still
-    # carries the state, so no information is lost). An unknown width (0)
-    # counts as "narrow" and drops the indicator.
-    #
-    # Indicator visual: '<glyph><space><text>' where:
-    #   glyph = '▶' (U+25B6, "black right-pointing triangle"), white
-    #           (high-contrast lozenge so the auto-mode signal pops
-    #            against the dimmer header / footer text).
-    #   text  = 'switching slot at N%', DarkGray (matches the footer
-    #           '[Watch]' / '[Monitor]' line color so the indicator recedes
-    #           into ambient-metadata weight).
-    # Rendered via three Write-Color calls with -NoNewline so each segment
-    # carries its own SGR color while the line is still a single logical
-    # row. The trailing un-piped Write-Host '' terminates the row.
-    $headerLeft  = '[Usage] Plan usage'
-    $autoGlyph   = $null
-    $autoText    = $null
-    $autoPadding = $null
-    if ($AutoThreshold -gt 0) {
-        $autoGlyph    = "$([char]0x25B6)"
-        $autoText     = " switching slot at $AutoThreshold%"
-        $indicatorLen = $autoGlyph.Length + $autoText.Length
-        $termWidth    = Get-ConsoleWidth
-        # Reserve 1 col right margin so the indicator isn't flush with
-        # the terminal edge. Need: leftLen + 2 (min gap) + indicatorLen
-        # + 1 (right margin) <= width.
-        if ($termWidth -lt ($headerLeft.Length + 2 + $indicatorLen + 1)) {
-            $autoGlyph = $null
-            $autoText  = $null
-        } else {
-            $padCount    = $termWidth - $headerLeft.Length - $indicatorLen - 1
-            $autoPadding = ' ' * $padCount
-        }
-    }
-    if ($autoGlyph) {
-        # Three-segment colored line: DarkYellow header + padding (no
-        # color) + white glyph (high-contrast lozenge) + DarkGray text
-        # (matches footer ambient-metadata color). -NoNewline chains
-        # them onto one logical row; final Write-Host '' below terminates.
-        Write-Color $headerLeft  'DarkYellow' -NoNewline
-        Write-Host  $autoPadding -NoNewline
-        Write-Color $autoGlyph   'Gray'       -NoNewline
-        Write-Color $autoText    'DarkGray'
-    } else {
-        Write-Color $headerLeft 'DarkYellow'
-    }
-    Write-Host ''
-    # Extra breathing room under the header when -Auto is engaged: the
-    # right-side indicator makes the header row visually busier, so an
-    # additional blank balances the layout. Without -Auto the original
-    # one-blank cadence is preserved (matches existing screenshots / SVG).
-    if ($AutoThreshold -gt 0) {
-        Write-Host ''
-    }
     # Aggregate bars sit between the post-header blank and the column
     # header. Format-AggregateBars emits per bar: 'bar line' + blank,
     # so the caller's blank above acts as the leading padding. When
@@ -4847,8 +4840,8 @@ function Format-UsageTable {
         }
         Format-AggregateBars -Results $Results -TotalLineWidth $barLineWidth
     }
-    Write-Host ($fmt -f ' ',  'Slot',         'Account',       'Session',     'Week',          'Status')
-    Write-Host ($fmt -f ' ', ('-' * $nameW), ('-' * $acctW),  ('-' * $fiveW), ('-' * $sevenW), '------')
+    Write-Host ($fmt -f ' ',  'Slot',            'Account',            'Session',        'Week',            'Status')
+    Write-Host ($fmt -f ' ', ('-' * $w.Name), ('-' * $w.Account), ('-' * $w.Five), ('-' * $w.Seven), '------')
 
     foreach ($entry in $rows) {
         $color = Get-StatusColor -Label $entry.Status -IsActive ([bool]$entry.Row.IsActive)
