@@ -262,7 +262,9 @@ $MarkerEnd   = "# === End Switch Claude Account ==="
 # These values power the `usage` action, which replicates the live 5h /
 # 7d rate-limit read that Claude Code's own `/usage` slash command
 # performs. Extracted from claude.exe 2.1.119 (a Bun-compiled binary
-# that embeds the JS source) by string-scanning the file.
+# that embeds the JS source) by string-scanning the file, and re-verified
+# unchanged against 2.1.278 on 2026-09-19: TOKEN_URL, CLIENT_ID and the beta
+# flag below all still match that build.
 #
 # These endpoints are UNDOCUMENTED and unsupported by Anthropic. Expect
 # them to break when Anthropic bumps the beta flag, rotates the OAuth
@@ -334,7 +336,11 @@ $Script:AnthropicBeta       = "oauth-2025-04-20"
 # an emergency patch. Pinned to the stable 2023-06-01 API version that
 # Claude Code itself ships with.
 $Script:AnthropicApiVersion = "2023-06-01"
-$Script:UsageUserAgent      = "claude-code/2.1.119"
+# Re-pinned to the client version the endpoints were last re-verified against
+# (2026-09-19). Claiming a version 159 releases old is the kind of detail an
+# unofficial-endpoint operator can reasonably fingerprint, and it costs nothing
+# to keep current. Bump it whenever the re-extraction recipe above is re-run.
+$Script:UsageUserAgent      = "claude-code/2.1.278"
 # Per-endpoint HTTP budgets. Measured /api/oauth/usage round-trips against
 # a live subscription span 46-2108 ms, so a shared 5 s budget left under
 # 2.4x headroom and a single latency spike collapsed a slot's row to an
@@ -418,7 +424,13 @@ $Script:TokenRefreshRetryDelayMs = 2000
 #   @{ Data; Timestamp; RateLimitedUntil }
 #
 #   Data             last successful response body; the fallback served on a 429.
-#   Timestamp        when Data was captured; fresh < $Script:UsageCacheTTL min.
+#                    $null in a throttle-only entry, which Set-SlotRateLimitBackoff
+#                    creates for a slot that has never read successfully, so the
+#                    backoff covers it too. Readers must treat $null as "nothing
+#                    to serve" rather than as an empty reading: Get-CachedUsageOrNull
+#                    refuses such an entry and Get-SlotUsage drops -CachedReason.
+#   Timestamp        when Data was captured, or when a throttle-only entry was
+#                    created; fresh < $Script:UsageCacheTTL min.
 #   RateLimitedUntil [DateTime] set on every 'rate-limited' return; absent/past
 #                    otherwise. While in the future Get-SlotUsage short-circuits
 #                    to the cache with NO token/usage HTTP, so a sustained 429
@@ -3231,11 +3243,21 @@ function Update-SlotTokens {
         throw "Slot '$SlotPath' has no OAuth material to refresh."
     }
 
-    $body = @{
+    # `scope` mirrors the client, which always sends it on a refresh:
+    #   {grant_type:"refresh_token", refresh_token, client_id, scope: w.join(" ")}
+    # (claude.exe 2.1.278). The slot file's own scopes are used rather than a
+    # hardcoded list so a grant issued with a narrower or wider set asks for
+    # what it actually holds; omitted entirely when the slot records none,
+    # since the client substitutes a default there and guessing it would be
+    # inventing a value this script cannot verify.
+    $bodyMap = [ordered]@{
         grant_type    = 'refresh_token'
         refresh_token = $info.RefreshToken
         client_id     = $Script:OAuthClientId
-    } | ConvertTo-Json -Compress
+    }
+    $scopes = @($info.RawObject.claudeAiOauth.scopes) | Where-Object { $_ }
+    if ($scopes.Count -gt 0) { $bodyMap['scope'] = ($scopes -join ' ') }
+    $body = $bodyMap | ConvertTo-Json -Compress
 
     $headers = @{
         'Content-Type'      = 'application/json'
@@ -3411,6 +3433,12 @@ function Get-CachedUsageOrNull {
     )
     if (-not $Script:SlotUsageCache.ContainsKey($SlotPath)) { return $null }
     $entry   = $Script:SlotUsageCache[$SlotPath]
+    # A throttle-only entry (Set-SlotRateLimitBackoff created it for a slot that
+    # never read successfully) carries no numbers. Serving it would report
+    # 'ok' with Data = $null, which Get-RowMaxUtilization scores 0% and
+    # auto-rotation then treats as a healthy, idle rotation target: a throttled
+    # slot promoted to active precisely because nothing could be read from it.
+    if ($null -eq $entry.Data) { return $null }
     $ageMin  = ([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes
     if ($ageMin -ge $Script:UsageCacheMaxAgeMin) { return $null }
 
@@ -3456,15 +3484,26 @@ function Resolve-UsageFailureFallback {
 
 # Mark a slot as throttled: stamp RateLimitedUntil on its cache entry so the
 # next Get-SlotUsage short-circuits to the cache without token/usage HTTP
-# (see $Script:SlotUsageCache). Existing entry only -- a slot with no prior
-# successful read has no data to protect, so it keeps the legacy retry-once
-# behaviour rather than getting a data-less marker that would complicate
-# Get-CachedUsageOrNull's staleness math.
+# (see $Script:SlotUsageCache), creating a throttle-only entry (Data = $null)
+# when the slot has none.
+#
+# Creating it matters more than protecting cached data. The backoff has two
+# jobs: keep a row's numbers on screen, and stop re-tripping a hot limiter.
+# Only the first needs a prior reading. Stamping cached slots alone excluded
+# exactly the slots that never got a reading BECAUSE they were throttled, so
+# each poll re-ran Update-SlotTokens' three-attempt ladder against an endpoint
+# already refusing: measured at 360 POSTs/hour for two such slots at the 60 s
+# default, traffic that plausibly sustains the very throttle it is probing.
+#
+# The two readers of a data-less entry are guarded at the source: Get-SlotUsage
+# omits -CachedReason when it has no numbers to serve, and Get-CachedUsageOrNull
+# refuses the entry outright rather than reporting 'ok' with no Data.
 function Set-SlotRateLimitBackoff {
     Param ([Parameter(Mandatory)] [string] $SlotPath)
-    if ($Script:SlotUsageCache.ContainsKey($SlotPath)) {
-        $Script:SlotUsageCache[$SlotPath].RateLimitedUntil = [DateTime]::UtcNow.AddSeconds($Script:RateLimitBackoffSec)
+    if (-not $Script:SlotUsageCache.ContainsKey($SlotPath)) {
+        $Script:SlotUsageCache[$SlotPath] = @{ Data = $null; Timestamp = [DateTime]::UtcNow }
     }
+    $Script:SlotUsageCache[$SlotPath].RateLimitedUntil = [DateTime]::UtcNow.AddSeconds($Script:RateLimitBackoffSec)
 }
 
 # Drop a slot's backoff stamp so the next Get-SlotUsage probes live again,
@@ -3629,6 +3668,12 @@ function Get-SlotUsage {
         # carrying numbers nobody should act on.
         $tooOld = ([DateTime]::UtcNow - $entry.Timestamp).TotalMinutes -ge $Script:UsageCacheMaxAgeMin
         $data   = if ($tooOld) { $null } else { $entry.Data }
+        # -CachedReason only alongside numbers: it sets IsCachedFallback, which
+        # is what routes the row to the "; showing last known usage" advisory.
+        # On a throttle-only entry, or one past the age ceiling, there is no
+        # last known usage and the row renders em-dashes, so claiming it would
+        # describe the screen wrongly.
+        if ($null -eq $data) { return New-UsageResult -Status 'rate-limited' }
         return New-UsageResult -Status 'rate-limited' -Data $data -CachedReason 'rate-limit'
     }
 
@@ -6015,6 +6060,19 @@ $Script:WarmupSpacingMs    = 300
 # Tunable for tests (Common.ps1 overrides to zero).
 $Script:WarmupCooldownMin  = 5
 
+# How many times the cooldown may double for a slot whose warm attempts keep
+# failing: 5, 10, 20, 40, 80, then 160 minutes and no further.
+#
+# A flat cooldown assumes the next attempt can succeed. When the account's
+# token endpoint is throttled that assumption is false for every attempt,
+# and `claude -p` is billable (~$0.004), so a flat 5 minutes spends about
+# $1.15 per slot per day discovering the same answer. Doubling keeps the
+# fast first retry for the transient case the cooldown was written for and
+# makes a persistent failure cheap; the cap keeps a recovered slot from
+# waiting hours to be noticed. The counter resets on the first successful
+# warm, so nothing is sticky once the condition clears.
+$Script:WarmupBackoffMaxDoublings = 5
+
 # Slot activator (`claude -p`) settings. Warmup opens a slot's 5h session
 # window by running the real Claude Code CLI as that slot, exactly as a
 # user typing one message would (Invoke-SlotActivator). This delegates the
@@ -6269,6 +6327,19 @@ function Test-WarmEligible {
     return -not ($null -ne $reset -and $reset -gt $Now)
 }
 
+# Re-warm cooldown for one slot, doubled once per consecutive failed warm and
+# capped at $MaxDoublings doublings. A zero base (tests) stays zero. Pure.
+function Get-WarmupCooldownMinutes {
+    Param (
+        [Parameter(Mandatory)] [int] $BaseMin,
+        [int] $Failures     = 0,
+        [int] $MaxDoublings = $Script:WarmupBackoffMaxDoublings
+    )
+
+    if ($Failures -le 0) { return [double]$BaseMin }
+    return [double]$BaseMin * [Math]::Pow(2, [Math]::Min($Failures, $MaxDoublings))
+}
+
 # Per-poll keep-warm step for `sca monitor -KeepWarm`. Mirrors
 # Invoke-AutoRotationStep: returns the footer-latch string the watch loop
 # appends to every frame until the next state change. Via Invoke-WarmAllSlots
@@ -6280,6 +6351,16 @@ function Test-WarmEligible {
 # $Script:WarmupCooldownMin, stamped on every attempt. It only bounds the
 # pathological FAILED-warm case: a successful warm pushes resets_at ~5h out,
 # so the closed-window check holds a healthy slot off on its own.
+#
+# $WarmupFailures (slot name -> consecutive failures) stretches that cooldown
+# via Get-WarmupCooldownMinutes. The flat cooldown assumed the next attempt
+# could differ, which is false while the account's token endpoint is throttled:
+# `claude -p` refreshes through the same endpoint, so every retry buys the same
+# answer at ~$0.004. A data-less throttled row also scores 0% in
+# Get-RowMaxUtilization, so Test-WarmEligible's at-limit gate cannot hold it
+# off either, and the pair left a permanently unreachable slot retried every
+# $CooldownMin for the life of the watch. Optional: omitted (tests, one-shot
+# callers) means no slot has failed yet, which is the flat-cooldown behaviour.
 #
 # Re-checks Test-ClaudeRunning per tick, catching a Claude Code launched
 # mid-watch that the pre-loop guard could not see. Re-warmed rows are NOT
@@ -6295,6 +6376,7 @@ function Invoke-KeepWarmStep {
         [Parameter(Mandatory)] [hashtable]      $WarmupTimes,
         [Parameter(Mandatory)] [int]            $Threshold,
         [int]                                   $CooldownMin = $Script:WarmupCooldownMin,
+        [hashtable]                             $WarmupFailures = @{},
         [AllowNull()] [AllowEmptyString()] [string] $CurrentLatch
     )
 
@@ -6309,7 +6391,8 @@ function Invoke-KeepWarmStep {
             if (-not (Test-WarmEligible -Row $r -Now $nowUtc -Threshold $Threshold)) { continue }
 
             $last = $WarmupTimes[$r.Name]
-            if ($last -and ($now - $last).TotalMinutes -lt $CooldownMin) { continue }
+            $wait = Get-WarmupCooldownMinutes -BaseMin $CooldownMin -Failures ([int]$WarmupFailures[$r.Name])
+            if ($last -and ($now - $last).TotalMinutes -lt $wait) { continue }
 
             $r.Name
         }
@@ -6346,14 +6429,31 @@ function Invoke-KeepWarmStep {
         # don't paint outside the watch loop's sync envelope (matches
         # Invoke-AutoRotationStep). No-op repaint: the loop's own redraw
         # covers the table; only the footer latch reports the event.
-        Invoke-WarmAllSlots -Names $cold -Repaint { Param ($snap) } 6>$null | Out-Null
-        foreach ($n in $cold) { $WarmupTimes[$n] = $now }
+        $warmed = Invoke-WarmAllSlots -Names $cold -Repaint { Param ($snap) } 6>$null
+
+        # Read the per-slot outcome rather than discarding it: the escalation
+        # only works if a failure is distinguishable from a success. 'ok' is
+        # the single status that proves the 5h window actually opened, so
+        # anything else counts against the slot.
+        $outcome = @{}
+        foreach ($w in @($warmed.Results)) { if ($w.Name) { $outcome[$w.Name] = $w.Status } }
+
+        foreach ($n in $cold) {
+            $WarmupTimes[$n] = $now
+            if ($outcome[$n] -eq 'ok') { $WarmupFailures.Remove($n) }
+            else { $WarmupFailures[$n] = 1 + [int]$WarmupFailures[$n] }
+        }
         return "[Warmup] Re-warmed $list at $($now.ToString('HH:mm:ss'))"
     }
     catch {
         # Stamp the attempt anyway so a hard failure does not re-fire every
         # poll; the cooldown then holds the slot off until it likely recovers.
-        foreach ($n in $cold) { $WarmupTimes[$n] = $now }
+        # The throw says nothing about individual slots, so every slot in the
+        # batch counts as failed and the cooldown stretches for all of them.
+        foreach ($n in $cold) {
+            $WarmupTimes[$n]    = $now
+            $WarmupFailures[$n] = 1 + [int]$WarmupFailures[$n]
+        }
         # Collapsed for the same reason as the [Monitor] rotation-failure line:
         # this string becomes one footer entry, and Format-UsageFooter splits
         # the footer on newlines.
@@ -6511,10 +6611,14 @@ function Invoke-UsageWatch {
         # -Warmup footer-line latch + per-slot last-re-warm map. The latch
         # parallels $lastAutoFooter (steady-state line until a keep-warm
         # event replaces it). $warmupTimes (slot name -> last attempt
-        # [DateTime]) lives only for this watch session and feeds the
-        # cooldown gate in Invoke-KeepWarmStep; it is never persisted.
+        # [DateTime]) and $warmupFailures (slot name -> consecutive failed
+        # warms) live only for this watch session and feed the cooldown gate in
+        # Invoke-KeepWarmStep; neither is persisted. They are separate maps
+        # because the step mutates both and a session that never fails keeps
+        # the second empty.
         $lastWarmupFooter = if ($Warmup) { '[Warmup] Keeping all slots warm.' } else { $null }
         $warmupTimes      = @{}
+        $warmupFailures   = @{}
 
         # -Warmup startup pass. Invoke-WarmAllSlots does the per-slot
         # swap-then-activate round-robin and returns a populated snapshot
@@ -6649,7 +6753,8 @@ function Invoke-UsageWatch {
                     # footer reports it.
                     if ($Warmup) {
                         $lastWarmupFooter = Invoke-KeepWarmStep -Snapshot $snapshot -WarmupTimes $warmupTimes `
-                                                               -Threshold $Threshold -CurrentLatch $lastWarmupFooter
+                                                               -Threshold $Threshold -WarmupFailures $warmupFailures `
+                                                               -CurrentLatch $lastWarmupFooter
                     }
                 }
                 catch {

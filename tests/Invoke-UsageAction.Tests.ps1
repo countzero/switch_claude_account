@@ -2472,9 +2472,62 @@ Describe 'switch_claude_account' {
             $Script:SlotUsageCache[$script:boSlot].Data                            | Should -Be 'D'
         }
 
-        It 'Set-SlotRateLimitBackoff is a no-op when the slot has no cache entry' {
+        It 'Set-SlotRateLimitBackoff creates a throttle-only entry when the slot has none' {
+            # The slots that most need the backoff are the ones that never read
+            # successfully, because they were throttled from the first poll.
+            # Stamping only pre-existing entries excluded exactly those, so each
+            # poll re-ran the three-attempt refresh ladder against an endpoint
+            # already refusing.
             Set-SlotRateLimitBackoff -SlotPath $script:boSlot
-            $Script:SlotUsageCache.ContainsKey($script:boSlot) | Should -BeFalse
+
+            $Script:SlotUsageCache.ContainsKey($script:boSlot)     | Should -BeTrue
+            $Script:SlotUsageCache[$script:boSlot].Data            | Should -BeNullOrEmpty
+            $Script:SlotUsageCache[$script:boSlot].RateLimitedUntil | Should -BeGreaterThan ([DateTime]::UtcNow)
+        }
+
+        It 'short-circuits with ZERO HTTP on a throttle-only entry, claiming no cached numbers' {
+            # The em-dash row must not also claim "showing last known usage":
+            # IsCachedFallback is what routes it to that advisory.
+            $script:rmCount2 = 0
+            Mock Invoke-RestMethod -MockWith { $script:rmCount2++; throw 'HTTP must not be called during backoff' }
+            $Script:SlotUsageCache[$script:boSlot] = @{
+                Data             = $null
+                Timestamp        = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:boSlot
+
+            $r.Status           | Should -Be 'rate-limited'
+            $r.Data             | Should -BeNullOrEmpty
+            $r.IsCachedFallback | Should -BeFalse
+            $script:rmCount2    | Should -Be 0
+        }
+
+        It 'a token-endpoint 429 on an uncached slot silences the NEXT poll entirely' {
+            # End to end for the defect: first poll burns the refresh ladder,
+            # second poll must make no request at all.
+            $expired = [DateTimeOffset]::UtcNow.AddHours(-2).ToUnixTimeMilliseconds()
+            $payload = @{ claudeAiOauth = @{ accessToken='AT'; refreshToken='RT'; expiresAt=$expired } } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $script:boSlot -Value $payload -NoNewline
+            $Script:SlotUsageCache.Remove($script:boSlot)
+
+            $script:tokCount = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:tokCount++
+                $resp = [pscustomobject]@{ StatusCode = 429 }
+                $e = [System.Exception]::new('429'); $e | Add-Member -NotePropertyName Response -NotePropertyValue $resp; throw $e
+            }
+
+            $first = Get-SlotUsage -SlotPath $script:boSlot
+            $after = $script:tokCount
+            $second = Get-SlotUsage -SlotPath $script:boSlot
+
+            $first.Status  | Should -Be 'rate-limited'
+            $second.Status | Should -Be 'rate-limited'
+            $after         | Should -BeGreaterThan 0
+            # The whole point: the second poll adds no traffic.
+            $script:tokCount | Should -Be $after
         }
     }
 
@@ -2592,6 +2645,22 @@ Describe 'switch_claude_account' {
 
         It 'returns $null on cache miss' {
             (Get-CachedUsageOrNull -SlotPath 'missing/path.json') | Should -BeNullOrEmpty
+        }
+
+        It 'refuses a throttle-only entry rather than reporting ok with no Data' {
+            # Set-SlotRateLimitBackoff creates these for slots that never read
+            # successfully. Serving one would return Status='ok' with Data=$null,
+            # which Get-RowMaxUtilization scores 0% and auto-rotation then reads
+            # as a healthy idle slot: a throttled slot promoted to active
+            # precisely because nothing could be read from it.
+            $slot = 'D:/throttle-only/path.json'
+            $Script:SlotUsageCache[$slot] = @{
+                Data             = $null
+                Timestamp        = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+            (Get-CachedUsageOrNull -SlotPath $slot)            | Should -BeNullOrEmpty
+            (Get-CachedUsageOrNull -SlotPath $slot -AllowStale) | Should -BeNullOrEmpty
         }
 
         It 'returns $null on stale entries (older than UsageCacheTTL minutes)' {
@@ -3946,6 +4015,96 @@ Describe 'switch_claude_account' {
                 @($Names).Count -eq 2 -and (@($Names) -contains 'b') -and (@($Names) -contains 'c')
             }
             $out | Should -Match "^\[Warmup\] Re-warmed 'b', 'c' at"
+        }
+
+        # A flat cooldown assumes the next attempt can differ. While the
+        # account's token endpoint is throttled it cannot: `claude -p`
+        # refreshes through that same endpoint, so every retry buys the same
+        # answer at ~$0.004. A data-less throttled row also scores 0% in
+        # Get-RowMaxUtilization, so the at-limit gate cannot hold it off
+        # either, which left such a slot retried every cooldown forever.
+        It 'counts a failed warm and stretches that slot cooldown' {
+            Mock Invoke-WarmAllSlots {
+                [pscustomobject]@{ Results = @([pscustomobject]@{ Name = 'b'; Status = 'rate-limited' }) }
+            }
+            $times = @{}; $fails = @{}
+            $snap  = New-KwSnapshot @( (New-KwRow -Name 'b' -Status 'rate-limited') )
+
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 `
+                                -CooldownMin 5 -WarmupFailures $fails -CurrentLatch 'x' | Out-Null
+
+            $fails['b'] | Should -Be 1
+
+            # 6 minutes on: past the flat 5, still inside the doubled 10.
+            $times['b'] = [DateTime]::Now.AddMinutes(-6)
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 `
+                                -CooldownMin 5 -WarmupFailures $fails -CurrentLatch 'x' | Out-Null
+
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
+        }
+
+        It 'resets the failure count after a successful warm' {
+            Mock Invoke-WarmAllSlots {
+                [pscustomobject]@{ Results = @([pscustomobject]@{ Name = 'a'; Status = 'ok' }) }
+            }
+            $fails = @{ 'a' = 3 }
+            $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 `
+                                -CooldownMin 5 -WarmupFailures $fails -CurrentLatch 'x' | Out-Null
+
+            $fails.ContainsKey('a') | Should -BeFalse
+        }
+
+        It 'counts every slot in the batch as failed when the warm pass throws' {
+            Mock Invoke-WarmAllSlots { throw [System.IO.IOException]::new('locked slot file') }
+            $fails = @{}
+            $snap  = New-KwSnapshot @(
+                (New-KwRow -Name 'a' -FiveResetsAt $null),
+                (New-KwRow -Name 'b' -FiveResetsAt $null)
+            )
+
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 `
+                                -CooldownMin 5 -WarmupFailures $fails -CurrentLatch 'x' | Out-Null
+
+            $fails['a'] | Should -Be 1
+            $fails['b'] | Should -Be 1
+        }
+
+        It 'omitting -WarmupFailures keeps the flat-cooldown behaviour' {
+            # Backward compatibility for one-shot callers and existing tests.
+            $times = @{ 'a' = [DateTime]::Now.AddMinutes(-6) }
+            $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 `
+                                -CooldownMin 5 -CurrentLatch 'x' | Out-Null
+
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
+        }
+    }
+
+    Context 'Get-WarmupCooldownMinutes' {
+        It 'returns the base cooldown when the slot has no failures' {
+            Get-WarmupCooldownMinutes -BaseMin 5 -Failures 0 | Should -Be 5
+        }
+
+        It 'doubles once per consecutive failure' {
+            Get-WarmupCooldownMinutes -BaseMin 5 -Failures 1 | Should -Be 10
+            Get-WarmupCooldownMinutes -BaseMin 5 -Failures 2 | Should -Be 20
+            Get-WarmupCooldownMinutes -BaseMin 5 -Failures 3 | Should -Be 40
+        }
+
+        It 'caps the doubling so a recovered slot is still noticed' {
+            $cap = Get-WarmupCooldownMinutes -BaseMin 5 -Failures $Script:WarmupBackoffMaxDoublings
+            Get-WarmupCooldownMinutes -BaseMin 5 -Failures 99 | Should -Be $cap
+        }
+
+        It 'keeps a zero base at zero, so the test override still disables the gate' {
+            Get-WarmupCooldownMinutes -BaseMin 0 -Failures 4 | Should -Be 0
+        }
+
+        It 'treats a negative failure count as no failures' {
+            Get-WarmupCooldownMinutes -BaseMin 5 -Failures -2 | Should -Be 5
         }
     }
 

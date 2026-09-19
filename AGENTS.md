@@ -45,7 +45,7 @@ The top-level dispatcher is wrapped in `Invoke-Main` and guarded by `if ($MyInvo
 
 ## Unofficial endpoints
 
-The `usage` action and the identity-fallback path depend on constants extracted from `claude.exe` 2.1.119, pinned at the top of `switch_claude_account.ps1` under `# --- Unofficial Claude Code OAuth-flow constants ---`. That block also carries the response schema, the per-endpoint HTTP budgets, and the re-extraction recipe.
+The `usage` action and the identity-fallback path depend on constants extracted from `claude.exe` 2.1.278, pinned at the top of `switch_claude_account.ps1` under `# --- Unofficial Claude Code OAuth-flow constants ---`. That block also carries the response schema, the per-endpoint HTTP budgets, and the re-extraction recipe.
 
 **Undocumented and unsupported by Anthropic.** When the calls start returning 4xx after a Claude Code upgrade, re-extract using the recipe in that comment, bump the constants, and re-run the suite. The tests mock `Invoke-RestMethod` by `$Uri` and verify shape contract only; they will not catch the constants drifting out of date. Only a live `sca usage` will.
 

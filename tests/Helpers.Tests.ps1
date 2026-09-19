@@ -2088,6 +2088,63 @@ Describe 'switch_claude_account' {
                 Should -Throw -ExpectedMessage '*no OAuth material to refresh*'
         }
 
+        # The client always sends `scope` on a refresh:
+        #   {grant_type, refresh_token, client_id, scope: w.join(" ")}
+        # (claude.exe 2.1.278). Omitting it was a silent divergence from the
+        # one request shape this unofficial endpoint is known to accept.
+        It 'sends the slot own scopes as a space-joined scope field' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $slot = Join-Path $credDir '.credentials.scoped.json'
+            $payload = @{
+                claudeAiOauth = @{
+                    accessToken  = 'old'
+                    refreshToken = 'rt'
+                    expiresAt    = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+                    scopes       = @('user:inference', 'user:profile')
+                }
+            } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            $script:sentBody = $null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:sentBody = $Body
+                return [pscustomobject]@{ access_token = 'new'; expires_in = 3600 }
+            }
+
+            Update-SlotTokens -SlotPath $slot | Out-Null
+
+            $parsed = $script:sentBody | ConvertFrom-Json
+            $parsed.grant_type | Should -Be 'refresh_token'
+            $parsed.scope      | Should -Be 'user:inference user:profile'
+        }
+
+        It 'omits scope entirely when the slot records none' {
+            # The client substitutes a default list there; guessing it would be
+            # inventing a value this script cannot verify.
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $slot = Join-Path $credDir '.credentials.unscoped.json'
+            $payload = @{
+                claudeAiOauth = @{
+                    accessToken  = 'old'
+                    refreshToken = 'rt'
+                    expiresAt    = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+                }
+            } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $slot -Value $payload -NoNewline
+
+            $script:sentBody2 = $null
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:sentBody2 = $Body
+                return [pscustomobject]@{ access_token = 'new'; expires_in = 3600 }
+            }
+
+            Update-SlotTokens -SlotPath $slot | Out-Null
+
+            ($script:sentBody2 | ConvertFrom-Json).PSObject.Properties.Name | Should -Not -Contain 'scope'
+        }
+
         It 'throws when refresh response is missing access_token' {
             $credDir = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $credDir -Force | Out-Null
