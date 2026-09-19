@@ -23,6 +23,38 @@ BeforeAll {
     $script:OriginalProfile     = $global:PROFILE
     $script:OriginalHome        = $env:HOME
     $script:OriginalConfigDir   = $env:CLAUDE_CONFIG_DIR
+
+    # The watch engine spans several functions, and the static tests in
+    # 'Watch-mode VT control rendering' assert over all of them at once.
+    # Two of those assertions are negative ("no Write-Host VT escape", "no
+    # ESC[2J literal"), and a negative is trivially true of a function that
+    # no longer holds the code: naming one function would let a later
+    # extraction disarm the guard while the suite stayed green. So the list
+    # lives here, every guard walks all of it, and the two negative guards
+    # each pair with a positive existence check over the same list. Extend
+    # this list whenever watch code moves into a new function.
+    function Get-WatchFamilyAst {
+        Param ([Parameter(Mandatory)] [string] $Path)
+
+        $family = @(
+            'Invoke-UsageWatch'
+        )
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $Path, [ref]$null, [ref]$null)
+        $found = @($ast.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $family -contains $n.Name
+        }, $true))
+
+        # A rename that forgets this list would otherwise shrink the family
+        # silently, which is the exact failure the list exists to prevent.
+        $missing = @($family | Where-Object { $_ -notin @($found.Name) })
+        if ($missing.Count -gt 0) {
+            throw "watch-family functions missing from the script: $($missing -join ', ')"
+        }
+        return $found
+    }
 }
 
 Describe 'switch_claude_account' {
@@ -793,21 +825,29 @@ Describe 'switch_claude_account' {
         # one static (no Write-Host VT escapes in Invoke-UsageWatch),
         # one behavioral (Write-VTSequence preserves DEC modes verbatim).
 
-        It 'Invoke-UsageWatch routes all VT control sequences through Write-VTSequence (no Write-Host VT escapes)' {
+        It 'the watch family routes all VT control sequences through Write-VTSequence (no Write-Host VT escapes)' {
             # AST-based static check: pin the call sites without a brittle
             # line-range. A future accidental `Write-Host "`e[?...h"`
-            # reintroduction in the watch loop fails this test.
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-                $script:ScriptPath, [ref]$null, [ref]$null)
-            $func = $ast.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                $n.Name -eq 'Invoke-UsageWatch'
-            }, $true) | Select-Object -First 1
+            # reintroduction in the watch lifecycle fails this test.
+            $funcs = Get-WatchFamilyAst -Path $script:ScriptPath
 
-            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
+            # Positive half first. The assertion below is "no VT through
+            # Write-Host", which a family that emits no VT at all satisfies
+            # trivially, so pin that the family still owns the VT writes.
+            $vtWrites = @(
+                $funcs | ForEach-Object {
+                    $_.FindAll({
+                        param($n)
+                        $n -is [System.Management.Automation.Language.CommandAst]
+                    }, $true)
+                } | Where-Object { $_.GetCommandName() -eq 'Write-VTSequence' }
+            )
+            $vtWrites.Count | Should -BeGreaterOrEqual 1 -Because (
+                'the watch lifecycle emits VT controls; if the family holds ' +
+                'none, the no-Write-Host assertion below is vacuous and the ' +
+                'code that actually emits them is unguarded')
 
-            $bodyLines = $func.Extent.Text -split "`r?`n"
+            $bodyLines = @($funcs | ForEach-Object { $_.Extent.Text -split "`r?`n" })
             $offending = @($bodyLines | Where-Object {
                 $_ -match '\bWrite-Host\b' -and $_ -match '`e\['
             })
@@ -819,7 +859,7 @@ Describe 'switch_claude_account' {
                 'private modes, which causes -Watch -NoColor to flicker.')
         }
 
-        It 'Invoke-UsageWatch emits an OSC 0 title set inside the loop and restores the captured title in finally' {
+        It 'the watch family emits an OSC 0 title set and restores the captured title on exit' {
             # Pin the contract that watch mode (a) updates the terminal
             # title on each successful poll and (b) restores the
             # pre-watch title on exit. The static check guards against
@@ -827,28 +867,22 @@ Describe 'switch_claude_account' {
             # title-set the background-window UX regresses, without
             # title-restore the watch leaks its title into the user's
             # post-Ctrl-C shell session.
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-                $script:ScriptPath, [ref]$null, [ref]$null)
-            $func = $ast.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                $n.Name -eq 'Invoke-UsageWatch'
-            }, $true) | Select-Object -First 1
-            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
-
-            $body = $func.Extent.Text
+            $funcs = Get-WatchFamilyAst -Path $script:ScriptPath
+            $body  = ($funcs | ForEach-Object { $_.Extent.Text }) -join "`n"
 
             # OSC 0 sequence: ESC ] 0 ; <title> BEL. Match the literal
             # `e]0; opener; the renderer interpolation and BEL terminator
             # vary across edits but the opener is invariant.
             $body | Should -Match '`e\]0;' -Because (
-                'Invoke-UsageWatch must emit an OSC 0 (\e]0;<title>\a) ' +
+                'the watch must emit an OSC 0 (\e]0;<title>\a) ' +
                 'sequence so the terminal-title shows live usage when ' +
                 'the watch window is in the background.')
 
-            # The captured pre-watch title must be restored on exit.
+            # The captured pre-watch title must be restored on exit. Named
+            # rather than shape-matched because "some OSC 0 write exists"
+            # cannot distinguish the restore from the per-poll update.
             $body | Should -Match '\$origTitle' -Because (
-                'Invoke-UsageWatch must capture and restore the pre-watch ' +
+                'the watch must capture and restore the pre-watch ' +
                 'terminal title; without restore the watch-mode title ' +
                 'persists into the user post-Ctrl-C shell session.')
         }
@@ -889,7 +923,7 @@ Describe 'switch_claude_account' {
                 'loses its DEC 2026 sync envelope and flickers.')
         }
 
-        It 'Invoke-UsageWatch suppresses the information stream on every nested action whose advisories would flash on screen' {
+        It 'the watch family suppresses the information stream on every nested action whose advisories would flash on screen' {
             # AST-based static check for the sub-frame flash bug:
             #
             # The polling loop calls three things inside its `if ($dueForPoll)`
@@ -914,16 +948,9 @@ Describe 'switch_claude_account' {
             # 6>$null; #3's inner site is asserted separately by the
             # Invoke-AutoRotationStep tests.
             #
-            # Static check rather than behavioral because Invoke-UsageWatch
+            # Static check rather than behavioral because the watch loop
             # is an infinite loop and hard to drive in a unit test.
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-                $script:ScriptPath, [ref]$null, [ref]$null)
-            $func = $ast.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                $n.Name -eq 'Invoke-UsageWatch'
-            }, $true) | Select-Object -First 1
-            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
+            $funcs = Get-WatchFamilyAst -Path $script:ScriptPath
 
             # Walk the AST for actual CommandAst nodes (function calls)
             # rather than regex-scanning the function body. Regex on
@@ -931,10 +958,12 @@ Describe 'switch_claude_account' {
             # `# (matches Get-UsageSnapshot).` which are not invocations
             # and would produce false positives. CommandAst.GetCommandName()
             # returns the bound command name for real invocations only.
-            $allCommands = $func.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.CommandAst]
-            }, $true)
+            $allCommands = @($funcs | ForEach-Object {
+                $_.FindAll({
+                    param($n)
+                    $n -is [System.Management.Automation.Language.CommandAst]
+                }, $true)
+            })
 
             $reconcileInvocations = @($allCommands | Where-Object {
                 $_.GetCommandName() -eq 'Invoke-Reconcile'
@@ -968,7 +997,7 @@ Describe 'switch_claude_account' {
                     }).Count -gt 0
                 }
                 $hasInfoSuppression | Should -BeTrue -Because (
-                    'every Invoke-Reconcile inside Invoke-UsageWatch must ' +
+                    'every Invoke-Reconcile in the watch family must ' +
                     'suppress information stream (6>$null); without it the ' +
                     "[Sync] auto-save / identity-change advisories print " +
                     'to the alt buffer outside the captured frame, where ' +
@@ -993,7 +1022,7 @@ Describe 'switch_claude_account' {
                     }).Count -gt 0
                 }
                 $hasInfoSuppression | Should -BeTrue -Because (
-                    'every Get-UsageSnapshot inside Invoke-UsageWatch must ' +
+                    'every Get-UsageSnapshot in the watch family must ' +
                     'suppress information stream (6>$null); Update-SlotTokens ' +
                     "(called via Get-SlotUsage) writes [Sync] yellow advisories " +
                     'on its two unhappy paths and those would print to the ' +
@@ -1129,7 +1158,7 @@ Describe 'switch_claude_account' {
             }
         }
 
-        It 'Invoke-UsageWatch stamps $lastPoll after the poll, never from the pre-poll $now' {
+        It 'the watch family stamps the last-poll time after the poll, never from the pre-poll $now' {
             # The loop is an infinite Start-Sleep loop and cannot be driven
             # directly, so this guards the shape instead. $lastPoll = $now uses
             # the timestamp captured BEFORE the HTTP work, which pre-credits the
@@ -1137,20 +1166,17 @@ Describe 'switch_claude_account' {
             # -Interval then makes the next iteration due immediately and the
             # loop polls back-to-back with no delay, hammering an endpoint whose
             # limiter trips after a handful of calls in a few seconds.
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-                $script:ScriptPath, [ref]$null, [ref]$null)
-            $func = $ast.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                $n.Name -eq 'Invoke-UsageWatch'
-            }, $true) | Select-Object -First 1
-            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
+            $funcs = Get-WatchFamilyAst -Path $script:ScriptPath
 
-            $assignments = @($func.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-                $n.Left.Extent.Text -eq '$lastPoll'
-            }, $true))
+            # Suffix match, so the guard survives the local becoming a field
+            # on the session object ($lastPoll -> $Session.LastPoll).
+            $assignments = @($funcs | ForEach-Object {
+                $_.FindAll({
+                    param($n)
+                    $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    $n.Left.Extent.Text -match '(^\$|\.)lastPoll$'
+                }, $true)
+            })
             $assignments.Count | Should -BeGreaterOrEqual 1
 
             foreach ($a in $assignments) {
@@ -1231,39 +1257,44 @@ Describe 'switch_claude_account' {
             $text | Should -Be "leaked`nB`n"
         }
 
-        It 'Invoke-UsageWatch never full-clears the screen (no ESC[2J literal)' {
+        It 'the watch family never full-clears the screen (no ESC[2J literal)' {
             # AST guard for the flicker fix: a future edit that reintroduces
             # a clear-then-redraw fails here. Prose mentions of "ESC[2J" use
             # the spelled-out form, so the backtick-e literal match ignores
             # them.
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-                $script:ScriptPath, [ref]$null, [ref]$null)
-            $func = $ast.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                $n.Name -eq 'Invoke-UsageWatch'
-            }, $true) | Select-Object -First 1
-            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
-            $func.Extent.Text | Should -Not -Match '`e\[2J' -Because (
-                'the watch repaints in place (home + per-line ESC[K + trailing ' +
-                'ESC[0J); an ESC[2J reintroduces the black -> row-by-row flash.')
+            $funcs = Get-WatchFamilyAst -Path $script:ScriptPath
+
+            # Positive half first, for the same reason as the Write-VTSequence
+            # guard above: "contains no ESC[2J" is vacuously true of a family
+            # that no longer paints frames at all.
+            $paints = @(
+                $funcs | ForEach-Object {
+                    $_.FindAll({
+                        param($n)
+                        $n -is [System.Management.Automation.Language.CommandAst]
+                    }, $true)
+                } | Where-Object { $_.GetCommandName() -eq 'ConvertTo-WatchFrameSequence' }
+            )
+            $paints.Count | Should -BeGreaterOrEqual 1 -Because (
+                'the in-place repaint is what this test guards; if no family ' +
+                'member builds a frame sequence, the ESC[2J assertion below ' +
+                'is vacuous and the real paint site is unguarded')
+
+            foreach ($f in $funcs) {
+                $f.Extent.Text | Should -Not -Match '`e\[2J' -Because (
+                    'the watch repaints in place (home + per-line ESC[K + trailing ' +
+                    'ESC[0J); an ESC[2J reintroduces the black -> row-by-row flash.')
+            }
         }
 
-        It 'Invoke-UsageWatch forces UTF-8 console output encoding and restores it (glyph regression)' {
+        It 'the watch family forces UTF-8 console output encoding and restores it (glyph regression)' {
             # Regression guard: the frame body is painted via [Console]::Out
             # .Write, which encodes through [Console]::OutputEncoding. On a
             # legacy OEM codepage (e.g. CP850) the bar / play / ellipsis
             # glyphs become '?'. The watch must force UTF-8 and restore the
             # original on exit.
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-                $script:ScriptPath, [ref]$null, [ref]$null)
-            $func = $ast.FindAll({
-                param($n)
-                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                $n.Name -eq 'Invoke-UsageWatch'
-            }, $true) | Select-Object -First 1
-            $func | Should -Not -BeNullOrEmpty -Because 'Invoke-UsageWatch must exist'
-            $body = $func.Extent.Text
+            $funcs = Get-WatchFamilyAst -Path $script:ScriptPath
+            $body  = ($funcs | ForEach-Object { $_.Extent.Text }) -join "`n"
             $body | Should -Match 'OutputEncoding\s*=\s*\[System\.Text\.UTF8Encoding\]' -Because (
                 'frame glyphs degrade to "?" unless [Console]::Out writes UTF-8')
             $body | Should -Match '\$origEncoding' -Because (
