@@ -259,7 +259,7 @@ That makes Claude Code equivalent to [`opencode-claude-auth`](https://github.com
 
 One residual difference from closing the app: `sca` does not take Claude Code's `~/.claude.json.lock`, so an `sca` read-modify-write can drop a config change Claude Code made in the same instant. That costs a counter or a project flag, never a credential.
 
-Credentials get a stronger guarantee, because losing one is not recoverable. Before overwriting a saved slot, `sca` checks that the active tokens really are that slot's account: byte-identical tokens are recognised as a slot that is already saved, accounts are matched on their uuid rather than their email (Claude Code records the same account under either of two email forms), and anything still in doubt is confirmed against `/api/oauth/profile` using those very tokens rather than against the email cached in `~/.claude.json`, which a `/login` updates a moment later than the tokens themselves.
+Credentials get a stronger guarantee, because losing one is not recoverable. Before overwriting a saved slot, `sca` checks that the active tokens really are that slot's account: byte-identical tokens are recognized as a slot that is already saved, accounts are matched on their uuid rather than their email (Claude Code records the same account under either of two email forms), and anything still in doubt is confirmed against `/api/oauth/profile` using those very tokens rather than against the email cached in `~/.claude.json`, which a `/login` updates a moment later than the tokens themselves.
 
 If none of that can attribute the active tokens, `sca` writes nothing rather than guess, and any command that was about to overwrite them stops and says so:
 
@@ -283,7 +283,7 @@ account can be resolved, or run 'sca save work' to capture them now.
 Slot-file updates done by `sca usage`'s token refresh use `MoveFileEx` with retry, so those survive an open Claude Code on `.credentials.json` itself.
 
 > [!IMPORTANT]
-> **The guard does not catch every install shape.** Claude Code installed from npm (`@anthropic-ai/claude-code`) runs as a `node` process rather than one named `claude`, so `sca` has to recognise it from the process command line instead. That works on Linux. It does **not** work on Windows, where reading command lines costs ~53 s and a guard on every write cannot spend that, nor on macOS, where PowerShell does not expose process command lines at all. On those two platforms, close Claude Code yourself before `sca save` and `sca warmup` rather than relying on the refusal. Claude Code from the native installer is detected on all three.
+> **The guard does not catch every install shape.** Claude Code installed from npm (`@anthropic-ai/claude-code`) runs as a `node` process rather than one named `claude`, so `sca` has to recognize it from the process command line instead. That works on Linux. It does **not** work on Windows, where reading command lines costs ~53 s and a guard on every write cannot spend that, nor on macOS, where PowerShell does not expose process command lines at all. On those two platforms, close Claude Code yourself before `sca save` and `sca warmup` rather than relying on the refusal. Claude Code from the native installer is detected on all three.
 
 ## Platform Notes
 

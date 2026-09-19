@@ -24,7 +24,7 @@ fixed; the description stays editable for as long as the repository exists.
 English, and it answers two questions:
 
 - **What** changed, specifically enough to skim: not "fix usage" but which
-  behaviour or contract moved.
+  behavior or contract moved.
 - **Why**, including the context you had as the author and the decisions the diff
   cannot show. Do not assume the reader knows the history.
 
