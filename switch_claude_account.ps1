@@ -6805,6 +6805,68 @@ function Invoke-WatchPoll {
     $Session.LastPoll = [DateTime]::Now
 }
 
+# Assemble the watch frame's footer block. Pure.
+#
+# Order: [Monitor] state (if -Auto) -> [Warmup] state (if -Warmup) ->
+# [Watch] Last poll -> [Watch] Last poll failed (if any). The mode-state
+# lines lead so the user's eye finds them first; transport-level details
+# follow underneath.
+#
+# -LastPoll is optional because the footer has two shapes. The -Warmup
+# startup pass renders the latches alone: it has not polled yet, and a
+# "Last poll at 00:00:00" line would be a lie. The loop passes it, and only
+# then can a failure tail follow.
+function Format-WatchFooter {
+    Param (
+        [AllowEmptyString()] [AllowNull()] [String]   $AutoLatch,
+        [AllowEmptyString()] [AllowNull()] [String]   $WarmLatch,
+        [Nullable[DateTime]]                          $LastPoll,
+        [AllowEmptyString()] [AllowNull()] [String]   $LastPollError
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    if ($AutoLatch) { $lines.Add($AutoLatch) }
+    if ($WarmLatch) { $lines.Add($WarmLatch) }
+    # [Nullable[DateTime]] for the "no poll yet" signal only: PowerShell
+    # unwraps it to a plain DateTime on binding, so this is a $null check on
+    # the parameter, not on a Nullable wrapper, and .Value does not exist.
+    if ($null -ne $LastPoll) {
+        $lines.Add("[Watch] Last poll at $($LastPoll.ToString('HH:mm:ss'))")
+        if ($LastPollError) {
+            # Collapse before interpolating: Format-UsageFooter splits the
+            # footer on newlines, so a multi-line socket exception would
+            # otherwise fork one entry into several unprefixed lines.
+            $pollReason = Format-StatusErrorTail -Message $LastPollError
+            $lines.Add("[Watch] Last poll failed: $pollReason (keeping previous data; will retry on next tick)")
+        }
+    }
+    return ($lines -join "`n")
+}
+
+# Paint one watch frame: render $RenderScript to a string, then write it in
+# one go as cursor-home + per-line erase-to-EOL + trailing erase-below
+# (ConvertTo-WatchFrameSequence), wrapped in the DEC 2026 sync envelope.
+#
+# The single write plus the absence of ESC[2J is what makes this
+# flicker-free even on a loaded machine or a terminal without DEC 2026:
+# nothing is ever blanked to black, so a render tick that lands mid-paint
+# shows the previous (near-identical) frame underneath rather than the
+# "black -> row for row" flash a clear-then-redraw produces. DEC 2026 (Win
+# Terminal >= 1.23, VS Code, iTerm2, kitty, alacritty, WezTerm, foot,
+# gnome-terminal, mintty, modern ConHost) is a bonus tier on top that also
+# suppresses sub-frame tearing, not the sole defense; older terminals ignore
+# the unknown DEC private mode with no regression.
+#
+# Callers repaint unconditionally on every tick, which is also what
+# self-heals a terminal resize within ~1 s: the per-line ESC[K and the
+# trailing ESC[0J reclaim any cells left by the old geometry.
+function Write-WatchFrame {
+    Param ([Parameter(Mandatory)] [scriptblock] $RenderScript)
+
+    $frameText = Get-WatchFrameText $RenderScript
+    Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence $frameText) + "`e[?2026l")
+}
+
 # Live `sca usage -Watch` loop: redraws once per second and re-polls the
 # endpoint every -Interval seconds. The redraw cadence is decoupled from
 # the poll cadence so the frame self-heals on terminal resize within
@@ -6816,24 +6878,9 @@ function Invoke-WatchPoll {
 # visibility. On HTTP failure the previous snapshot stays visible and
 # an advisory is appended to the footer so the display never blanks.
 #
-# Flicker-free rendering. Each frame is rendered to a string
-# (Get-WatchFrameText), then painted in a single write as cursor-home
-# (ESC[H) + per-line erase-to-EOL (ESC[K) + trailing erase-below (ESC[0J)
-# via ConvertTo-WatchFrameSequence, wrapped in the DEC 2026 sync envelope
-# (ESC[?2026h … ESC[?2026l). The frame is overwritten in place and never
-# blanked to black -- there is no ESC[2J -- so even when the terminal
-# lacks DEC 2026 or is too loaded to honor it, a render tick that lands
-# mid-paint shows the previous (near-identical) frame underneath instead
-# of the "black -> row for row" flash a clear-then-redraw produces. This
-# is the ANSI equivalent of how PSReadLine / SetBufferContents repaint:
-# overwrite in place, never clear. DEC 2026 (Win Terminal >= 1.23, VS
-# Code, iTerm2, kitty, alacritty, WezTerm, foot, gnome-terminal, mintty,
-# modern ConHost) is now a bonus tier that also suppresses sub-frame
-# tearing on capable terminals; older terminals ignore the unknown DEC
-# private mode with no regression. The watch also enters the alternate
-# screen buffer (ESC[?1049h) so the pre-watch terminal scrollback is
-# restored on exit, mirroring how top / htop / vim behave. Renderer
-# functions are reused unchanged; this loop captures and repaints them.
+# Renderer functions are reused unchanged; this loop captures and
+# repaints them through Write-WatchFrame, which owns the flicker-free
+# paint. Enter-WatchTerminal owns the alt-buffer and encoding setup.
 #
 # VT control sequences (alt buffer, sync mode, cursor hide/show, home,
 # erase) are emitted via `Write-VTSequence` so they bypass the
@@ -6917,17 +6964,12 @@ function Invoke-UsageWatch {
             $autoHeader = if ($Auto) { $Threshold } else { 0 }
             $session.Snapshot = Invoke-WarmAllSlots -Name $Name -Repaint {
                 Param ($snap)
-                $startupFooter = ''
-                if ($session.AutoLatch) { $startupFooter = $session.AutoLatch + "`n" }
-                if ($session.WarmLatch) { $startupFooter += $session.WarmLatch }
-                # Same in-place-overwrite single-write paint as the polling
-                # loop (no ESC[2J); the alt buffer is already blank on entry,
-                # so the first warmup repaint has nothing stale to clear and
-                # each subsequent per-slot repaint overwrites in place.
-                $frameText = Get-WatchFrameText {
+                # No -LastPoll: the startup pass has not polled yet, so the
+                # footer is the two latches alone.
+                $startupFooter = Format-WatchFooter -AutoLatch $session.AutoLatch -WarmLatch $session.WarmLatch
+                Write-WatchFrame {
                     Format-UsageFrame -Name $Name -Snapshot $snap -Footer $startupFooter -AutoThreshold $autoHeader
                 }
-                Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence $frameText) + "`e[?2026l")
             }
             if ($null -ne $session.Snapshot) {
                 $session.LastPoll = [DateTime]::Now
@@ -6965,66 +7007,30 @@ function Invoke-UsageWatch {
                 Invoke-WatchPoll -Session $session -Name $Name -Threshold $Threshold -Auto:$Auto -Warmup:$Warmup
             }
 
-            # Footer rebuilt every tick. The string is constant between
-            # poll boundaries (timestamp updates only on poll), but the
-            # rebuild is a cheap concat and keeps the redraw path single-
-            # branch. Multi-line only when the previous poll failed.
-            # Order: [Monitor] state (if -Auto) -> [Warmup] state (if -Warmup)
-            # -> [Watch] Last poll -> [Watch] Last poll failed (if any).
-            # The mode-state lines ([Monitor], [Warmup]) lead the block so the
-            # user's eye finds them first; transport-level details (poll
-            # timestamp, failure tail) follow underneath.
-            $footer = ''
-            if ($session.AutoLatch) {
-                $footer = $session.AutoLatch + "`n"
-            }
-            if ($session.WarmLatch) {
-                $footer += $session.WarmLatch + "`n"
-            }
-            $footer += "[Watch] Last poll at $($session.LastPoll.ToString('HH:mm:ss'))"
-            if ($session.LastPollError) {
-                # Collapse before interpolating: the footer is split on newlines
-                # by Format-UsageFooter, so a multi-line socket exception would
-                # otherwise fork one footer entry into several unprefixed lines.
-                $pollReason = Format-StatusErrorTail -Message $session.LastPollError
-                $footer += "`n[Watch] Last poll failed: $pollReason (keeping previous data; will retry on next tick)"
-            }
+            # Rebuilt every tick. The string only changes at poll
+            # boundaries, but rebuilding is a cheap join and keeps the
+            # redraw path single-branch.
+            $footer = Format-WatchFooter -AutoLatch $session.AutoLatch -WarmLatch $session.WarmLatch `
+                                         -LastPoll $session.LastPoll -LastPollError $session.LastPollError
 
             # Auto-mode threshold for the header tag. Passed only when
             # -Auto is set; otherwise 0 (Format-UsageTable interprets
             # 0 as "no tag").
             $autoHeaderThreshold = if ($Auto) { $Threshold } else { 0 }
 
-            # In-place-overwrite frame: render to a string, then paint it in
-            # a single write as cursor-home + per-line erase-to-EOL + trailing
-            # erase-below (ConvertTo-WatchFrameSequence), wrapped in the DEC
-            # 2026 sync envelope. The single write + the absence of ESC[2J is
-            # what makes this flicker-free even on a loaded machine or a
-            # terminal without DEC 2026: nothing is ever blanked to black, so
-            # a mid-paint render tick shows the previous (near-identical)
-            # frame underneath rather than the "black -> row for row" flash a
-            # clear-then-redraw produces. DEC 2026 (Win Terminal >= 1.23, VS
-            # Code, iTerm2, kitty, alacritty, WezTerm, foot, gnome-terminal,
-            # mintty, modern ConHost) is now a bonus that also suppresses
-            # sub-frame tearing, not the sole defense. The repaint runs every
-            # tick unconditionally, which also self-heals a terminal resize
-            # within ~1 s (the per-line ESC[K + trailing ESC[0J reclaim any
-            # stale cells from the old geometry).
-            $frameText = Get-WatchFrameText {
+            Write-WatchFrame {
                 if ($null -ne $session.Snapshot) {
                     Format-UsageFrame -Name $Name -Snapshot $session.Snapshot -Footer $footer -AutoThreshold $autoHeaderThreshold
                 } else {
                     # First poll failed and we have nothing to render yet.
                     # $footer already leads with the [Monitor] line (when -Auto
-                    # is set) via the composition above, so a single
-                    # Format-UsageFooter call places auto-mode state above
-                    # the 'Waiting...' advisory; no separate standalone
-                    # print needed.
+                    # is set), so a single Format-UsageFooter call places
+                    # auto-mode state above the 'Waiting...' advisory; no
+                    # separate standalone print needed.
                     Write-Color "[Watch] Waiting for first successful /api/oauth/usage response..." 'Yellow'
                     Format-UsageFooter $footer
                 }
             }
-            Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence $frameText) + "`e[?2026l")
 
             # 1-second inter-frame wait. Decoupling redraw cadence from
             # poll cadence lets the screen self-heal on terminal resize

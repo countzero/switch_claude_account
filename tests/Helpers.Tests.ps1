@@ -42,6 +42,8 @@ BeforeAll {
             'Exit-WatchTerminal'
             'New-WatchSession'
             'Invoke-WatchPoll'
+            'Format-WatchFooter'
+            'Write-WatchFrame'
         )
         $ast = [System.Management.Automation.Language.Parser]::ParseFile(
             $Path, [ref]$null, [ref]$null)
@@ -1494,6 +1496,115 @@ Describe 'switch_claude_account' {
 
             Invoke-WatchPoll -Session (New-WatchSession -Auto) -Name '' -Threshold 95 -Auto
             Should -Invoke Format-WatchTitle -Times 1 -Exactly -ParameterFilter { $Aggregate }
+        }
+    }
+
+    Context 'Format-WatchFooter' {
+        # Pure, and previously unreachable: every branch lived inline in the
+        # watch loop, so none of the four was exercised by anything.
+
+        It 'orders mode state above transport detail' {
+            # The mode lines lead so the user's eye finds them first; poll
+            # timestamp and failure tail follow underneath.
+            Format-WatchFooter -AutoLatch '[Monitor] on' -WarmLatch '[Warmup] on' `
+                               -LastPoll ([DateTime]::new(2026, 1, 2, 13, 4, 5)) |
+                Should -Be "[Monitor] on`n[Warmup] on`n[Watch] Last poll at 13:04:05"
+        }
+
+        It 'renders the startup shape as the latches alone' {
+            # The -Warmup startup pass has not polled yet, so a "Last poll
+            # at ..." line would be a lie. Omitting -LastPoll is how a
+            # caller says so.
+            Format-WatchFooter -AutoLatch '[Monitor] on' -WarmLatch '[Warmup] on' |
+                Should -Be "[Monitor] on`n[Warmup] on"
+        }
+
+        It 'drops the latches it was not given' {
+            Format-WatchFooter -LastPoll ([DateTime]::new(2026, 1, 2, 13, 4, 5)) |
+                Should -Be '[Watch] Last poll at 13:04:05'
+            Format-WatchFooter -WarmLatch '[Warmup] on' -LastPoll ([DateTime]::new(2026, 1, 2, 13, 4, 5)) |
+                Should -Be "[Warmup] on`n[Watch] Last poll at 13:04:05"
+        }
+
+        It 'appends the failure tail under the poll line' {
+            $out = Format-WatchFooter -LastPoll ([DateTime]::new(2026, 1, 2, 13, 4, 5)) `
+                                      -LastPollError 'socket closed'
+            $out | Should -Be (
+                "[Watch] Last poll at 13:04:05`n" +
+                '[Watch] Last poll failed: socket closed (keeping previous data; will retry on next tick)')
+        }
+
+        It 'collapses a multi-line failure onto one footer line' {
+            # Format-UsageFooter splits the footer on newlines and prefixes
+            # nothing, so an uncollapsed socket exception would fork one
+            # entry into several stray lines.
+            $out = Format-WatchFooter -LastPoll ([DateTime]::new(2026, 1, 2, 13, 4, 5)) `
+                                      -LastPollError "one`ntwo`n  three"
+            @($out -split "`n").Count | Should -Be 2
+            $out | Should -Match 'one two three'
+        }
+
+        It 'suppresses the failure tail when there has been no poll' {
+            # The tail is meaningless without the poll line it hangs from,
+            # and the startup pass never sets an error anyway.
+            Format-WatchFooter -WarmLatch '[Warmup] on' -LastPollError 'ignored' |
+                Should -Be '[Warmup] on'
+        }
+
+        It 'returns an empty string when there is nothing to report' {
+            Format-WatchFooter | Should -Be ''
+        }
+    }
+
+    Context 'Write-WatchFrame' {
+        # The single paint site. Both callers (the polling loop and the
+        # -Warmup startup repaint) go through it, so the DEC envelope and
+        # the no-clear guarantee have one home instead of two copies.
+
+        BeforeAll {
+            function Get-CapturedFramePaint {
+                Param ([Parameter(Mandatory)] [scriptblock] $Body)
+
+                $origOut = [Console]::Out
+                $sw      = [System.IO.StringWriter]::new()
+                try {
+                    [Console]::SetOut($sw)
+                    & $Body
+                } finally {
+                    [Console]::SetOut($origOut)
+                }
+                return $sw.ToString()
+            }
+        }
+
+        It 'wraps the frame in the DEC 2026 sync envelope' {
+            $out = Get-CapturedFramePaint { Write-WatchFrame { Write-Host 'row' } }
+            $out.StartsWith("`e[?2026h") | Should -BeTrue
+            $out.EndsWith("`e[?2026l")   | Should -BeTrue
+        }
+
+        It 'homes the cursor and never full-clears' {
+            # The whole point of the in-place repaint: an ESC[2J here brings
+            # back the black -> row-by-row flash on any terminal that lacks
+            # DEC 2026 or is too loaded to honour it.
+            $out = Get-CapturedFramePaint { Write-WatchFrame { Write-Host 'row' } }
+            $out | Should -Match ([regex]::Escape("`e[H"))
+            $out.Contains("`e[2J") | Should -BeFalse
+        }
+
+        It 'paints the frame in a single write' {
+            # A frame split across writes can be interrupted by a render
+            # tick mid-paint, which is exactly what the envelope exists to
+            # prevent.
+            Mock Write-VTSequence -MockWith { }
+            Write-WatchFrame { Write-Host 'row' }
+            Should -Invoke Write-VTSequence -Times 1 -Exactly
+        }
+
+        It 'renders the caller block into the payload' {
+            $out = Get-CapturedFramePaint { Write-WatchFrame { Write-Host 'hello'; Write-Host 'world' } }
+            $out | Should -Match 'hello'
+            $out | Should -Match 'world'
         }
     }
 
