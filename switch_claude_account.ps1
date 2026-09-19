@@ -6597,6 +6597,15 @@ function Get-EarlyRepollLastPoll {
     return $Now.AddSeconds(-[Math]::Max(0, $Interval - $DelaySec))
 }
 
+# True when stdout is a terminal the watch can paint into. A one-line
+# wrapper over a static probe for the same reason as Test-ClaudeRunning:
+# a [Console] static cannot be mocked, and without a seam here no test can
+# reach the watch loop at all, because a test host is by definition the
+# case this returns false for.
+function Test-WatchInteractive {
+    return (-not [Console]::IsOutputRedirected)
+}
+
 # Terminal-state lifecycle for the watch loop, split into a capture-and-
 # mutate half and a restore half so the caller's try/finally spans three
 # lines instead of the entire loop body. Enter- returns the token Exit-
@@ -6988,14 +6997,14 @@ function Invoke-UsageWatch {
     # Pre-loop Claude Code guard, -Warmup only; see Test-ClaudeRunning for why
     # the fleet walk refuses and rotation does not.
     #
-    # Checked BEFORE the IsOutputRedirected guard so the user sees the
+    # Checked BEFORE the Test-WatchInteractive guard so the user sees the
     # more actionable "close Claude Code" message rather than the
     # interactive-terminal one (which the test harness always hits).
     if ($Warmup -and (Test-ClaudeRunning)) {
         throw "Claude Code is running. Close it before 'sca monitor -KeepWarm', which makes every slot active in turn and would drag the live session across all of them. Plain 'sca monitor' rotates without that and runs fine alongside Claude Code."
     }
 
-    if ([Console]::IsOutputRedirected) {
+    if (-not (Test-WatchInteractive)) {
         throw "-Watch requires an interactive terminal; for scripted output use 'sca usage -Json'."
     }
 

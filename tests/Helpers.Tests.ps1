@@ -38,6 +38,7 @@ BeforeAll {
 
         $family = @(
             'Invoke-UsageWatch'
+            'Test-WatchInteractive'
             'Enter-WatchTerminal'
             'Exit-WatchTerminal'
             'New-WatchSession'
@@ -61,6 +62,26 @@ BeforeAll {
             throw "watch-family functions missing from the script: $($missing -join ', ')"
         }
         return $found
+    }
+
+    # Run $Body with [Console]::Out swapped for a StringWriter and return
+    # what was written. The watch writes its VT control sequences straight to
+    # [Console]::Out to bypass the PlainText filter Write-Host applies, so
+    # this swap is the only way to see them. Pester's own output goes through
+    # the host UI rather than Console.Out and is unaffected; the finally puts
+    # the real writer back even when $Body throws.
+    function Get-CapturedConsoleOut {
+        Param ([Parameter(Mandatory)] [scriptblock] $Body)
+
+        $origOut = [Console]::Out
+        $sw      = [System.IO.StringWriter]::new()
+        try {
+            [Console]::SetOut($sw)
+            & $Body
+        } finally {
+            [Console]::SetOut($origOut)
+        }
+        return $sw.ToString()
     }
 }
 
@@ -1208,23 +1229,6 @@ Describe 'switch_claude_account' {
         # Exit-WatchTerminal in a finally.
 
         BeforeAll {
-            # Run $Body with [Console]::Out swapped for a StringWriter and
-            # return what was written. Same technique as the Write-VTSequence
-            # test above; restores Console.Out before Pester's own output.
-            function Get-CapturedConsoleOut {
-                Param ([Parameter(Mandatory)] [scriptblock] $Body)
-
-                $origOut = [Console]::Out
-                $sw      = [System.IO.StringWriter]::new()
-                try {
-                    [Console]::SetOut($sw)
-                    & $Body
-                } finally {
-                    [Console]::SetOut($origOut)
-                }
-                return $sw.ToString()
-            }
-
             # Enter the watch terminal with output captured, then hand the
             # token and everything written during entry to $Assert. Always
             # restores, including when $Assert fails, so one red test cannot
@@ -1631,24 +1635,8 @@ Describe 'switch_claude_account' {
         # -Warmup startup repaint) go through it, so the DEC envelope and
         # the no-clear guarantee have one home instead of two copies.
 
-        BeforeAll {
-            function Get-CapturedFramePaint {
-                Param ([Parameter(Mandatory)] [scriptblock] $Body)
-
-                $origOut = [Console]::Out
-                $sw      = [System.IO.StringWriter]::new()
-                try {
-                    [Console]::SetOut($sw)
-                    & $Body
-                } finally {
-                    [Console]::SetOut($origOut)
-                }
-                return $sw.ToString()
-            }
-        }
-
         It 'wraps the frame in the DEC 2026 sync envelope' {
-            $out = Get-CapturedFramePaint { Write-WatchFrame { Write-Host 'row' } }
+            $out = Get-CapturedConsoleOut { Write-WatchFrame { Write-Host 'row' } }
             $out.StartsWith("`e[?2026h") | Should -BeTrue
             $out.EndsWith("`e[?2026l")   | Should -BeTrue
         }
@@ -1657,7 +1645,7 @@ Describe 'switch_claude_account' {
             # The whole point of the in-place repaint: an ESC[2J here brings
             # back the black -> row-by-row flash on any terminal that lacks
             # DEC 2026 or is too loaded to honour it.
-            $out = Get-CapturedFramePaint { Write-WatchFrame { Write-Host 'row' } }
+            $out = Get-CapturedConsoleOut { Write-WatchFrame { Write-Host 'row' } }
             $out | Should -Match ([regex]::Escape("`e[H"))
             $out.Contains("`e[2J") | Should -BeFalse
         }
@@ -1672,7 +1660,7 @@ Describe 'switch_claude_account' {
         }
 
         It 'renders the caller block into the payload' {
-            $out = Get-CapturedFramePaint { Write-WatchFrame { Write-Host 'hello'; Write-Host 'world' } }
+            $out = Get-CapturedConsoleOut { Write-WatchFrame { Write-Host 'hello'; Write-Host 'world' } }
             $out | Should -Match 'hello'
             $out | Should -Match 'world'
         }
@@ -1780,6 +1768,139 @@ Describe 'switch_claude_account' {
 
             Invoke-WatchStartupWarm -Session (New-WatchSession -Auto -Warmup) -Interval 300 -Threshold 95 -Auto
             Should -Invoke Format-UsageFrame -Times 1 -Exactly -ParameterFilter { $AutoThreshold -eq 95 }
+        }
+    }
+
+    Context 'Invoke-UsageWatch loop' {
+        # The assembly, as opposed to the parts. Every piece the loop calls
+        # is tested on its own above; what none of those cover is whether
+        # the loop wires them together -- and until Test-WatchInteractive
+        # existed nothing could reach the loop at all, because a test host
+        # is by definition the case its guard refuses.
+        #
+        # Enter-WatchTerminal and Exit-WatchTerminal run for real, so this
+        # also proves the try/finally restores the terminal. The renderers
+        # run for real too; only the boundary is stubbed.
+
+        BeforeEach {
+            $script:watchTicks = 0
+            $script:tickBudget = 2
+
+            Mock Test-WatchInteractive -MockWith { $true }
+
+            # The loop is `while ($true)` with no exit. Start-Sleep is the
+            # one call every tick makes regardless of branch, so it doubles
+            # as the tick counter and the way out. The sentinel unwinds
+            # through the real try/finally exactly as an unexpected failure
+            # would, which is what makes the restore assertions meaningful.
+            Mock Start-Sleep -MockWith {
+                $script:watchTicks++
+                if ($script:watchTicks -ge $script:tickBudget) { throw 'watch-loop-stop' }
+            }
+
+            Mock Invoke-WatchPoll -MockWith {
+                $Session.Snapshot = [pscustomobject]@{
+                    NoSlots = $false
+                    Results = @(
+                        [pscustomobject]@{
+                            Name     = 'alpha'
+                            Status   = 'ok'
+                            IsActive = $true
+                            Email    = $null
+                            Data     = [pscustomobject]@{
+                                five_hour = [pscustomobject]@{ utilization = 10 }
+                                seven_day = [pscustomobject]@{ utilization = 20 }
+                            }
+                            Error            = $null
+                            IsCachedFallback = $false
+                        }
+                    )
+                }
+                $Session.LastPoll = [DateTime]::Now
+            }
+
+            # Swallow only our own sentinel; a real failure still fails the
+            # test rather than being mistaken for the loop bound.
+            function script:Invoke-BoundedWatch {
+                Param ([hashtable] $WatchArgs = @{})
+
+                Get-CapturedConsoleOut {
+                    try { Invoke-UsageWatch @WatchArgs }
+                    catch { if ($_.Exception.Message -ne 'watch-loop-stop') { throw } }
+                }
+            }
+        }
+
+        It 'refuses to start when stdout is not a terminal' {
+            # Proves the seam is load-bearing and not merely present: with
+            # the probe reporting a pipe, the loop never runs.
+            Mock Test-WatchInteractive -MockWith { $false }
+            { Invoke-UsageWatch } | Should -Throw -ExpectedMessage '*requires an interactive terminal*'
+            Should -Invoke Invoke-WatchPoll -Times 0 -Exactly
+        }
+
+        It 'enters the alt buffer once and leaves it once' {
+            # Entering twice would nest the buffer and lose the user's
+            # scrollback; leaving zero times would strand them in it.
+            $out = Invoke-BoundedWatch
+            ([regex]::Matches($out, [regex]::Escape("`e[?1049h"))).Count | Should -Be 1
+            ([regex]::Matches($out, [regex]::Escape("`e[?1049l"))).Count | Should -Be 1
+        }
+
+        It 'restores the cursor and leaves the alt buffer last, even when the body throws' {
+            # The sentinel is an unexpected failure as far as the loop is
+            # concerned, so this is the finally doing its job.
+            $out = Invoke-BoundedWatch
+            $out.EndsWith("`e[?25h`e[?1049l") | Should -BeTrue
+        }
+
+        It 'paints one frame per tick' {
+            $script:tickBudget = 3
+            $out = Invoke-BoundedWatch
+            ([regex]::Matches($out, [regex]::Escape("`e[?2026h"))).Count | Should -Be 3
+        }
+
+        It 'polls on the first tick and not again inside the interval' {
+            # The redraw cadence is 1 s and the poll cadence is -Interval;
+            # conflating them would hammer the unofficial endpoint once a
+            # second.
+            $script:tickBudget = 3
+            Invoke-BoundedWatch | Out-Null
+            Should -Invoke Invoke-WatchPoll -Times 1 -Exactly
+        }
+
+        It 'polls every tick while no snapshot has arrived yet' {
+            # The other half of the gate: with nothing on screen the loop
+            # must keep trying rather than wait out an interval.
+            Mock Invoke-WatchPoll -MockWith { }
+            $script:tickBudget = 3
+            Invoke-BoundedWatch | Out-Null
+            Should -Invoke Invoke-WatchPoll -Times 3 -Exactly
+        }
+
+        It 'shows the waiting advisory until the first poll succeeds' {
+            Mock Invoke-WatchPoll -MockWith { }
+            Invoke-BoundedWatch | Should -Match 'Waiting for first successful'
+        }
+
+        It 'renders the table once a snapshot exists' {
+            $out = Invoke-BoundedWatch
+            $out | Should -Match 'alpha'
+            $out | Should -Not -Match 'Waiting for first successful'
+        }
+
+        It 'carries the mode latch through the footer into the frame' {
+            # Proves Format-WatchFooter's output actually reaches
+            # Format-UsageFrame; the two were wired by hand in the loop.
+            Invoke-BoundedWatch -WatchArgs @{ Auto = $true } |
+                Should -Match ([regex]::Escape($Script:MonitorSteadyLatch))
+        }
+
+        It 'clamps an interval below the minimum and says so' {
+            $msg = & {
+                Invoke-BoundedWatch -WatchArgs @{ Interval = 1 } | Out-Null
+            } 6>&1 | Out-String
+            $msg | Should -Match 'clamping to 60s'
         }
     }
 
