@@ -6711,6 +6711,100 @@ function New-WatchSession {
     }
 }
 
+# One poll boundary of the watch loop: reconcile, read usage, retitle, then
+# let -Auto rotate and -Warmup re-warm. Mutates $Session in place (see
+# New-WatchSession); returns nothing.
+#
+# The work sits in one try because every step of it is optional to the
+# frame: a failure anywhere leaves the previous snapshot on screen and parks
+# the message on LastPollError for the footer, so the display never blanks
+# and the user can still quit cleanly. This is the only extracted watch unit
+# that touches credentials.
+function Invoke-WatchPoll {
+    Param (
+        [Parameter(Mandatory)] [pscustomobject] $Session,
+        [String] $Name,
+        [int]    $Threshold,
+        [switch] $Auto,
+        [switch] $Warmup
+    )
+
+    try {
+        # Reconcile at every poll boundary so a refresh that happened since
+        # the last poll is captured into the tracked slot before we read its
+        # bytes for the /api/oauth/usage call. Suppressed stdout: any
+        # advisory the reconcile emits would print straight to the alt buffer
+        # (outside the captured frame) and the in-place repaint would not
+        # overwrite it cleanly anyway.
+        Invoke-Reconcile 6>$null | Out-Null
+        # 6>$null on Get-UsageSnapshot: Update-SlotTokens (called via
+        # Get-SlotUsage when a token is within 60s of expiry) emits yellow
+        # [Sync] advisories on its two unhappy paths (propagation-to-
+        # .credentials.json failure, or active slot sidecar-orphaned). Those
+        # Write-Host calls would print to the alt buffer outside the captured
+        # frame and linger (the in-place repaint overwrites only the cells
+        # the frame occupies, never ESC[2J-clears), producing a stray line
+        # the user cannot dismiss. Suppress them here; the user still sees
+        # the same condition in non-watch contexts (`sca usage`, `sca list`).
+        # Matches the Invoke-Reconcile above and the Invoke-SlotSwap 6>$null
+        # inside Invoke-AutoRotationStep.
+        $Session.Snapshot      = Get-UsageSnapshot -Name $Name 6>$null
+        $Session.LastPollError = $null
+
+        # Update the terminal title only on a successful poll; on a failed
+        # poll the previous title (and body) persist together until the next
+        # tick. OSC 0 ('ESC ] 0 ; <title> BEL') sets both window and icon
+        # title; supported by Windows Terminal, modern ConHost, VS Code,
+        # iTerm2, kitty, alacritty, WezTerm, foot, gnome-terminal, mintty.
+        # Routed through Write-VTSequence for parity with DEC sequences
+        # (bypasses the OutputRendering=PlainText filter; see
+        # Write-VTSequence docblock).
+        # -Aggregate is tied to -Auto: in -Auto mode the active slot moves
+        # under the user as the script rotates, so the active-slot title
+        # loses signal; pool-mean matches the aggregate bars rendered above
+        # the table. Bare -Watch keeps the per-slot alarm-glance title. See
+        # Format-WatchTitle docblock.
+        Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $Session.Snapshot -Aggregate:$Auto))
+
+        # Auto-rotation decision happens after each successful poll. The
+        # latched footer string is updated based on the decision so it stays
+        # visible until the next state change (the next 'rotate' /
+        # 'no-eligible' outcome). Failures inside the swap are caught there
+        # and surfaced as a 'Rotation failed!' line; the watch never aborts
+        # because of an auto-rotation issue (the user can still quit with
+        # Ctrl-C and inspect the table).
+        if ($Auto) {
+            $Session.AutoLatch = Invoke-AutoRotationStep -Snapshot $Session.Snapshot -Threshold $Threshold -CurrentLatch $Session.AutoLatch
+        }
+
+        # Keep-warm decision after auto-rotation so the slot
+        # Invoke-WarmAllSlots restores to is the post-rotation active one.
+        # Keep-warm and rotation cannot fight over a slot: both gate on
+        # Get-RowMaxUtilization against the same -Threshold, and
+        # Test-WarmEligible skips anything at or above it, so a rotation
+        # source is never warm-eligible. Re-opens any slot whose 5h window
+        # has closed; the latched footer reports it.
+        if ($Warmup) {
+            $Session.WarmLatch = Invoke-KeepWarmStep -Snapshot $Session.Snapshot -WarmupTimes $Session.WarmupTimes `
+                                                     -Threshold $Threshold -WarmupFailures $Session.WarmupFailures `
+                                                     -CurrentLatch $Session.WarmLatch
+        }
+    }
+    catch {
+        # Keep the previous snapshot visible. If the very first poll failed
+        # there is nothing to show below the header yet and the frame falls
+        # back to a waiting advisory; either way the error reaches the user
+        # through the footer rather than ending the watch.
+        $Session.LastPollError = $_.Exception.Message
+    }
+    # Stamped AFTER the poll, never from a timestamp taken before it: a poll
+    # that outruns -Interval (slow endpoint x N slots) would otherwise be
+    # pre-credited with its own duration and the next iteration would re-poll
+    # with zero delay, hammering a limiter that 429s after a handful of calls
+    # in a few seconds. Matches the post-warmup stamp in the startup pass.
+    $Session.LastPoll = [DateTime]::Now
+}
+
 # Live `sca usage -Watch` loop: redraws once per second and re-polls the
 # endpoint every -Interval seconds. The redraw cadence is decoupled from
 # the poll cadence so the frame self-heals on terminal resize within
@@ -6864,94 +6958,11 @@ function Invoke-UsageWatch {
         }
 
         while ($true) {
+            # Poll when there is nothing on screen yet, or when the interval
+            # has elapsed since the last poll finished.
             $now = [DateTime]::Now
-            $dueForPoll = ($null -eq $session.Snapshot) -or (($now - $session.LastPoll).TotalSeconds -ge $Interval)
-
-            if ($dueForPoll) {
-                try {
-                    # Reconcile at every poll boundary so a refresh that
-                    # happened since the last poll is captured into the
-                    # tracked slot before we read its bytes for the
-                    # /api/oauth/usage call. Suppressed stdout; any
-                    # advisory the reconcile emits would print straight to
-                    # the alt buffer (outside the captured frame) and the
-                    # in-place repaint would not overwrite it cleanly anyway.
-                    Invoke-Reconcile 6>$null | Out-Null
-                    # 6>$null on Get-UsageSnapshot: Update-SlotTokens
-                    # (called via Get-SlotUsage when a token is within 60s
-                    # of expiry) emits yellow [Sync] advisories on its two
-                    # unhappy paths (propagation-to-.credentials.json
-                    # failure, or active slot sidecar-orphaned). Those
-                    # Write-Host calls would print to the alt buffer outside
-                    # the captured frame and linger (the in-place repaint
-                    # overwrites only the cells the frame occupies, never
-                    # ESC[2J-clears), producing a stray line the user cannot
-                    # dismiss. Suppress
-                    # them here; the user still sees the same condition
-                    # in non-watch contexts (`sca usage`, `sca list`).
-                    # Matches the Invoke-Reconcile 6>$null above and the
-                    # Invoke-SlotSwap 6>$null inside Invoke-AutoRotationStep.
-                    $session.Snapshot      = Get-UsageSnapshot -Name $Name 6>$null
-                    $session.LastPollError = $null
-
-                    # Update the terminal title only on a successful poll;
-                    # on a failed poll the previous title (and body) persist
-                    # together until the next tick. OSC 0 ('ESC ] 0 ; <title>
-                    # BEL') sets both window and icon title; supported by
-                    # Windows Terminal, modern ConHost, VS Code, iTerm2,
-                    # kitty, alacritty, WezTerm, foot, gnome-terminal,
-                    # mintty. Routed through Write-VTSequence for parity
-                    # with DEC sequences (bypasses the
-                    # OutputRendering=PlainText filter; see Write-VTSequence
-                    # docblock).
-                    # -Aggregate is tied to -Auto: in -Auto mode the
-                    # active slot moves under the user as the script
-                    # rotates, so the active-slot title loses signal;
-                    # pool-mean matches the aggregate bars rendered
-                    # above the table. Bare -Watch keeps the per-slot
-                    # alarm-glance title. See Format-WatchTitle docblock.
-                    Write-VTSequence ("`e]0;{0}`a" -f (Format-WatchTitle -Name $Name -Snapshot $session.Snapshot -Aggregate:$Auto))
-
-                    # Auto-rotation decision happens after each successful
-                    # poll. The latched footer string is updated based on
-                    # the decision so it stays visible until the next
-                    # state change (the next 'rotate' / 'no-eligible'
-                    # outcome). Failures inside the swap are caught and
-                    # surfaced as a 'Rotation failed!' line; the loop never
-                    # aborts because of an auto-rotation issue (user can
-                    # still quit with Ctrl-C and inspect the table).
-                    if ($Auto) {
-                        $session.AutoLatch = Invoke-AutoRotationStep -Snapshot $session.Snapshot -Threshold $Threshold -CurrentLatch $session.AutoLatch
-                    }
-
-                    # Keep-warm decision after auto-rotation so the slot
-                    # Invoke-WarmAllSlots restores to is the post-rotation
-                    # active one. Keep-warm and rotation cannot fight over a
-                    # slot: both gate on Get-RowMaxUtilization against the same
-                    # -Threshold, and Test-WarmEligible skips anything at or
-                    # above it, so a rotation source is never warm-eligible.
-                    # Re-opens any slot whose 5h window has closed; the latched
-                    # footer reports it.
-                    if ($Warmup) {
-                        $session.WarmLatch = Invoke-KeepWarmStep -Snapshot $session.Snapshot -WarmupTimes $session.WarmupTimes `
-                                                                 -Threshold $Threshold -WarmupFailures $session.WarmupFailures `
-                                                                 -CurrentLatch $session.WarmLatch
-                    }
-                }
-                catch {
-                    # Keep the previous snapshot visible. If the very first
-                    # poll failed we still need to show SOMETHING below the
-                    # header, so render an empty frame and surface the
-                    # error in the footer; the user can still quit cleanly.
-                    $session.LastPollError = $_.Exception.Message
-                }
-                # Stamped AFTER the poll, not from the pre-poll $now: a poll
-                # that outruns -Interval (slow endpoint x N slots) would
-                # otherwise be pre-credited with its own duration and the next
-                # iteration would re-poll with zero delay, hammering a limiter
-                # that 429s after a handful of calls in a few seconds. Matches
-                # the post-warmup stamp above.
-                $session.LastPoll = [DateTime]::Now
+            if (($null -eq $session.Snapshot) -or (($now - $session.LastPoll).TotalSeconds -ge $Interval)) {
+                Invoke-WatchPoll -Session $session -Name $Name -Threshold $Threshold -Auto:$Auto -Warmup:$Warmup
             }
 
             # Footer rebuilt every tick. The string is constant between

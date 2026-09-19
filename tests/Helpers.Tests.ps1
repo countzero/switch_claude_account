@@ -41,6 +41,7 @@ BeforeAll {
             'Enter-WatchTerminal'
             'Exit-WatchTerminal'
             'New-WatchSession'
+            'Invoke-WatchPoll'
         )
         $ast = [System.Management.Automation.Language.Parser]::ParseFile(
             $Path, [ref]$null, [ref]$null)
@@ -1365,6 +1366,134 @@ Describe 'switch_claude_account' {
             $enter.Extent.Text | Should -Match 'try\s*\{\s*\[Console\]::CursorVisible\s*\}\s*catch' -Because (
                 'reading it unguarded throws PlatformNotSupportedException on ' +
                 'Linux and macOS, which kills sca usage -Watch and sca monitor there')
+        }
+    }
+
+    Context 'Invoke-WatchPoll' {
+        # The poll step is the only extracted watch unit that touches
+        # credentials, and until it came out of the loop none of it was
+        # reachable by a test: the loop around it never terminates. Every
+        # collaborator is mocked, so these drive the step's own decisions
+        # (what it stores, what it swallows, what it skips, in what order)
+        # and nothing else.
+
+        BeforeEach {
+            Mock Invoke-Reconcile        -MockWith { [pscustomobject]@{ Captured = $true } }
+            Mock Write-VTSequence        -MockWith { }
+            Mock Format-WatchTitle       -MockWith { 'title' }
+            Mock Invoke-AutoRotationStep -MockWith { '[Monitor] rotated' }
+            Mock Invoke-KeepWarmStep     -MockWith { '[Warmup] re-warmed' }
+            Mock Get-UsageSnapshot       -MockWith { [pscustomobject]@{ Results = @(); NoSlots = $false } }
+        }
+
+        It 'stores the fresh snapshot and clears a stale poll error' {
+            $s = New-WatchSession
+            $s.LastPollError = 'previous failure'
+            Invoke-WatchPoll -Session $s -Name '' -Threshold 95
+            $s.Snapshot      | Should -Not -BeNullOrEmpty
+            $s.LastPollError | Should -BeNullOrEmpty
+        }
+
+        It 'parks the failure on the session and keeps the previous snapshot on screen' {
+            # The watch must never blank on a transport error; the previous
+            # table stays up and the message reaches the footer instead.
+            Mock Get-UsageSnapshot -MockWith { throw 'socket closed' }
+            $s = New-WatchSession
+            $stale = [pscustomobject]@{ Results = @(); NoSlots = $false }
+            $s.Snapshot = $stale
+
+            { Invoke-WatchPoll -Session $s -Name '' -Threshold 95 } | Should -Not -Throw
+            $s.Snapshot      | Should -Be $stale
+            $s.LastPollError | Should -Be 'socket closed'
+        }
+
+        It 'leaves the terminal title alone when the poll failed' {
+            # Title and body must move together; a title updated off a poll
+            # that produced no data would disagree with the table under it.
+            Mock Get-UsageSnapshot -MockWith { throw 'nope' }
+            Invoke-WatchPoll -Session (New-WatchSession) -Name '' -Threshold 95
+            Should -Invoke Format-WatchTitle -Times 0 -Exactly
+        }
+
+        It 'stamps the last-poll time after the work, not before it' {
+            # Behavioural counterpart to the AST guard: a stamp taken before
+            # the request pre-credits the interval with the poll's own
+            # duration, so a poll slower than -Interval makes the next
+            # iteration due immediately and the loop hammers the limiter.
+            Mock Get-UsageSnapshot -MockWith {
+                Start-Sleep -Milliseconds 300
+                [pscustomobject]@{ Results = @(); NoSlots = $false }
+            }
+            $s = New-WatchSession
+            $before = [DateTime]::Now
+            Invoke-WatchPoll -Session $s -Name '' -Threshold 95
+            ($s.LastPoll - $before).TotalMilliseconds | Should -BeGreaterThan 250
+        }
+
+        It 'stamps the last-poll time even when the poll threw' {
+            # Otherwise a failing endpoint would leave LastPoll at MinValue
+            # and the loop would retry with no delay at all.
+            Mock Get-UsageSnapshot -MockWith { throw 'nope' }
+            $s = New-WatchSession
+            Invoke-WatchPoll -Session $s -Name '' -Threshold 95
+            $s.LastPoll | Should -BeGreaterThan ([DateTime]::MinValue)
+        }
+
+        It 'rotates only under -Auto, and latches the verdict' {
+            $plain = New-WatchSession
+            Invoke-WatchPoll -Session $plain -Name '' -Threshold 95
+            Should -Invoke Invoke-AutoRotationStep -Times 0 -Exactly
+            $plain.AutoLatch | Should -BeNullOrEmpty
+
+            $auto = New-WatchSession -Auto
+            Invoke-WatchPoll -Session $auto -Name '' -Threshold 95 -Auto
+            Should -Invoke Invoke-AutoRotationStep -Times 1 -Exactly
+            $auto.AutoLatch | Should -Be '[Monitor] rotated'
+        }
+
+        It 'keeps slots warm only under -Warmup, and latches the outcome' {
+            $plain = New-WatchSession
+            Invoke-WatchPoll -Session $plain -Name '' -Threshold 95
+            Should -Invoke Invoke-KeepWarmStep -Times 0 -Exactly
+
+            $warm = New-WatchSession -Warmup
+            Invoke-WatchPoll -Session $warm -Name '' -Threshold 95 -Warmup
+            Should -Invoke Invoke-KeepWarmStep -Times 1 -Exactly
+            $warm.WarmLatch | Should -Be '[Warmup] re-warmed'
+        }
+
+        It 'runs keep-warm after auto-rotation' {
+            # Order is load-bearing: Invoke-WarmAllSlots restores whichever
+            # slot was active when it started, so warming before a rotation
+            # would undo the rotation.
+            $order = [System.Collections.Generic.List[string]]::new()
+            Mock Invoke-AutoRotationStep -MockWith { $order.Add('rotate'); 'latch' }
+            Mock Invoke-KeepWarmStep     -MockWith { $order.Add('warm');   'latch' }
+
+            Invoke-WatchPoll -Session (New-WatchSession -Auto -Warmup) -Name '' -Threshold 95 -Auto -Warmup
+            $order -join ',' | Should -Be 'rotate,warm'
+        }
+
+        It 'reconciles before reading any slot bytes' {
+            # A refresh that landed since the last poll must be captured into
+            # the tracked slot before its token is used for the usage call.
+            $order = [System.Collections.Generic.List[string]]::new()
+            Mock Invoke-Reconcile  -MockWith { $order.Add('reconcile'); [pscustomobject]@{ Captured = $true } }
+            Mock Get-UsageSnapshot -MockWith { $order.Add('snapshot'); [pscustomobject]@{ Results = @(); NoSlots = $false } }
+
+            Invoke-WatchPoll -Session (New-WatchSession) -Name '' -Threshold 95
+            $order -join ',' | Should -Be 'reconcile,snapshot'
+        }
+
+        It 'passes -Aggregate to the title only under -Auto' {
+            # Under rotation the active slot moves under the user, so the
+            # title switches to the pool mean; bare -Watch keeps the
+            # per-slot alarm glance.
+            Invoke-WatchPoll -Session (New-WatchSession) -Name '' -Threshold 95
+            Should -Invoke Format-WatchTitle -Times 1 -Exactly -ParameterFilter { -not $Aggregate }
+
+            Invoke-WatchPoll -Session (New-WatchSession -Auto) -Name '' -Threshold 95 -Auto
+            Should -Invoke Format-WatchTitle -Times 1 -Exactly -ParameterFilter { $Aggregate }
         }
     }
 
