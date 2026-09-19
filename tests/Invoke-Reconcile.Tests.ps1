@@ -530,16 +530,37 @@ Describe 'switch_claude_account' {
             Get-Content -LiteralPath $script:GuardSlot -Raw | Should -Be $script:GuardOther
         }
 
-        # With no client running, nothing can be between a /login's two writes,
-        # so the offline answer stands and `sca list` stays network-free.
-        It 'does not probe at all when no client is running' {
+        # Test-ClaudeRunning misses an npm-installed Claude Code on Windows and
+        # macOS, so gating the probe on it would disable the guard on exactly
+        # those hosts and let the mirror overwrite the tracked login there.
+        It 'probes even when no client can be detected' {
             Mock Test-ClaudeRunning { $false }
+            MockProfileUuid -Uuid 'test-acct-uuid-INTRUDER' -Email 'intruder@example.com'
+
+            $r = Invoke-Reconcile 6>$null
+
+            $r.Action | Should -Be 'identity-change'
+            Get-Content -LiteralPath $script:GuardSlot -Raw |
+                Should -Be $script:CredsBody -Because 'an undetected client must not cost the tracked login'
+            Should -Invoke Invoke-RestMethod -Times 1 -ParameterFilter {
+                $Uri -eq 'https://api.anthropic.com/api/oauth/profile'
+            }
+        }
+
+        # The probe is the only network call on this branch, and reconcile
+        # returns at the hash-match check unless the bytes actually changed, so
+        # `sca list` pays it about once per token refresh, not once per run.
+        It 'does not probe when the bytes are unchanged' {
+            $hash = Get-SHA256Hex -Path $script:GuardCred
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash $hash | Out-Null
             Mock Invoke-RestMethod -ParameterFilter {
                 $Uri -eq 'https://api.anthropic.com/api/oauth/profile'
             } -MockWith { throw 'profile must not be called' }
 
             $r = Invoke-Reconcile 6>$null
-            $r.Action | Should -Be 'mirror'
+
+            $r.Action | Should -Be 'noop'
+            $r.Reason | Should -Be 'hash-match'
             Should -Invoke Invoke-RestMethod -Times 0 -ParameterFilter {
                 $Uri -eq 'https://api.anthropic.com/api/oauth/profile'
             }

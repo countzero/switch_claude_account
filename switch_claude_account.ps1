@@ -325,6 +325,10 @@ $Script:UsageEndpoint       = "https://api.anthropic.com/api/oauth/usage"
 # embedded `account_email`, which need not equal `account.email` here. The
 # uuid is the one field both paths agree on, which is why the identity guard
 # compares uuids and not emails.
+#
+# Compare those uuids case-INSENSITIVELY (PowerShell's default -eq): the same
+# binary lowercases them on some of its own comparison paths, so two records
+# of one account can differ in case alone.
 $Script:ProfileEndpoint     = "https://api.anthropic.com/api/oauth/profile"
 $Script:TokenEndpoint       = "https://platform.claude.com/v1/oauth/token"
 $Script:OAuthClientId       = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -2188,11 +2192,9 @@ function New-OAuthAccountFromProfile {
 # so its answer cannot lag them; it is the only probe that settles the question
 # rather than guessing at it.
 #
-# Compares accountUuid, never email. Claude Code fills ~/.claude.json's
-# emailAddress from the profile response on one path and from the access
-# token's own embedded account_email on another, so two records of the same
-# account can legitimately disagree about the email; both paths agree on the
-# uuid. See the $Script:ProfileEndpoint docblock for the extraction evidence.
+# Compares accountUuid, never email, and case-insensitively. See the
+# $Script:ProfileEndpoint docblock for why the email is not interchangeable
+# and why the case must not matter.
 #
 # -NoRefresh on the probe is not optional: this runs while a live Claude Code
 # may be mid-request on those exact tokens, and refreshing would rotate the
@@ -2221,9 +2223,6 @@ function Test-CredentialAccountMatch {
         return [pscustomobject]@{ Status = 'unknown'; Reason = 'profile-has-no-uuid' }
     }
 
-    # Case-insensitive by PowerShell's default -eq, deliberately: Claude Code
-    # lowercases uuids on some of its own comparison paths, so two records of
-    # one account can differ in case alone.
     $status = if ($probe.AccountUuid -eq $expected) { 'match' } else { 'mismatch' }
     return [pscustomobject]@{
         Status      = $status
@@ -2236,16 +2235,10 @@ function Test-CredentialAccountMatch {
 #
 # Compares accountUuid when both carry one, and falls back to emailAddress
 # otherwise, because Read-Sidecar requires an email but not a uuid: a sidecar
-# written before uuid capture has only the email to offer. Where the uuid
-# exists it is the better answer, and the email is actively unsafe: Claude Code
-# fills ~/.claude.json's emailAddress from the profile response on one login
-# path and from the access token's own embedded account_email on another, so
-# two records of one account can disagree about the email while both agree on
-# the uuid. See the $Script:ProfileEndpoint docblock for that evidence.
-#
-# Case-insensitive on both fields by PowerShell's default -eq, deliberately:
-# Claude Code lowercases uuids on some of its own comparison paths, so two
-# records of one account can differ in case alone.
+# written before uuid capture has only the email to offer. That fallback is a
+# concession to those sidecars, not a second opinion; see the
+# $Script:ProfileEndpoint docblock for why the email is the weaker answer and
+# why both comparisons are case-insensitive.
 function Test-SameOAuthAccount {
     Param (
         [AllowNull()] [pscustomobject] $Left,
@@ -2286,8 +2279,8 @@ function Test-SameOAuthAccount {
 # them.
 #
 # Split out of Invoke-Reconcile because this is the one decision there that is
-# neither a guard nor a write: four ways of answering a single question, two of
-# them costing a network round trip. Keeping it whole here is also what lets
+# neither a guard nor a write: three ways of answering a single question, one
+# of them costing a network round trip. Keeping it whole here is also what lets
 # the caller read as a flat dispatch over the three verdicts.
 function Confirm-TrackedSlotIdentity {
     Param (
@@ -2295,6 +2288,7 @@ function Confirm-TrackedSlotIdentity {
         [AllowNull()] [String] $IncomingEmail,
         [AllowNull()] [pscustomobject] $IncomingAccount,
         [AllowNull()] [String] $IncomingSource,
+        [Parameter(Mandatory)] [String] $CredentialPath,
         [Parameter(Mandatory)] [String] $Hash
     )
 
@@ -2317,17 +2311,18 @@ function Confirm-TrackedSlotIdentity {
     }
 
     # The email said "same account, only the tokens moved", and it came from
-    # the file that lags (see Test-ClaudeRunning). With no client running
-    # nothing can be inside that window and the offline answer stands; with one
-    # running, ask the tokens themselves, because this is the last moment at
-    # which the login in that slot file still exists. Gated rather than
-    # unconditional because the probe is a network round-trip on a path
-    # `sca list` also takes.
-    $probe = if (Test-ClaudeRunning) {
-        Test-CredentialAccountMatch -CredentialPath $CredFile -Sidecar $Slot.Sidecar
-    } else {
-        [pscustomobject]@{ Status = 'unknown'; Reason = 'no-client-running' }
-    }
+    # the file that lags (see Test-ClaudeRunning). Ask the tokens themselves,
+    # because this is the last moment at which the login in that slot file
+    # still exists.
+    #
+    # Unconditional, not gated on Test-ClaudeRunning. That guard misses an
+    # npm-installed Claude Code on Windows and macOS (see its docblock), and
+    # gating on it would silently disable this probe on exactly those hosts,
+    # leaving the overwrite it exists to prevent. The round trip is also
+    # cheaper than it looks: Invoke-Reconcile returns at the hash-match check
+    # unless the bytes actually changed, so this fires about once per token
+    # refresh rather than once per command.
+    $probe = Test-CredentialAccountMatch -CredentialPath $CredentialPath -Sidecar $Slot.Sidecar
 
     # Only a PROVEN mismatch overturns the offline answer. Treating "could not
     # ask" as "different account" would freeze every slot file behind an
@@ -2343,7 +2338,7 @@ function Confirm-TrackedSlotIdentity {
     # OLD account's tokens under the NEW account's name, which is precisely the
     # mislabelled slot `sca save` refuses to create, with no later pass to
     # correct it. A re-hash is cheap next to the request just made.
-    $stillSame = try { (Get-SHA256Hex -Path $CredFile) -eq $Hash } catch { $false }
+    $stillSame = try { (Get-SHA256Hex -Path $CredentialPath) -eq $Hash } catch { $false }
     if (-not $stillSame) {
         return [pscustomobject]@{ Verdict = 'moved'; SlotEmail = $slotEmail }
     }
@@ -2422,9 +2417,9 @@ function Confirm-TrackedSlotIdentity {
 # saw changed bytes and deliberately wrote nothing (identity-unresolved,
 # credentials-changed-mid-probe). Swapping on top of those discards a refresh
 # the tracked slot never received, leaving it holding a refresh token the
-# server has already rotated -- a dead login, and the one loss here that no
+# server has already rotated: a dead login, and the one loss here that no
 # later pass can repair. Callers must read the field rather than allowlist
-# Action values; the allowlist is what missed these two when they were added.
+# Action values, so a new non-capturing outcome cannot slip past them.
 #
 # `Captured` and "did the active slot move" are different questions. The
 # second is answered by Action alone (adopt / identity-change / auto-save all
@@ -2568,6 +2563,7 @@ function Invoke-Reconcile {
             $verdict = Confirm-TrackedSlotIdentity -Slot $slot -IncomingEmail $newEmail `
                                                    -IncomingAccount $newAccount `
                                                    -IncomingSource $sourceLabel `
+                                                   -CredentialPath $CredFile `
                                                    -Hash $hash
 
             if ($verdict.Verdict -eq 'same') {
@@ -2637,7 +2633,14 @@ function Invoke-Reconcile {
 # Self-contained on purpose: two of the three callers suppress reconcile's own
 # advisory (6>$null, to keep JSON parseable and watch frames intact), so this
 # is the only thing the user sees. It names the recovery for the same reason
-# the adopt advisory does -- nothing retries a refused action on its own.
+# the adopt advisory does: nothing retries a refused action on its own.
+#
+# Branches on Reason because the two outcomes have different recoveries. A
+# mid-probe move needs only a re-run. An unresolved identity does not, and the
+# `sca save` offered there carries its precondition: save resolves identity
+# from the same two sources that just failed, and refuses outright while
+# Claude Code is open, so naming it bare would send the user to a command that
+# refuses them for the reason they are already stuck on.
 function Get-UncapturedCredentialsRefusal {
     Param (
         [Parameter(Mandatory)] [pscustomobject] $Sync,
@@ -2645,11 +2648,17 @@ function Get-UncapturedCredentialsRefusal {
     )
 
     $stake = if ($Sync.Slot) {
-        "so the token refresh they carry would be lost and slot '$($Sync.Slot)' left holding a refresh token the server has already rotated. Re-run once an account can be resolved, or run 'sca save $($Sync.Slot)' to capture them now"
+        "the token refresh they carry would be lost and slot '$($Sync.Slot)' left holding a refresh token the server has already rotated"
     } else {
-        "so they would be lost with no saved copy anywhere. Re-run once an account can be resolved, or run 'sca save <name>' to capture them first"
+        "they would be lost with no saved copy anywhere"
     }
-    return "The active credentials could not be attributed to an account, so nothing captured them. '$ActionLabel' overwrites them, $stake."
+
+    if ($Sync.Reason -eq 'credentials-changed-mid-probe') {
+        return "The active credentials changed while their account was being verified, so nothing captured them. '$ActionLabel' overwrites them, and $stake. Re-run: the next pass reads them afresh."
+    }
+
+    $save = if ($Sync.Slot) { "'sca save $($Sync.Slot)'" } else { "'sca save <name>'" }
+    return "The active credentials could not be attributed to an account, so nothing captured them. '$ActionLabel' overwrites them, and $stake. Re-run once an account can be resolved; if it stays unresolved while you are online, close Claude Code and run $save to capture them by hand."
 }
 
 # We are extracting each action body into its own function so the logic
@@ -6421,6 +6430,17 @@ function Invoke-KeepWarmStep {
 
     if (Test-ClaudeRunning) {
         return '[Warmup] Re-warm refused! Claude Code is running.'
+    }
+
+    # Re-capture before the round-robin below overwrites .credentials.json once
+    # per slot. Same window, and the same reason, as Invoke-AutoRotationStep's:
+    # the poll reconciled before Get-UsageSnapshot, which then spent a full
+    # serial HTTP pass across every slot. This step runs later still, so a
+    # refresh landing in that window would be discarded here and never
+    # mirrored. See Invoke-Reconcile's `Captured`.
+    $sync = Invoke-Reconcile 6>$null
+    if (-not $sync.Captured) {
+        return '[Warmup] Re-warm refused! The active slot''s latest tokens could not be captured; retrying at the next poll.'
     }
 
     $list = ($cold | Sort-Object | ForEach-Object { "'$_'" }) -join ', '

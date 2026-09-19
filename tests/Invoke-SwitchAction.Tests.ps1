@@ -3,8 +3,9 @@
 
 # Pester 5 tests for Invoke-SwitchAction in switch_claude_account.ps1.
 #
-# Post-v2.1.0 contract:
-#   * Refuses to operate while Claude Code is running.
+# Contract:
+#   * Runs with Claude Code open; it follows the swap.
+#   * Refuses when reconcile could not capture the active credentials.
 #   * Refuses to switch to a slot that has no sidecar.
 #   * Restores the destination slot's captured oauthAccount into
 #     ~/.claude.json so /status displays the active slot's email.
@@ -280,9 +281,9 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-SwitchAction -Name 'alpha' 6>&1 | Out-String
 
-            # The retired [Info] apply hint must not reappear; the previous
-            # "Restart Claude Code…running sessions" wording from before
-            # the refuse-while-running guard is also gone.
+            # Switch output carries no apply hint: Claude Code follows the
+            # swap on its own, so telling the user to restart it would be
+            # wrong advice rather than merely redundant.
             $out | Should -Not -Match '\[Info\] Start'
             $out | Should -Not -Match 'running sessions may continue'
 
@@ -342,7 +343,6 @@ Describe 'switch_claude_account' {
                 mcpServers      = @{ memory = @{ command = 'mcp-memory' } }
                 customSomething = 'sentinel-value-xyz'
             }
-            $beforeRaw = Get-Content -LiteralPath $ClaudeJsonPath -Raw
 
             New-SlotPair -CredDir $script:CredDirPath -Name 'slot' -Email 'new@example.com' -Content 'X' | Out-Null
 
@@ -510,7 +510,7 @@ Describe 'switch_claude_account' {
                 displayName      = 'Old'
                 organizationName = 'old-org'
             })
-            $newSlot = New-SlotPair -CredDir $script:CredDirPath -Name 'new' -Content 'NEW_TARGET'
+            New-SlotPair -CredDir $script:CredDirPath -Name 'new' -Content 'NEW_TARGET' | Out-Null
 
             Set-Content -LiteralPath $script:CredFilePath -Value 'REFRESHED' -NoNewline
             Update-ScaState -ActiveSlot 'old' -LastSyncHash 'STALE_HASH' | Out-Null
@@ -564,6 +564,32 @@ Describe 'switch_claude_account' {
 
             $msg | Should -BeLike "*'sca save <name>'*"
             $msg | Should -Not -BeLike '*slot ''''*'
+        }
+
+        # 'sca save' resolves identity from the same two sources reconcile just
+        # failed on, and refuses outright while Claude Code is open, so naming
+        # it without its precondition sends the user to a command that will
+        # refuse them for the reason they are already stuck on.
+        It 'names the precondition on the save it recommends' {
+            $sync = [pscustomobject]@{ Action = 'noop'; Reason = 'identity-unresolved'; Slot = 'work'; Captured = $false }
+
+            $msg = Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca switch'
+
+            $msg | Should -BeLike '*close Claude Code*'
+        }
+
+        # The account WAS resolved on this path; the file moved under the
+        # probe. Saying "could not be attributed" would describe neither the
+        # cause nor the fix, and there is nothing to resolve before retrying.
+        It 'describes a mid-probe move as a move, not an unresolved identity' {
+            $sync = [pscustomobject]@{ Action = 'noop'; Reason = 'credentials-changed-mid-probe'; Slot = 'work'; Captured = $false }
+
+            $msg = Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca switch'
+
+            $msg | Should -BeLike '*changed while their account was being verified*'
+            $msg | Should -BeLike "*slot 'work'*"
+            $msg | Should -Not -BeLike '*could not be attributed to an account*'
+            $msg | Should -Not -BeLike '*sca save*'
         }
     }
 

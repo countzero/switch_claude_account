@@ -10,7 +10,8 @@
 # contexts in Invoke-UsageAction.Tests.ps1. Here we cover the action-level
 # contract: that monitor maps to the engine with -Auto set, threads -Threshold
 # and -KeepWarm through, ignores a positional name, and surfaces the
-# watch-engine guards (Claude-Code refusal, interactive-terminal requirement).
+# watch-engine guards. Plain `monitor` runs beside a live Claude Code; only
+# -KeepWarm refuses it, so the Claude-Code guard here is -KeepWarm's alone.
 # Per-test sandbox setup lives in tests/Common.ps1.
 
 BeforeAll {

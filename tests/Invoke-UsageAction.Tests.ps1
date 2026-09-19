@@ -1871,6 +1871,49 @@ Describe 'switch_claude_account' {
             $after.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-NEW'
         }
 
+        # -NoRefresh is what lets the identity guard probe .credentials.json
+        # while a live client may be mid-request on those exact tokens: a
+        # refresh would rotate the refresh token out from under it to answer a
+        # question. The inverse of the test above, on the same fixture.
+        It '-NoRefresh reports expired instead of rotating an expired token' {
+            $slot = New-ProfileSlot -Name 'norefresh' `
+                                    -AccessToken 'sk-ant-oat-OLD' `
+                                    -ExpiresAt   ([DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds())
+            Mock Update-SlotTokens { throw '-NoRefresh must not rotate tokens' }
+
+            $res = Get-SlotProfile -SlotPath $slot -NoRefresh
+
+            $res.Status    | Should -Be 'expired'
+            $res.Error     | Should -Match 'NoRefresh'
+            # Transport=$false: nothing was attempted, so a retry cannot differ.
+            $res.Transport | Should -BeFalse
+            Should -Invoke Update-SlotTokens -Times 0 -Exactly
+            Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter {
+                $Uri -eq 'https://api.anthropic.com/api/oauth/profile'
+            }
+            # The slot file is left byte-identical; nothing was rewritten.
+            (Get-Content -LiteralPath $slot -Raw | ConvertFrom-Json).claudeAiOauth.accessToken |
+                Should -Be 'sk-ant-oat-OLD'
+        }
+
+        It '-NoRefresh still answers normally while the token is valid' {
+            $slot = New-ProfileSlot -Name 'norefresh-ok'
+            Mock Update-SlotTokens { throw '-NoRefresh must not rotate tokens' }
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' } -MockWith {
+                return [pscustomobject]@{
+                    account      = [pscustomobject]@{ email = 'carol@example.com'; uuid = 'acct-uuid-carol' }
+                    organization = [pscustomobject]@{ uuid = 'org-uuid' }
+                }
+            }
+
+            $res = Get-SlotProfile -SlotPath $slot -NoRefresh
+
+            $res.Status      | Should -Be 'ok'
+            $res.Email       | Should -Be 'carol@example.com'
+            $res.AccountUuid | Should -Be 'acct-uuid-carol'
+            Should -Invoke Update-SlotTokens -Times 0 -Exactly
+        }
+
         It 'refresh 429 surfaces as rate-limited (not expired)' {
             $slot = New-ProfileSlot -Name 'rl' -ExpiresAt ([DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds())
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
@@ -3177,11 +3220,6 @@ Describe 'switch_claude_account' {
         }
     }
 
-    # The `usage -Auto` / `usage -Warmup` integration contexts were removed
-    # in 3.0.0: those flags moved to the `monitor` action. The watch-engine
-    # guards they exercised (Claude-Code refusal, interactive-terminal
-    # requirement) are now covered in Invoke-MonitorAction.Tests.ps1.
-
     Context 'anthropic-version header propagation' {
         # Defense-in-depth: assert that every authenticated request adds
         # the anthropic-version header so a future tightening at any
@@ -3976,6 +4014,34 @@ Describe 'switch_claude_account' {
 
             $out | Should -Be '[Warmup] Re-warm refused! Claude Code is running.'
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+        }
+
+        # The round-robin overwrites .credentials.json once per slot, and this
+        # step runs after the poll's reconcile AND after a full serial usage
+        # pass, so a refresh landing in that window would be discarded here.
+        # Same guard, same window, as Invoke-AutoRotationStep's.
+        It 'refuses (without warming) when reconcile could not capture the active credentials' {
+            Mock Invoke-Reconcile { New-ReconcileResult -Action 'noop' -Reason 'identity-unresolved' -Slot 'a' -Captured $false }
+            $times = @{}
+            $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 -CurrentLatch 'x'
+
+            $out | Should -Match '^\[Warmup\] Re-warm refused! .*could not be captured'
+            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+            # Not stamped: the slot was never attempted, so the next poll must
+            # be free to retry it as soon as the capture succeeds.
+            $times.ContainsKey('a') | Should -BeFalse
+        }
+
+        It 'reconciles before warming so the swap cannot discard a fresh refresh' {
+            Mock Invoke-Reconcile { New-ReconcileResult -Action 'mirror' -Slot 'a' }
+            $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x' | Out-Null
+
+            Should -Invoke Invoke-Reconcile -Times 1 -Exactly
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
         }
 
         It 'surfaces a warm-path exception as "Re-warm failed!" and still stamps the attempt' {
