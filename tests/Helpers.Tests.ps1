@@ -2340,6 +2340,102 @@ Describe 'switch_claude_account' {
             # No retry for non-429 (avoids hammering a deterministic 4xx).
             $script:attempts | Should -Be 1
         }
+
+        # The ladder assumes a per-token limiter that unlocks in seconds. The
+        # 429s measured on 2026-09-19 come from Cloudflare's edge and are keyed
+        # to the origin, so once one slot has drawn one, attempts 2 and 3 for
+        # every later slot in the same run are pure tally against the address.
+        It 'collapses to a single attempt once another slot holds a live backoff stamp' {
+            $Script:SlotUsageCache['X:\another-slot.json'] = @{
+                Data             = $null
+                Timestamp        = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+            $script:attempts = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:attempts++
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('429 Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            # Still surfaces the real 429 rather than falling out of the loop
+            # with $resp unset and reporting a bogus 'missing access_token'.
+            { Update-SlotTokens -SlotPath $script:slot 6>$null } |
+                Should -Throw -ExpectedMessage '*429*'
+
+            $script:attempts | Should -Be 1
+        }
+
+        It 'uses the full ladder again once the other slot stamp has expired' {
+            $Script:SlotUsageCache['X:\another-slot.json'] = @{
+                Data             = $null
+                Timestamp        = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(-1)   # expired
+            }
+            $script:attempts = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:attempts++
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('429 Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            { Update-SlotTokens -SlotPath $script:slot 6>$null } | Should -Throw
+
+            $script:attempts | Should -Be $Script:TokenRefreshRetryMax
+        }
+
+        It 'still collapses when the live stamp belongs to the slot being refreshed' {
+            # Reachable on a watch tick whose backoff expired between the
+            # short-circuit check and this refresh.
+            $Script:SlotUsageCache[$script:slot] = @{
+                Data             = $null
+                Timestamp        = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+            $script:attempts = 0
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                $script:attempts++
+                $resp  = [pscustomobject]@{ StatusCode = 429 }
+                $inner = [System.Exception]::new('429 Too Many Requests')
+                $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp
+                throw $inner
+            }
+
+            { Update-SlotTokens -SlotPath $script:slot 6>$null } | Should -Throw
+            $script:attempts | Should -Be 1
+        }
+    }
+
+    Context 'Test-TokenEndpointThrottled' {
+        It 'is false when the cache is empty' {
+            Test-TokenEndpointThrottled | Should -BeFalse
+        }
+
+        It 'is false when entries carry no backoff stamp' {
+            $Script:SlotUsageCache['X:\a.json'] = @{ Data = 'D'; Timestamp = [DateTime]::UtcNow }
+            Test-TokenEndpointThrottled | Should -BeFalse
+        }
+
+        It 'is true while any single entry is inside its window' {
+            $Script:SlotUsageCache['X:\a.json'] = @{ Data = 'D'; Timestamp = [DateTime]::UtcNow }
+            $Script:SlotUsageCache['X:\b.json'] = @{
+                Data = $null; Timestamp = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+            Test-TokenEndpointThrottled | Should -BeTrue
+        }
+
+        It 'is false once every window has passed' {
+            $Script:SlotUsageCache['X:\b.json'] = @{
+                Data = $null; Timestamp = [DateTime]::UtcNow
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(-1)
+            }
+            Test-TokenEndpointThrottled | Should -BeFalse
+        }
     }
 
     Context 'New-AutoSaveSlot (sidecar-write failure advisory)' {

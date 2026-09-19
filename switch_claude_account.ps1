@@ -3283,8 +3283,20 @@ function Update-SlotTokens {
     # 4xx with a malformed request or a 5xx with a server-side
     # problem). Tests override $Script:TokenRefreshRetryDelayMs to
     # zero so the mocked 429 paths complete instantly.
+    #
+    # One attempt only, once another slot has already drawn a 429 this run.
+    # Measured 2026-09-19: these 429s are served at Cloudflare's edge (Server:
+    # cloudflare, CF-RAY, and no Retry-After or rate-limit header of any kind),
+    # so they never reach the per-token limiter this ladder was written for. A
+    # bogus refresh token and a bogus authorization_code both drew 429 rather
+    # than invalid_grant, which puts the key on the origin, not the grant.
+    # Attempts 2 and 3 cannot clear that, and each is another tally against the
+    # address that tripped it. The first 429 of a run still pays full price,
+    # because nothing is known before it.
+    $maxAttempts = if (Test-TokenEndpointThrottled) { 1 } else { $Script:TokenRefreshRetryMax }
+
     $resp = $null
-    for ($attempt = 1; $attempt -le $Script:TokenRefreshRetryMax; $attempt++) {
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         try {
             $resp = Invoke-RestMethod -Method Post `
                                       -Uri $Script:TokenEndpoint `
@@ -3296,7 +3308,7 @@ function Update-SlotTokens {
         }
         catch {
             $is429 = Test-Is429 $_.Exception
-            if (-not $is429 -or $attempt -ge $Script:TokenRefreshRetryMax) {
+            if (-not $is429 -or $attempt -ge $maxAttempts) {
                 throw
             }
             # Exponential backoff: 2 s, 4 s, 8 s ... capped by RetryMax.
@@ -3525,6 +3537,17 @@ function Clear-SlotRateLimitBackoff {
     if ($Script:SlotUsageCache.ContainsKey($SlotPath)) {
         $Script:SlotUsageCache[$SlotPath].Remove('RateLimitedUntil')
     }
+}
+
+# Is ANY slot inside a live backoff window? Read from the per-slot stamps
+# rather than kept as a separate flag, so "we are throttled" has one record
+# and cannot drift from what Set-SlotRateLimitBackoff wrote.
+function Test-TokenEndpointThrottled {
+    $now = [DateTime]::UtcNow
+    foreach ($entry in $Script:SlotUsageCache.Values) {
+        if ($entry.RateLimitedUntil -and $now -lt $entry.RateLimitedUntil) { return $true }
+    }
+    return $false
 }
 
 # Read a slot's OAuth tokens and return a non-expired access token,
