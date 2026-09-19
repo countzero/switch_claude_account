@@ -387,6 +387,16 @@ $Script:UsageCacheMaxAgeMin = 360
 # the per-poll refresh storm on an expired idle-slot token. Tunable for tests.
 $Script:RateLimitBackoffSec = 120
 
+# The only conclusions `claude -p` can prove about a grant, and so the only
+# verdicts Set-SlotAuthVerdict records and ConvertTo-AuthVerdictMap accepts off
+# disk. The set is narrow on purpose: Resolve-AuthVerdictResult hands the stored
+# value to New-UsageResult's ValidateSet, so a status written by another version
+# would throw out of a Get-SlotUsage documented never to and take every row of
+# the reading with it, and an 'ok' would pass that set while carrying no Data,
+# scoring 0% in Get-RowMaxUtilization and presenting a slot nothing can be read
+# from as the preferred rotation target.
+$Script:AuthVerdictStatuses = @('expired', 'unauthorized')
+
 # Plan-usability thresholds used by Get-PlanStatus / Format-UsageTable /
 # Format-UsageVerbose. The Status column on the usage table mixes HTTP
 # health (expired / unauthorized / error / no-oauth) with plan-state
@@ -833,6 +843,11 @@ function Repair-CredentialFileModes {
 # Entries missing a status or a cred_hash are dropped rather than repaired: a
 # verdict with no cred_hash can never be matched against a slot file, so it
 # would sit in the file forever, and one with no status carries nothing.
+#
+# A status outside $Script:AuthVerdictStatuses is dropped for the same reason,
+# and this is the only place that can drop it: every reader downstream treats
+# the value as already trustworthy. See that constant for what an unfiltered
+# one costs.
 function ConvertTo-AuthVerdictMap {
     Param ($Parsed)
 
@@ -842,6 +857,7 @@ function ConvertTo-AuthVerdictMap {
     foreach ($prop in $Parsed.PSObject.Properties) {
         $v = $prop.Value
         if (-not $v -or -not $v.status -or -not $v.cred_hash) { continue }
+        if ([string]$v.status -notin $Script:AuthVerdictStatuses) { continue }
         $map[$prop.Name] = @{
             status    = [string]$v.status
             error     = if ($v.error) { [string]$v.error } else { $null }
@@ -3877,9 +3893,9 @@ function Get-SlotUsage {
         # retry once"). They differ in the reason they report, in whether the
         # retry sleeps first, and in how a doomed retry is labelled.
         if ($status -eq 429) {
-            # Stamp the backoff (no-op without a prior entry; see
-            # Set-SlotRateLimitBackoff) so subsequent polls stop re-tripping a
-            # hot limiter.
+            # Stamp the backoff, creating a throttle-only entry when the slot
+            # has none (see Set-SlotRateLimitBackoff), so subsequent polls stop
+            # re-tripping a hot limiter.
             Set-SlotRateLimitBackoff -SlotPath $SlotPath
             $fallback = Resolve-UsageFailureFallback -SlotPath $SlotPath -Reason 'rate-limit'
             if ($fallback) { return $fallback }
@@ -6412,7 +6428,7 @@ function Invoke-WarmAllSlots {
                     # and its own probe can be turned away before the server
                     # looks at the grant, so this is the only way that command
                     # can tell a dead login from a throttle.
-                    if ($r.Status -in @('expired', 'unauthorized')) {
+                    if ($r.Status -in $Script:AuthVerdictStatuses) {
                         Set-SlotAuthVerdict -SlotName $row.Name -SlotPath $row.Path `
                                             -Status $r.Status -ErrorMessage $r.Error
                     }
@@ -6655,9 +6671,12 @@ function Test-WatchInteractive {
 # lines instead of the entire loop body. Enter- returns the token Exit-
 # consumes; nothing else may read it.
 #
-# Both [Console]::CursorVisible halves are guarded: neither is reliable off
-# an attached Windows console, and an unguarded read aborted the whole watch
-# engine at startup on Linux and macOS. A $null Cursor means "not captured",
+# Enter-'s read of [Console]::CursorVisible and its write are both guarded:
+# neither is reliable off an attached Windows console, and an unguarded read
+# aborted the whole watch engine at startup on Linux and macOS. Exit- restores
+# through the API only where the capture succeeded, which confines its own
+# unguarded write to a console that already answered once.
+# A $null Cursor means "not captured",
 # and Exit-WatchTerminal skips the API restore on it rather than coercing
 # $null to $false and leaving the user's cursor hidden. The ESC[?25h in the
 # alt-buffer leave is what the cursor actually depends on; the API call is

@@ -740,6 +740,26 @@ Describe 'switch_claude_account' {
             $r.auth_verdicts.ContainsKey('good') | Should -BeTrue
         }
 
+        It 'drops a status outside the set claude -p can prove' {
+            # Nothing sca writes can produce these, but a state file from
+            # another version can, and every reader downstream treats the value
+            # as already trustworthy. Resolve-AuthVerdictResult hands it to
+            # New-UsageResult's ValidateSet, so 'revoked' would throw out of a
+            # Get-SlotUsage documented never to and take the whole reading with
+            # it; 'ok' would pass that set while carrying no Data, score 0% in
+            # Get-RowMaxUtilization and make a slot nothing can be read from the
+            # preferred rotation target.
+            $stateJson = '{"schema":1,"active_slot":"work","last_sync_hash":"h","auth_verdicts":{' +
+                         '"kept":{"status":"unauthorized","error":"e","cred_hash":"abc"},' +
+                         '"future":{"status":"revoked","error":"e","cred_hash":"abc"},' +
+                         '"healthy":{"status":"ok","error":"e","cred_hash":"abc"}}}'
+            Set-Content -LiteralPath $StateFile -Value $stateJson -NoNewline -Encoding utf8NoBOM
+
+            $r = Read-ScaState
+            $r.auth_verdicts.Count | Should -Be 1
+            $r.auth_verdicts.ContainsKey('kept') | Should -BeTrue
+        }
+
         It 'tolerates a state file with no auth_verdicts block at all' {
             Set-Content -LiteralPath $StateFile -Value '{"schema":1,"active_slot":"w","last_sync_hash":"h"}' -NoNewline -Encoding utf8NoBOM
 
