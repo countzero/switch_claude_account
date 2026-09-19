@@ -1149,6 +1149,31 @@ function Test-ClaudeNodeProcess {
     return $false
 }
 
+# Parse ~/.claude.json once, reporting WHY there is no usable object rather
+# than collapsing every cause into $null. State is 'absent' | 'unreadable' |
+# 'ok'; Object is the parsed file on 'ok' and $null otherwise. Never throws.
+#
+# The distinction exists for Invoke-Reconcile's adopt branch, which reacts to a
+# failed identity write by asking whether the file holds an identity that write
+# would have gone stale against. An absent file holds none and the adoption is
+# safe; an unreadable one may hold any identity at all and it is not. Reading
+# both as "no identity" is how the guard came to stand down in the very case
+# most likely to need it, since an unreadable file is also the likeliest reason
+# the write failed.
+function Read-ClaudeJson {
+    if (-not (Test-Path -LiteralPath $ClaudeJsonPath)) {
+        return [pscustomobject]@{ State = 'absent'; Object = $null }
+    }
+    try {
+        $obj = Get-Content -LiteralPath $ClaudeJsonPath -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+        return [pscustomobject]@{ State = 'ok'; Object = $obj }
+    }
+    catch {
+        return [pscustomobject]@{ State = 'unreadable'; Object = $null }
+    }
+}
+
 # Read Claude Code's `oauthAccount` block out of ~/.claude.json. Returns a
 # pscustomobject with the whitelisted identity fields when the file exists,
 # parses, and contains a populated oauthAccount.emailAddress; otherwise $null.
@@ -1158,21 +1183,16 @@ function Test-ClaudeNodeProcess {
 # over time and should not round-trip through sca):
 #   accountUuid, emailAddress, organizationUuid, displayName, organizationName
 #
-# Failure modes (all -> $null, never throws):
+# Failure modes (all -> $null, never throws). A caller that has to tell them
+# apart wants Read-ClaudeJson, which is where the first two are distinguished:
 #   * file missing                     (fresh install / Claude Code never run)
 #   * file unparseable                 (corrupt JSON; Claude Code probably broken too)
 #   * no oauthAccount key              (logged out / API-key-only mode)
 #   * oauthAccount.emailAddress empty  (incomplete cache; treat as no identity)
 function Get-OAuthAccountFromClaudeJson {
-    if (-not (Test-Path -LiteralPath $ClaudeJsonPath)) { return $null }
-
-    try {
-        $obj = Get-Content -LiteralPath $ClaudeJsonPath -Raw -ErrorAction Stop |
-            ConvertFrom-Json -ErrorAction Stop
-    }
-    catch {
-        return $null
-    }
+    $parsed = Read-ClaudeJson
+    if ($parsed.State -ne 'ok') { return $null }
+    $obj = $parsed.Object
 
     if (-not $obj.oauthAccount) { return $null }
     $oa = $obj.oauthAccount
@@ -2467,9 +2487,17 @@ function Invoke-Reconcile {
         # A failed write only splits the two files when ~/.claude.json holds an
         # identity to disagree with. It also throws when there is none to hold
         # (file absent, or never signed in), and that case is safe: nothing can
-        # go stale against the adoption, so it stands and only the display
-        # lags. $newEmail was resolved from that same file at the top.
-        if ($identityError -and $newEmail -and $newEmail -ne $twin.Email) {
+        # go stale against the adoption, so it stands and only the display lags.
+        #
+        # $newEmail cannot tell those apart. Its resolver answers $null for an
+        # unreadable file exactly as for an absent one, and an unreadable file
+        # is itself the likeliest reason the write above threw, so the proxy
+        # read "nothing to disagree with" in the one case most likely to
+        # disagree. Ask the file directly and let the adoption stand only where
+        # the absence of an identity is proven.
+        $claudeJsonState = if ($identityError) { (Read-ClaudeJson).State } else { 'ok' }
+        if ($identityError -and (($claudeJsonState -eq 'unreadable') -or
+                                 ($newEmail -and $newEmail -ne $twin.Email))) {
             Write-Color "[Sync] Active credentials match saved slot $twinIdent, but ~/.claude.json could not be pointed at it ($identityError), so the active slot is left as it was rather than split across the two files. Fix that and re-run, or run 'sca switch $($twin.Name)'." 'Yellow'
             return [pscustomobject]@{
                 Action   = 'noop'
@@ -3317,25 +3345,41 @@ function Update-SlotTokens {
     if ($state -and $state.active_slot) {
         $activeSlot = Find-SlotByName -Name $state.active_slot
         if ($activeSlot -and $activeSlot.Path -eq $SlotPath) {
-            try {
-                Set-CredentialFileAtomic -Path $CredFile -Bytes $newBytes
-
-                $newHash = Get-SHA256Hex -Bytes $newBytes
-                Update-ScaState -LastSyncHash $newHash | Out-Null
+            # Only mirror onto bytes a reconcile actually captured. This write
+            # reaches .credentials.json from `sca usage` and from every monitor
+            # poll, neither of which refuses on Invoke-Reconcile's
+            # `Captured = $false`, so without this check it overwrites bytes no
+            # slot holds a copy of and then stamps last_sync_hash over the
+            # evidence that they were ever unreconciled.
+            #
+            # Only a PROVEN mismatch blocks it, matching the rule the identity
+            # guard follows: a file that cannot be hashed, or a state with no
+            # hash to compare against, must not be able to freeze the mirror.
+            $liveHash = try { Get-SHA256Hex -Path $CredFile } catch { $null }
+            if ($state.last_sync_hash -and $liveHash -and $liveHash -ne $state.last_sync_hash) {
+                Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but .credentials.json holds bytes no slot has captured, so they were left alone rather than overwritten. Re-run once an account can be resolved, or run 'sca switch $($state.active_slot)' to propagate this slot's tokens deliberately." 'Yellow'
             }
-            catch {
-                # Slot file holds the new tokens; .credentials.json still
-                # has the old ones. The next Invoke-Reconcile will hash-
-                # match-noop (state.last_sync_hash equals .credentials.json's
-                # current bytes) so this gap does NOT auto-heal -- the
-                # mirror direction is .credentials.json -> slot, never the
-                # reverse. The user must re-propagate explicitly via
-                # `sca switch <slot>` (which writes the slot's bytes back
-                # into .credentials.json). Until they do, Anthropic may
-                # have rotated the refresh_token we just consumed; Claude
-                # Code reading the stale .credentials.json could fail its
-                # own next refresh and require re-login.
-                Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but propagation to .credentials.json failed: $($_.Exception.Message). Run 'sca switch $($state.active_slot)' to propagate manually; otherwise Claude Code's own refresh may fail and require re-login." 'Yellow'
+            else {
+                try {
+                    Set-CredentialFileAtomic -Path $CredFile -Bytes $newBytes
+
+                    $newHash = Get-SHA256Hex -Bytes $newBytes
+                    Update-ScaState -LastSyncHash $newHash | Out-Null
+                }
+                catch {
+                    # Slot file holds the new tokens; .credentials.json still
+                    # has the old ones. The next Invoke-Reconcile will hash-
+                    # match-noop (state.last_sync_hash equals .credentials.json's
+                    # current bytes) so this gap does NOT auto-heal -- the
+                    # mirror direction is .credentials.json -> slot, never the
+                    # reverse. The user must re-propagate explicitly via
+                    # `sca switch <slot>` (which writes the slot's bytes back
+                    # into .credentials.json). Until they do, Anthropic may
+                    # have rotated the refresh_token we just consumed; Claude
+                    # Code reading the stale .credentials.json could fail its
+                    # own next refresh and require re-login.
+                    Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but propagation to .credentials.json failed: $($_.Exception.Message). Run 'sca switch $($state.active_slot)' to propagate manually; otherwise Claude Code's own refresh may fail and require re-login." 'Yellow'
+                }
             }
         }
         elseif (-not $activeSlot) {

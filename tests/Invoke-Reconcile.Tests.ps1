@@ -318,6 +318,39 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'may lag'
         }
 
+        # The case above is safe because the file is READABLE and provably
+        # carries no identity. An unreadable one proves nothing: it may name
+        # any account, and it is also the likeliest reason the identity write
+        # threw in the first place, so deciding on the resolved email alone
+        # stood the guard down in exactly the case that needs it. The two
+        # causes are distinguished by Read-ClaudeJson, not by whether an email
+        # came back.
+        It 'refuses to adopt while ~/.claude.json is unreadable' {
+            $credFile  = Join-Path $script:CD '.credentials.json'
+            $otherBody = '{"claudeAiOauth":{"accessToken":"sk-ant-oat-OTHER","refreshToken":"sk-ant-ort-OTHER","expiresAt":9999999999999}}'
+            $workFile = New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content $script:CredsBody
+            $persFile = New-SlotPair -CredDir $script:CD -Name 'personal' -Email 'bob@example.com' -Content $otherBody
+            Set-Content -LiteralPath $credFile -Value $otherBody -NoNewline
+            # Truncated mid-object: Get-Content succeeds, ConvertFrom-Json does
+            # not, and the identity write throws on the missing block. One
+            # cause, both failures, which is the pairing the old guard missed.
+            Set-Content -LiteralPath $ClaudeJsonPath -Value '{"numStartups":' -NoNewline -Encoding utf8NoBOM
+            Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE_HASH' | Out-Null
+
+            $out = Invoke-Reconcile 6>&1 | Out-String
+
+            # Tracking stays put, so the next run re-enters this branch once
+            # the file is readable rather than acting on a half-applied swap.
+            $st = Read-ScaState
+            $st.active_slot    | Should -Be 'work'
+            $st.last_sync_hash | Should -Be 'STALE_HASH'
+            Get-Content -LiteralPath $workFile -Raw | Should -Be $script:CredsBody
+            Get-Content -LiteralPath $persFile -Raw | Should -Be $otherBody
+
+            $out | Should -Match 'could not be pointed at it'
+            $out | Should -Match "run 'sca switch personal'"
+        }
+
         It 'prints a yellow advisory naming the adopted slot' {
             $credFile  = Join-Path $script:CD '.credentials.json'
             $otherBody = '{"claudeAiOauth":{"accessToken":"sk-ant-oat-OTHER","refreshToken":"sk-ant-ort-OTHER","expiresAt":9999999999999}}'

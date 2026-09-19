@@ -640,6 +640,80 @@ Describe 'switch_claude_account' {
                 Should -Be (Get-FileHash -LiteralPath $script:CredFilePath -Algorithm SHA256).Hash
         }
 
+        # The propagation above is the one write reaching .credentials.json
+        # from a read-only command: `sca usage` and every monitor poll
+        # reconcile without refusing on `Captured = $false`, so bytes a
+        # reconcile deliberately declined to attribute were still overwritten
+        # here, and the last_sync_hash update then erased the evidence that
+        # they had ever been unreconciled. Driven through Update-SlotTokens
+        # directly, as the sidecar-less case below is, because reaching it via
+        # Invoke-UsageAction would reconcile the very bytes under test.
+        It 'refresh does NOT propagate onto active credentials no slot has captured' {
+            $slotPath = New-Slot -Name 'activeStale' -AccessToken 'sk-ant-oat-OLD' -ExpiresAt $script:PastMs
+
+            # Seed state as though a reconcile had captured the slot's bytes...
+            Copy-Item -LiteralPath $slotPath -Destination $script:CredFilePath -Force
+            $hash = (Get-FileHash -LiteralPath $script:CredFilePath -Algorithm SHA256).Hash
+            Update-ScaState -ActiveSlot 'activeStale' -LastSyncHash $hash | Out-Null
+
+            # ...then let another writer land bytes nothing has captured, which
+            # is what an identity-unresolved reconcile leaves behind.
+            $uncaptured = '{"claudeAiOauth":{"accessToken":"sk-ant-oat-UNCAPTURED","refreshToken":"sk-ant-ort-UNCAPTURED","expiresAt":9999999999999}}'
+            Set-Content -LiteralPath $script:CredFilePath -Value $uncaptured -NoNewline
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]@{
+                    access_token  = 'sk-ant-oat-NEW'
+                    refresh_token = 'sk-ant-ort-NEW'
+                    expires_in    = 3600
+                }
+            }
+
+            $out = Update-SlotTokens -SlotPath $slotPath 6>&1 | Out-String
+
+            $out | Should -Match 'no slot has captured'
+            $out | Should -Match 'sca switch activeStale'
+
+            # The slot file still takes the rotation: the refresh happened and
+            # the tokens have to be recorded somewhere.
+            $slotJson = Get-Content -LiteralPath $slotPath -Raw | ConvertFrom-Json
+            $slotJson.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-NEW'
+
+            # The uncaptured bytes survive untouched, and the hash still names
+            # the pre-refresh state, so the next reconcile sees them as changed.
+            Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be $uncaptured
+            (Read-ScaState).last_sync_hash | Should -Be $hash
+        }
+
+        # Only a PROVEN mismatch blocks the propagation. A state with no
+        # last_sync_hash has nothing to compare against, and freezing the
+        # mirror there would strand the active slot on the first refresh after
+        # a state file was rebuilt.
+        It 'refresh still propagates when state carries no sync hash to compare' {
+            $slotPath = New-Slot -Name 'activeStale' -AccessToken 'sk-ant-oat-OLD' -ExpiresAt $script:PastMs
+
+            Copy-Item -LiteralPath $slotPath -Destination $script:CredFilePath -Force
+            # Written directly rather than through Update-ScaState: with no
+            # state file on disk, Read-ScaState auto-migrates by hashing
+            # .credentials.json against the slots, and the match would bootstrap
+            # the very hash this case is about not having.
+            Write-ScaState -State ([pscustomobject]@{ active_slot = 'activeStale'; last_sync_hash = $null })
+            (Read-ScaState).last_sync_hash | Should -BeNullOrEmpty
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]@{
+                    access_token  = 'sk-ant-oat-NEW'
+                    refresh_token = 'sk-ant-ort-NEW'
+                    expires_in    = 3600
+                }
+            }
+
+            Update-SlotTokens -SlotPath $slotPath 6>$null | Out-Null
+
+            $credJson = Get-Content -LiteralPath $script:CredFilePath -Raw | ConvertFrom-Json
+            $credJson.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-NEW'
+        }
+
         # When state.active_slot points at a slot whose sidecar is
         # missing (legacy install, lost sidecar from a failed save's
         # rollback, or a sidecar-less auto-save), Find-SlotByName
