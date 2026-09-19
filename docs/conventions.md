@@ -81,20 +81,33 @@ reversible at any release; nothing reads the prefixes.
 
 ## Changelog
 
-`CHANGELOG.md` follows [Common Changelog](https://common-changelog.org) with four
+`CHANGELOG.md` follows [Common Changelog](https://common-changelog.org) with two
 deliberate deviations. They share one reason: this is a single-maintainer repository
 whose git history is public and reachable, so the changelog is written for a reader
 deciding whether to upgrade, not as an index into commits.
 
-| Deviation | Spec | Why |
-| ------------------------------------------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| No commit or pull-request reference on an entry | §2.4.2, "changes must reference relevant commits" | A reference exists to let a reader reach the reasoning. Here the reasoning is already in the entry, and `git log --grep` reaches the commit from any phrase in it. Links on every entry would be maintenance with no reader. |
-| No release link on a version heading | §2.2 | The same: the tag is discoverable from the version, and a reference-link block is one more thing to forget at release time. |
-| An `Unreleased` section exists | §6.2 | The objection in §6.2 is that a contributor cannot add self-references to an unreleased entry. Having declined references, the objection does not apply, and an `Unreleased` section is how work in progress stays visible between releases. |
-| Some entries run past one line | §3.6 | §3.6 sends the long form to "commits or other references". Having declined references, the changelog is the only place it can go. An entry should still lead with the one-line change and put the reasoning after it, so the first clause stays skimmable. |
+| Deviation                                       | Spec                                              | Why                                                                                                                                                                                                                                          |
+| ----------------------------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| No commit or pull-request reference on an entry | §2.4.2, "changes must reference relevant commits" | A reference exists to let a reader reach the reasoning. The reasoning is in the commit body, and `git log --grep` reaches it from any phrase in the entry. One on every entry would be maintenance with no reader.                           |
+| An `Unreleased` section exists                  | §6.2                                              | The objection in §6.2 is that a contributor cannot add self-references to an unreleased entry. Having declined references, the objection does not apply, and an `Unreleased` section is how work in progress stays visible between releases. |
 
 Everything else holds: the four categories in order (`Changed`, `Added`, `Removed`,
-`Fixed`), imperative mood, `**BREAKING**` in bold on a breaking change, ISO dates, and
-no entry for a change a consumer cannot observe.
+`Fixed`), imperative mood, `**BREAKING**` in bold on a breaking change, ISO dates,
+a release link per version heading as a reference-link block at the foot of the file,
+and no entry for a change a consumer cannot observe.
+
+An entry is **one line**: what changed, not why. Around 100 characters, and past 200
+it is either two changes or a sentence of reasoning that belongs in the commit. §3.6
+sends the long form to "commits or other references", and declining the references
+does not make the commits unreachable, which is what the old fourth deviation assumed.
+Measured before it was dropped: where entries were long, the commits of that era
+carried 550-650 characters of body each; where commit bodies were sparse, the entries
+were already at 100.
+
+A version heading may carry one **italic line** beneath it, for anything that makes
+upgrading more than replacing the file: a new minimum version of something else, a
+command that can now refuse, a migration that runs on first read. It is the first
+thing a reader deciding whether to upgrade needs, and the one place a longer sentence
+earns its room.
 
 `CHANGELOG.md` is edited as a step of a release, not per pull request.
