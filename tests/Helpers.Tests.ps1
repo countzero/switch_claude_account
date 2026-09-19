@@ -835,6 +835,20 @@ Describe 'switch_claude_account' {
             Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
                 Should -Be '[~] 89% | 89% | Switch Claude Account'
         }
+
+        It '-Aggregate counts a 7d-capped row as fully burned in the Session number' {
+            # 5h = (100 + 0)/2 = 50: row 'a' reads 0% on its own 5h bucket but
+            # is at the weekly cap, so that session capacity is unreachable.
+            # 7d = (100 + 20)/2 = 60, untouched. Shares Get-PoolMeanUtilization
+            # with the bar above the table, so the two cannot drift; the math
+            # itself is pinned in Invoke-UsageAction.Tests.ps1.
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil = 0; SevenUtil = 100; IsActive = $true }
+                @{ Name = 'b'; FiveUtil = 0; SevenUtil = 20 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[~] 50% | 60% | Switch Claude Account'
+        }
     }
 
     Context 'Watch-mode VT control rendering' {

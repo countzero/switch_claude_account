@@ -4651,12 +4651,19 @@ function Get-AggregateBarColor {
 #                  list.
 #   * $BucketKey - 'five_hour' or 'seven_day'.
 #
+# A row at the 7d hard cap ($Script:UtilLimitPct) contributes 100 to the
+# five_hour mean whatever its own 5h bucket reads: a 5h window is nested in
+# the 7d one, so while the week refuses prompts none of that slot's session
+# capacity is reachable. One-way on purpose -- a 5h cap costs the week at
+# most 5h of 168 -- so the seven_day mean keeps each row's own number.
+#
 # Return:
 #   * Integer in [0, 100], rounded with [math]::Round, when at least one
-#     eligible row exists. Math: sum of per-row utilization (each clamped
-#     to [0,100]; null or missing counted as 0, which by Select-LiveBuckets
-#     also covers a window that has rolled) divided by cap = N*100, scaled
-#     to percent. Equivalently the mean utilization across all eligible rows.
+#     eligible row exists. Math: sum of per-row effective utilization (each
+#     clamped to [0,100]; null or missing counted as 0, which by
+#     Select-LiveBuckets also covers a window that has rolled) divided by
+#     cap = N*100, scaled to percent. Equivalently the mean effective
+#     utilization across all eligible rows.
 #   * $null when zero eligible rows. Callers decide what to render for
 #     the empty case (Format-AggregateBars emits nothing; Format-WatchTitle
 #     collapses to bare suffix).
@@ -4681,6 +4688,13 @@ function Get-PoolMeanUtilization {
         # A bucket whose window has rolled is already gone (Select-LiveBuckets)
         # and therefore counts 0 here, exactly as a missing one does.
         $u = Get-BucketUtilizationOrZero -Bucket $r.Data.$BucketKey
+
+        # A capped week takes the session down with it; see the docblock.
+        if ($BucketKey -eq 'five_hour' -and
+            (Get-BucketUtilizationOrZero -Bucket $r.Data.seven_day) -ge $Script:UtilLimitPct) {
+            $u = 100
+        }
+
         if ($u -lt 0)   { $u = 0 }
         if ($u -gt 100) { $u = 100 }
         $usedSum += $u
@@ -4735,6 +4749,8 @@ function Test-RowIsMeasurable {
 # Slot inclusion rules (Test-RowIsMeasurable):
 #   * Status='ok', or any row carrying Data from the cache fallback.
 #   * Buckets with null/missing utilization counted as 0% used.
+#   * A row at the 7d hard cap counts 100% used on the Session bar too; see
+#     Get-PoolMeanUtilization for why the rule runs one way only.
 #
 # Color thresholds via $Script:AggregateRedPct / $Script:AggregateYellowPct.
 #

@@ -1410,6 +1410,20 @@ Describe 'switch_claude_account' {
             $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+100%\s*$'
         }
 
+        It 'renders a 7d-capped row as fully burned on the Session bar' {
+            # Keeps the rendered bar wired to Get-PoolMeanUtilization's cap
+            # substitution, which is unit-tested on its own below: both rows
+            # read 0% in their own 5h bucket, yet 'a' is at the weekly cap so
+            # Session = (100 + 0)/200 = 50% used, matching Week.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 0 -SevenUtil 100)
+                (New-OkRow -Name 'b' -FiveUtil 0 -SevenUtil 0)
+            )
+            $out = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
+            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+50%\s*$'
+            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+50%\s*$'
+        }
+
         It 'each rendered bar line equals TotalLineWidth (fits to table edge)' {
             $rows = @( (New-OkRow -Name 'a' -FiveUtil 50 -SevenUtil 50) )
             $w    = 70
@@ -1605,6 +1619,50 @@ Describe 'switch_claude_account' {
                 }
             )
             Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 90
+        }
+
+        # A slot at the weekly hard cap serves no prompt until the week
+        # resets, so the session capacity nested inside that week is
+        # unreachable and the pool has none of it left to offer. These four
+        # pin the substitution, its boundary, and the direction it does not
+        # run in.
+
+        It 'counts a 7d-capped row as fully burned in the Session mean' {
+            # 5h mean = (100 + 0)/2 = 50, not (0 + 0)/2 = 0. Row 'a' reads 0%
+            # on its own 5h bucket and still cannot serve a single prompt.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 0 -SevenUtil 100)
+                (New-OkRow -Name 'b' -FiveUtil 0 -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 50
+        }
+
+        It 'counts a 7d-capped row as fully burned with no five_hour bucket at all' {
+            # The missing-bucket path: 'no 5h reading' and 'a 5h reading of 0'
+            # are the same unreachable capacity once the week is capped.
+            $rows = @( New-OkRow -Name 'a' -SevenUtil 100 )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 100
+        }
+
+        It 'leaves the Week mean alone for a 5h-capped row (the rule is one-way)' {
+            # 7d mean = (20 + 0)/2 = 10, NOT (100 + 0)/2 = 50. A capped 5h
+            # window costs the week at most 5h of 168, so row 'a' keeps its
+            # 80% of weekly headroom. Inverse-axis check on the Session test
+            # above: without it, a symmetric rule would pass both.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 100 -SevenUtil 20)
+                (New-OkRow -Name 'b' -FiveUtil 0   -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'seven_day' | Should -Be 10
+        }
+
+        It 'fires at UtilLimitPct (100) exactly, not one point below' {
+            # 99% of a week still leaves reachable session capacity, so the
+            # substitution must not creep down into the 'near limit' tier.
+            $near = @( New-OkRow -Name 'a' -FiveUtil 0 -SevenUtil  99 )
+            $at   = @( New-OkRow -Name 'a' -FiveUtil 0 -SevenUtil 100 )
+            Get-PoolMeanUtilization -Results $near -BucketKey 'five_hour' | Should -Be 0
+            Get-PoolMeanUtilization -Results $at   -BucketKey 'five_hour' | Should -Be 100
         }
     }
 

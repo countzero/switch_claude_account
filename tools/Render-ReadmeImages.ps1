@@ -28,6 +28,12 @@
     text as the source of truth and colorising it is simpler than
     reverse-engineering inputs that round-trip through the real renderer.
 
+    The Session bar of 40% does not average the visible Session cells
+    either, but that one is exactly what the renderer would emit: 'legacy'
+    sits at the 100% Week cap, so Get-PoolMeanUtilization scores its
+    unreachable session capacity as 100 rather than the 12% its cell
+    prints. Do not "correct" it to the 23% the cells alone suggest.
+
     One deliberate divergence from the README's pre-image ASCII: the bar's
     empty portion is rendered with `▓` (medium shade block, U+2593) rather
     than spaces. That matches what `Format-AggregateBars` actually emits
@@ -148,12 +154,12 @@ $RED    = "$ESC[38;2;231;72;86m"    # #E74856  Campbell Brt Red     (Red)
 $GRAY   = "$ESC[38;2;204;204;204m"  # #CCCCCC  Campbell White       (Gray)
 
 # --- Block 1: usage -Watch (README ~lines 17-33) ---------------------------
-# Multi-slot watch frame with 5 rows; bars at 22% (green) / 62% (yellow);
+# Multi-slot watch frame with 5 rows; bars at 40% (green) / 62% (yellow);
 # trailing [Watch] footer in DarkGray.
 $watchLines = @(
     "$DKYEL[Usage] Plan usage$RESET",
     "",
-    "$GREEN  Session [█████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  22%$RESET",
+    "$GREEN  Session [███████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  40%$RESET",
     "",
     "$YELLO  Week    [███████████████████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  62%$RESET",
     "",
@@ -232,7 +238,7 @@ $watchAutoLines = @(
     "$DKYEL[Usage] Plan usage$RESET$autoHeaderPad$GRAY$autoGlyph$RESET$DKGRY switching slot at 95%$RESET",
     "",
     "",
-    "$GREEN  Session [█████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  22%$RESET",
+    "$GREEN  Session [███████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  40%$RESET",
     "",
     "$YELLO  Week    [███████████████████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  62%$RESET",
     "",
