@@ -48,6 +48,32 @@ pass whether or not the pinned OAuth constants still match the shipping Claude C
 build. Only a live `sca usage` detects that drift
 (`docs/claude-code-internals.md` → *Re-extraction recipe*).
 
+## Real-terminal probe
+
+```powershell
+pwsh -NoProfile -File tests/Invoke-WatchPtyProbe.ps1
+```
+
+Linux and macOS only; a no-op that exits 0 on Windows. Runs in CI on both those
+matrix legs after the suite.
+
+Pester runs with stdout redirected, because that is what a test host is, and under
+redirection the console cursor API is a no-op or throws while the alternate screen
+buffer is a string in a `StringWriter`. The suite can therefore prove the watch
+lifecycle does not crash and cannot prove it works. This probe re-enters itself under
+`script(1)`, whose pseudo terminal makes `[Console]::IsOutputRedirected` false, so the
+interactive guard passes and `Enter-WatchTerminal` runs against a real console handle.
+It then asserts the six VT markers that bracket a session: alt buffer in and out,
+cursor hide and restore, one frame paint, one title set.
+
+Only the network and credential boundary is stubbed, and `CLAUDE_CONFIG_DIR` is
+pointed at a temporary directory so the operator's real login is never in reach. The
+run bounds itself by a counted number of redraws rather than a wall clock, so it
+cannot flake on a slow runner.
+
+Windows is out of scope: it has no `script(1)`, and ConPTY is disproportionate for one
+probe. It keeps the suite and the coverage gate.
+
 ## Complexity diagnostic
 
 Advisory, on-demand, not part of the suite or any gate:
