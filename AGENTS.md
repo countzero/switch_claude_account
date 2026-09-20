@@ -68,7 +68,7 @@ Comments explain **why**, not **what**. Default to no comment; prefer a clearer 
 
 ## Scratch files
 
-Ad-hoc agent artifacts (screenshots, diffs, scratch scripts, traces) go under `.tmp/sessions/<session-id>/`. `.tmp/` is gitignored. Never write scratch files to `.claude/`, the repo root, or `tests/`.
+Every ad-hoc artifact of an agent session (screenshots, diffs, scratch scripts, traces: anything not meant to be committed) goes under `.tmp/sessions/<session-id>/` at the repo root, `<session-id>` per rule 3 in *Multi-Agent Working Tree Discipline*; `.tmp/` is gitignored. Nowhere else: not `.claude/`, not the repo root, not `tests/` or `tools/`, and not the operating-system temp directory under any name or helper (`$env:TEMP`, `os.tmpdir()`), which sits outside the workspace.
 
 ## Multi-Agent Working Tree Discipline
 
@@ -76,7 +76,7 @@ Multiple agents may share this directory; foreign uncommitted changes and untrac
 
 1. **Foreign changes off-limits.** Never run `git checkout --`, `restore --`, `reset --hard`, `clean`, `rm`, `mv`, or `git stash pop/apply` on a path another agent modified or an untracked file another agent created. "Commit and push" does NOT authorize destructive cleanup of foreign paths.
 2. **Preflight.** `git status --porcelain -u` at task start and again before `git commit`.
-3. **Session-scoped scratch.** Use `<session-id>` from your runtime's session metadata if exposed; otherwise mint `YYYYMMDD-HHMMSS-<random6>`.
+3. **Session-scoped scratch.** At task start take `SESSION_ID` from your session-start context (Claude Code) or the shell environment (OpenCode, where it is spent unread in a command and read once with `Write-Output $env:SESSION_ID` for a Write or Edit path; `.opencode/plugins/session-id-injector.js` has why it is not in the prompt), use it as `<session-id>` and write every scratch artifact into `.tmp/sessions/<session-id>/` under a readable name (`foreign-baseline.diff`). A resumed session gets the same id; unset, it collapses the path to `.tmp/sessions/`, so without one mint `YYYYMMDD-HHMMSS-<random6>` and lose resume support.
 4. **Stashes session-scoped.** Only with explicit pathspec and tagged message: `git stash push --message "session-<id>: <reason>" -- <files>`. Bare `git stash`, `-u`, `--all`, and pop/apply of foreign stashes are forbidden.
 5. **Edit and shell writes are mutually exclusive per file.** If a file was written outside the Edit tool, the cached content is stale. Re-Read before the next Edit. If Edit fails with "oldString not found", assume concurrent foreign write: surface to the user, do not guess.
 6. **Worktrees.** `.claude/worktrees/<branch-name>/` is gitignored. Cleanup with `git worktree remove <path>`; no `--force`.

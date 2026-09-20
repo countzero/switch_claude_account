@@ -3,5 +3,13 @@
 node_modules/
 tests/TestResults/
 *.sublime-workspace
+
+# Local Claude Code settings; the shared SessionStart hook is tracked.
+.claude/settings.local.json
+
+# Agent git worktrees. See AGENTS.md "Multi-Agent Working Tree Discipline".
 .claude/worktrees/
+
+# Local scratch directory for all agent-generated artifacts (screenshots,
+# diffs, trace outputs, experimental scripts). See AGENTS.md "Scratch files".
 .tmp/
