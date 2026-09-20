@@ -1157,11 +1157,11 @@ function Test-ClaudeRunning {
 
 # True when any process in $Processes is an npm-installed Claude Code.
 #
-# Split out of Test-ClaudeRunning because that function's own body cannot be
-# tested: a Get-Process mock does not reach a dot-sourced function the way an
-# Invoke-RestMethod or Get-ChildItem mock does (verified against Pester 5.7).
-# Taking the process list as a parameter puts the part worth pinning, the
-# pattern itself, under test on every platform.
+# Split out of Test-ClaudeRunning so the pattern can be pinned on every
+# platform: the caller reaches this probe only on Unix, and a Windows-only
+# coverage gate would otherwise never execute the one line here worth being
+# wrong about. Taking the process list as a parameter, rather than calling
+# Get-Process itself, is what makes that possible.
 #
 # The pattern is the npm package's own entry point,
 # @anthropic-ai/claude-code/cli.js, which argv carries as the resolved script
@@ -1243,9 +1243,14 @@ function Get-OAuthAccountFromClaudeJson {
 # Set-OAuthAccountInClaudeJson to substitute new field values into the
 # raw JSON text without depending on PowerShell's JSON serializer (which
 # would re-format the entire 18 KB+ config file and risk drift).
+#
+# A JSON `null` is not among the outputs. AllowNull lets a caller pass $null,
+# but the binder still converts it to '' on the way into a [string] parameter,
+# so the only reachable answer for one is '""'. Set-OAuthAccountInClaudeJson
+# wants exactly that: it substitutes into a field Claude Code re-reads, and an
+# unquoted null there is a different type, not a blanker value.
 function ConvertTo-ScaJsonString {
     Param ([AllowEmptyString()] [AllowNull()] [string] $Value)
-    if ($null -eq $Value) { return 'null' }
     $escaped = $Value.Replace('\', '\\').Replace('"', '\"')
     $escaped = $escaped.Replace("`b", '\b').Replace("`f", '\f').Replace("`n", '\n').Replace("`r", '\r').Replace("`t", '\t')
     return '"' + $escaped + '"'
