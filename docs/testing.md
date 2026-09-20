@@ -21,6 +21,24 @@ default with a **90% gate** (`-CoverageThreshold <int>` to override, `0` disable
 gate but keeps the summary); JaCoCo XML lands in `tests/TestResults/coverage.xml`
 (gitignored). `-SkipCoverage` for the fastest local loop.
 
+### Reading the result
+
+```powershell
+pwsh -NoProfile -File tests/Invoke-Tests.ps1; "EXIT=$LASTEXITCODE"
+```
+
+Ask for the exit code in the same command as the run. It is the whole verdict, tests
+and coverage gate together, and the runner's header comment owns that contract.
+
+Never narrow the run to find the verdict instead. `-Output Detailed` prints a line per
+test, so the `Tests Passed: N, Failed: N` summary and the coverage line sit under
+roughly a thousand of them, and a filter picked to fit a terminal (`Select-Object
+-Last`, a `Select-String` pattern) is overwhelmingly likely to cut exactly those two
+lines. The only way back to them is a second full run of a suite that takes minutes.
+An agent harness that truncates long output has already written the whole of it to a
+file and says where: search that file rather than narrowing the command. On a nonzero
+exit the failures are the `[-]` lines.
+
 ## Test conventions
 
 - **Layout**: one file per action at `tests/Invoke-<Action>Action.Tests.ps1`, plus

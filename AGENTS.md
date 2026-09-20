@@ -49,10 +49,10 @@ The `usage` action and the identity-fallback path depend on constants extracted 
 ## Testing
 
 ```powershell
-pwsh -NoProfile -File tests/Invoke-Tests.ps1
+pwsh -NoProfile -File tests/Invoke-Tests.ps1; "EXIT=$LASTEXITCODE"
 ```
 
-Coverage on `switch_claude_account.ps1` runs by default behind a **90% gate**; `-SkipCoverage` for the fastest local loop. One file per action at `tests/Invoke-<Action>Action.Tests.ps1`, every outer `Describe` named `'switch_claude_account'`, and `tests/Common.ps1` dot-sourced from each `BeforeEach` to sandbox both home variables, `CLAUDE_CONFIG_DIR` and `$PROFILE.CurrentUserAllHosts` into `$TestDrive`. The filter recipes, the direct-call pattern, the output-capture rule and the complexity diagnostic are `docs/testing.md`.
+The exit code is the verdict, so never narrow the run to find one: a filter that fits the output to a terminal drops the summary and costs a second full run. Coverage on `switch_claude_account.ps1` runs by default behind a **90% gate**; `-SkipCoverage` for the fastest local loop. One file per action at `tests/Invoke-<Action>Action.Tests.ps1`, every outer `Describe` named `'switch_claude_account'`, and `tests/Common.ps1` dot-sourced from each `BeforeEach` to sandbox both home variables, `CLAUDE_CONFIG_DIR` and `$PROFILE.CurrentUserAllHosts` into `$TestDrive`. The filter recipes, the direct-call pattern, the output-capture rule, reading the result and the complexity diagnostic are `docs/testing.md`.
 
 ## README image regeneration
 
