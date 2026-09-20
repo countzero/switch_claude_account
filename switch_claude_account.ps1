@@ -1062,18 +1062,25 @@ function Update-ScaState {
 # one account, handed a second account's .credentials.json 4 s in, died 4 s
 # later on the SECOND account's 5h limit.
 #
-# So swapping accounts under a live Claude Code works, and `sca switch` and
-# `sca monitor` run beside one. What refuses, and why:
+# So swapping accounts under a live Claude Code works, and every action but one
+# runs beside it. `save` alone refuses: it captures .credentials.json and an
+# identity in the same breath, one from each file, so catching the window
+# mislabels the slot permanently and, unlike a bad mirror, nothing later
+# corrects it.
 #
-#   * save    Captures .credentials.json and an identity in the same breath,
-#             one from each file. Catching the window mislabels the slot
-#             permanently, and unlike a bad mirror nothing later corrects it.
-#   * warmup, monitor -KeepWarm
-#             Both make EVERY slot active in turn. A live session would be
-#             dragged across every account on the machine and bill whichever
-#             one was mounted when the user hit enter. Rotation moves to one
-#             chosen destination and stays; a round-robin underneath a user is
-#             not something they can reason about.
+# `warmup` and `monitor -KeepWarm` refused too until their round-robin was made
+# safe. Both make EVERY slot active in turn, so a live session follows them
+# across every account, and the fear was that the `claude -p` a warm pass
+# spawns would race the live client for the cold slot's grant and leave one of
+# them holding a rotated refresh token. It cannot: Claude Code refreshes only
+# when a request needs it, never on a timer, and serializes refreshes across
+# processes behind a lock file, adopting a peer's result instead of racing it
+# (docs/claude-code-internals.md -> Token refresh). The real loss was sca's
+# own: the round-robin discarded a refresh claude had landed whenever the
+# activation then failed for some other reason. That is fixed where it
+# happened, in Invoke-WarmAllSlots' mirror, so what is left is a prompt sent
+# mid-pass billing whichever slot is mounted. A surprise, not a loss, and
+# `sca warmup` says so before it starts.
 #
 # What sca risks by writing beside a live client, in both files:
 #
@@ -1629,8 +1636,8 @@ function Show-Help {
         "  PS profile   : $ProfilePath",
         "",
         "NOTES",
-        "  • 'switch' and 'monitor' work with Claude Code open; it follows the swap.",
-        "  • Close Claude Code / VS Code before 'save', 'warmup', or 'monitor -KeepWarm'.",
+        "  • 'switch', 'monitor' and 'warmup' work with Claude Code open; it follows the swap.",
+        "  • Close Claude Code / VS Code before 'save'; every other action runs beside it.",
         "  • Needs Claude Code >= 2.1.274, or OpenCode + opencode-claude-auth >= 1.5.4.",
         ""
     )
@@ -3274,9 +3281,12 @@ function Get-SlotOAuth {
 # message on failure.
 #
 # Race with a running Claude Code: `sca usage` does NOT refuse while
-# Claude Code is running (only `save`, `warmup` and `monitor -KeepWarm` do;
-# see Test-ClaudeRunning callers), so an active-slot refresh triggered here
-# can race against Claude Code's own refresh. Anthropic rotates the
+# Claude Code is running (only `save` does; see Test-ClaudeRunning), so an
+# active-slot refresh triggered here can race against Claude Code's own.
+# Claude Code serializes refreshes across its OWN processes behind a lock file
+# and adopts a peer's result rather than racing it, but sca does not take that
+# lock, so this call is not a participant and the race below is real where a
+# `claude -p` would have none. Anthropic rotates the
 # refresh_token on every successful /v1/oauth/token call: whichever
 # party (sca or Claude Code) calls second presents the now-rotated old
 # token and gets a 4xx, losing its session. We accept this as a
@@ -5788,8 +5798,8 @@ function Invoke-UsageAction {
 #
 # Rotation needs the client to re-read .credentials.json when its cached token
 # misses, which opencode-claude-auth >= 1.5.4 and Claude Code >= 2.1.274 both
-# do, so plain `monitor` runs beside either. -KeepWarm refuses a live Claude
-# Code, guarded in Invoke-UsageWatch; see Test-ClaudeRunning.
+# do, so `monitor` runs beside either with or without -KeepWarm; see
+# Test-ClaudeRunning for what the keep-warm round-robin costs a live session.
 function Invoke-MonitorAction {
     Param (
         [string] $Name,
@@ -5807,16 +5817,14 @@ function Invoke-MonitorAction {
 # table with live percentages and exits. This is the automation of the
 # manual "switch to a slot, send one message" routine across all slots.
 #
-# Refuses up front if Claude Code is already running (see Test-ClaudeRunning),
-# and when the `claude` binary is not on PATH, since the activation IS
-# `claude`. The original active slot is restored by Invoke-WarmAllSlots'
-# finally block. Billable: ~$0.004 per slot on the pinned Haiku model.
+# Refuses when the `claude` binary is not on PATH, since the activation IS
+# `claude`. Runs beside a live Claude Code and warns when it finds one; see
+# Test-ClaudeRunning for why that is a warning rather than a refusal. The
+# original active slot is restored by Invoke-WarmAllSlots' finally block.
+# Billable: ~$0.004 per slot on the pinned Haiku model.
 function Invoke-WarmupAction {
     Param ([String] $Name)
 
-    if (Test-ClaudeRunning) {
-        throw "Claude Code is running. Close it before 'sca warmup', which makes every slot active in turn and would drag the live session across all of them. 'sca switch' and 'sca monitor' do not have that problem and run fine alongside Claude Code."
-    }
     if (-not (Get-Command claude -CommandType Application -ErrorAction SilentlyContinue)) {
         throw "The 'claude' CLI was not found on PATH. 'sca warmup' activates each slot by running 'claude -p', so Claude Code must be installed."
     }
@@ -5828,6 +5836,15 @@ function Invoke-WarmupAction {
     $sync = Invoke-Reconcile
     if (-not $sync.Captured) {
         throw (Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca warmup')
+    }
+
+    # The pass makes each slot active in turn, so a live client follows it
+    # across every account before the finally restores the original. Warn
+    # rather than refuse: nothing here is destructive (Test-ClaudeRunning owns
+    # the evidence), but a prompt sent mid-pass bills whichever slot happens to
+    # be mounted, and only the user knows whether they are about to type one.
+    if (Test-ClaudeRunning) {
+        Write-Color "[Warmup] Claude Code is running. Each slot becomes active in turn and your session follows; a prompt sent during the pass bills whichever slot is mounted." 'Yellow'
     }
 
     Write-Color "[Warmup] Activating saved slots via 'claude -p' (billable; ~`$0.004/slot on Haiku, a few seconds each)..." 'DarkYellow'
@@ -6346,22 +6363,25 @@ $Script:ActivatorTimeoutSec = 90
 # OAuth refresh to Claude Code's own flow and is exactly what a user does
 # by hand. Cost: ~$0.004 per slot per warmup on the pinned Haiku model.
 #
-# Mirror-then-verify (only after an 'ok' activation):
+# Mirror-then-verify:
 #   1. Invoke-Reconcile copies the (possibly refreshed) tokens claude just
-#      wrote into .credentials.json back into the slot file. This MUST run
-#      before the usage read: otherwise Get-SlotUsage reads the slot's
-#      stale pre-activation token and triggers sca's own refresh against
-#      the (sometimes throttled) token endpoint -- the exact amplification
-#      this design removes. The reconcile takes the same-identity mirror
-#      branch (the swap wrote this slot's email to ~/.claude.json), so it
-#      never auto-saves.
+#      wrote into .credentials.json back into the slot file. Runs after EVERY
+#      activation, not only a successful one: the next iteration's swap
+#      overwrites that file, so a refresh claude landed before failing for
+#      some other reason (hitting the 5h limit is the common one) is destroyed
+#      unless it is captured here. It MUST also precede the usage read below,
+#      or Get-SlotUsage reads the slot's stale pre-activation token and
+#      triggers sca's own refresh against the (sometimes throttled) token
+#      endpoint -- the exact amplification this design removes. The reconcile
+#      takes the same-identity mirror branch (the swap wrote this slot's email
+#      to ~/.claude.json), so it never auto-saves, and it costs nothing when
+#      nothing moved: the swap stamped state.last_sync_hash with the bytes it
+#      wrote, so an untouched file returns at reconcile's hash-match check.
 #   2. Get-SlotUsage reads /api/oauth/usage with the fresh token so the
 #      warmup frame shows live percentages immediately instead of
-#      'ok (no plan data)' until the first poll ~60 s later.
-# A failed activation (rate-limited / unauthorized / expired / no-oauth /
-# error) skips both the mirror and the usage read -- no token to refresh,
-# nothing to verify -- and surfaces the activator's own outcome, so a
-# throttled slot incurs zero sca refresh calls.
+#      'ok (no plan data)' until the first poll ~60 s later. Only after an
+#      'ok' activation: a failed one has nothing to verify, and a throttled
+#      slot must incur zero sca refresh calls.
 #
 # Builds the rendered snapshot in place: one row per slot (filtered by
 # -Names, else -Name, when set), each starting at Status='warming-up' with Data=$null,
@@ -6469,18 +6489,14 @@ function Invoke-WarmAllSlots {
                 # the live active slot. Record it for the restore advisory.
                 $lastSwapped = $row
                 $r = Invoke-SlotActivator -SlotPath $row.Path 6>$null
+
+                # Capture whatever claude left in .credentials.json before the
+                # next iteration's swap overwrites it. Mirror-then-verify on
+                # the docblock owns why this runs on every outcome and why it
+                # must precede the usage read. Never throws.
+                $sync = Invoke-Reconcile 6>$null
+
                 if ($r.Status -eq 'ok') {
-                    # Mirror claude's (possibly refreshed) tokens from
-                    # .credentials.json back into the slot file BEFORE the
-                    # verify read, so Get-SlotUsage reads the fresh token
-                    # rather than the slot's stale pre-activation one (which
-                    # would trigger sca's own refresh against a possibly
-                    # throttled token endpoint). Same-identity mirror only;
-                    # never auto-saves (the swap wrote this slot's email to
-                    # ~/.claude.json). Then read usage so the warmup frame
-                    # shows live percentages immediately instead of
-                    # 'ok (no plan data)'. Neither call throws.
-                    Invoke-Reconcile 6>$null | Out-Null
                     # Drop any backoff stamp first: a successful activation is
                     # evidence the throttle may be over, and the verify read
                     # must probe live rather than be short-circuited by the
@@ -6512,7 +6528,14 @@ function Invoke-WarmAllSlots {
                     # and its own probe can be turned away before the server
                     # looks at the grant, so this is the only way that command
                     # can tell a dead login from a throttle.
-                    if ($r.Status -in $Script:AuthVerdictStatuses) {
+                    #
+                    # Only when the reconcile above found the file untouched. A
+                    # verdict asserts claude proved this grant dead, which holds
+                    # only if claude wrote nothing: had its refresh gone through,
+                    # the grant is alive and the refusal was about something
+                    # else. Recording one then would strand a working slot
+                    # behind a verdict that outlives the run.
+                    if ($r.Status -in $Script:AuthVerdictStatuses -and $sync.Reason -eq 'hash-match') {
                         Set-SlotAuthVerdict -SlotName $row.Name -SlotPath $row.Path `
                                             -Status $r.Status -ErrorMessage $r.Error
                     }
@@ -6615,11 +6638,10 @@ function Get-WarmupCooldownMinutes {
 # $CooldownMin for the life of the watch. Optional: omitted (tests, one-shot
 # callers) means no slot has failed yet, which is the flat-cooldown behaviour.
 #
-# Re-checks Test-ClaudeRunning per tick, catching a Claude Code launched
-# mid-watch that the pre-loop guard could not see. Re-warmed rows are NOT
-# merged back into $Snapshot; the next poll re-reads /api/oauth/usage. Never
-# throws: a warm-path exception surfaces as a '[Warmup] Re-warm failed! ...'
-# line.
+# Runs beside a live Claude Code; see Test-ClaudeRunning for why the round-
+# robin no longer refuses one. Re-warmed rows are NOT merged back into
+# $Snapshot; the next poll re-reads /api/oauth/usage. Never throws: a warm-path
+# exception surfaces as a '[Warmup] Re-warm failed! ...' line.
 # -Threshold is mandatory rather than defaulted: it must be the SAME value
 # auto-rotation uses, and the caller always has it. A default here would let a
 # wiring mistake silently disable the at-limit skip instead of failing loudly.
@@ -6670,10 +6692,6 @@ function Invoke-KeepWarmStep {
             return '[Warmup] Rate-limited at the rotation threshold; will re-warm after the next window reset.'
         }
         return $CurrentLatch
-    }
-
-    if (Test-ClaudeRunning) {
-        return '[Warmup] Re-warm refused! Claude Code is running.'
     }
 
     # Re-capture before the round-robin below overwrites .credentials.json once
@@ -7140,16 +7158,6 @@ function Invoke-UsageWatch {
         # always sets -Auto too).
         [switch] $Warmup
     )
-
-    # Pre-loop Claude Code guard, -Warmup only; see Test-ClaudeRunning for why
-    # the fleet walk refuses and rotation does not.
-    #
-    # Checked BEFORE the Test-WatchInteractive guard so the user sees the
-    # more actionable "close Claude Code" message rather than the
-    # interactive-terminal one (which the test harness always hits).
-    if ($Warmup -and (Test-ClaudeRunning)) {
-        throw "Claude Code is running. Close it before 'sca monitor -KeepWarm', which makes every slot active in turn and would drag the live session across all of them. Plain 'sca monitor' rotates without that and runs fine alongside Claude Code."
-    }
 
     if (-not (Test-WatchInteractive)) {
         throw "-Watch requires an interactive terminal; for scripted output use 'sca usage -Json'."

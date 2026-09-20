@@ -51,11 +51,18 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Invoke-WarmupAction' {
-        It 'refuses when Claude Code is running' {
+        # No longer a refusal: claude serializes refreshes across its own
+        # processes, so the pass cannot cost a credential. It names the one cost
+        # that remains, a prompt sent mid-pass billing the mounted slot.
+        It 'warns but proceeds when Claude Code is running' {
             Mock Test-ClaudeRunning -MockWith { $true }
             New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null
 
-            { Invoke-WarmupAction -Name '' 6>$null } | Should -Throw -ExpectedMessage '*Claude Code is running*'
+            $out = Invoke-WarmupAction -Name '' 6>&1 | Out-String
+
+            $out | Should -Match 'Claude Code is running'
+            $out | Should -Match 'bills whichever slot is mounted'
+            Should -Invoke Invoke-SlotActivator -Times 1 -Exactly
         }
 
         It 'refuses when the claude CLI is not on PATH' {

@@ -40,7 +40,7 @@ The `usage` action and the identity-fallback path depend on constants extracted 
 
 ## Platform gotchas
 
-- **Hot-swapping a live client is supported.** `switch` and `monitor` run with Claude Code open; `save`, `warmup` and `monitor -KeepWarm` refuse. `Test-ClaudeRunning` owns the evidence and the exceptions.
+- **Hot-swapping a live client is supported.** Every action but `save` runs with Claude Code open, the warm round-robin included; `save` alone refuses. `Test-ClaudeRunning` owns the evidence and that one exception.
 - **POSIX has no mandatory locking**, so a share-mode test is `-Skip:(-not $IsWindows)` and pairs with a Unix test asserting the inode property instead.
 - **`Get-SafeName` is Windows-strict on every platform**, and every credential-file operation also passes `-LiteralPath` as defense in depth.
 - **Guard every `System.Console` call.** `[Console]::CursorVisible` is Windows-only to read and throws off an attached console to write; a failed capture stays `$null` so the restore is skipped rather than defaulted to a wrong value.

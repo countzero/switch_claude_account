@@ -10,8 +10,8 @@
 # contexts in Invoke-UsageAction.Tests.ps1. Here we cover the action-level
 # contract: that monitor maps to the engine with -Auto set, threads -Threshold
 # and -KeepWarm through, ignores a positional name, and surfaces the
-# watch-engine guards. Plain `monitor` runs beside a live Claude Code; only
-# -KeepWarm refuses it, so the Claude-Code guard here is -KeepWarm's alone.
+# watch-engine guards. Both plain `monitor` and -KeepWarm run beside a live
+# Claude Code, so neither asserts a Claude-Code refusal any more.
 # Per-test sandbox setup lives in tests/Common.ps1.
 
 BeforeAll {
@@ -89,14 +89,22 @@ Describe 'switch_claude_account' {
             { Invoke-MonitorAction 6>$null } | Should -Throw -ExpectedMessage '*requires an interactive terminal*'
         }
 
-        It 'still refuses -KeepWarm when Claude Code is running, naming the flag' {
-            # Keep-warm makes every slot active in turn, so a live session
-            # would be dragged across every account. That guard stays, and it
-            # runs BEFORE IsOutputRedirected so this is safe interactively.
+        It 'does NOT refuse -KeepWarm when Claude Code is running either' {
+            # Keep-warm makes every slot active in turn, which used to refuse a
+            # live client. It no longer does: claude serializes refreshes across
+            # its own processes, and the loss that justified the guard was sca's
+            # own discarded mirror, fixed in Invoke-WarmAllSlots. With that guard
+            # gone the next one reached is IsOutputRedirected, exactly as for
+            # plain `monitor` above.
             Mock Test-ClaudeRunning -MockWith { $true }
 
+            if (-not [Console]::IsOutputRedirected) {
+                Set-ItResult -Skipped -Because 'Console stdout is not redirected; running this test would enter the alt-screen buffer and blank the terminal.'
+                return
+            }
+
             { Invoke-MonitorAction -KeepWarm 6>$null } |
-                Should -Throw -ExpectedMessage '*Claude Code is running*sca monitor -KeepWarm*'
+                Should -Throw -ExpectedMessage '*requires an interactive terminal*'
         }
 
         It 'passes the Claude-Code guard then short-circuits on IsOutputRedirected' {

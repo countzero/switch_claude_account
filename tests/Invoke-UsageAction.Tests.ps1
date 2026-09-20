@@ -4012,15 +4012,46 @@ Describe 'switch_claude_account' {
             Get-SlotAuthVerdict -SlotPath $slotPath | Should -BeNullOrEmpty
         }
 
-        It 'activator no-oauth: row ends Status="no-oauth", no mirror or usage read' {
+        It 'activator no-oauth: row ends Status="no-oauth", no usage read' {
             New-WarmupSlot -Name 'apikey' | Out-Null
             Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'no-oauth' } }
 
             $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
 
             (Get-RowStatus $snap 'apikey') | Should -Be 'no-oauth'
-            Should -Invoke Invoke-Reconcile -Times 0 -Exactly
             Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq $Script:UsageEndpoint }
+        }
+
+        # The next iteration's swap overwrites .credentials.json, so anything
+        # claude left there has one chance to be captured. A failed activation
+        # is not a quiet one: claude can refresh the grant and only then be
+        # turned away (hitting the 5h limit is the common case), and skipping
+        # the mirror there destroyed that refresh.
+        It 'mirrors after a FAILED activation too, so a refresh claude landed is not lost' {
+            New-WarmupSlot -Name 'limited3' | Out-Null
+            Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'rate-limited' } }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            Should -Invoke Invoke-Reconcile -Times 1 -Exactly
+        }
+
+        # A verdict asserts claude PROVED the grant dead. That holds only if
+        # claude wrote nothing: a reconcile that saw the bytes move means a
+        # refresh went through, so the grant is alive and the refusal was about
+        # something else. Recording one then strands a working slot behind a
+        # verdict that outlives the run.
+        It 'does NOT record a verdict when the credentials moved during the activation' {
+            New-WarmupSlot -Name 'raced' | Out-Null
+            Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'unauthorized'; Error = 'forbidden' } }
+            Mock Invoke-Reconcile -MockWith { New-ReconcileResult -Action 'mirror' -Reason 'mirrored' -Slot 'raced' }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            $state = Read-ScaState
+            if ($state -and $state.auth_verdicts) {
+                $state.auth_verdicts.ContainsKey('raced') | Should -BeFalse
+            }
         }
 
         It 'Invoke-SlotActivator throws: row ends Status="error" with the exception message' {
@@ -4456,14 +4487,19 @@ Describe 'switch_claude_account' {
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
         }
 
-        It 'refuses (without warming) when Claude Code is running' {
+        # The round-robin no longer refuses a live client. Claude Code
+        # serializes refreshes across its own processes, so the `claude -p` a
+        # warm pass spawns cannot race the live session's grant; what is left
+        # is a prompt sent mid-pass billing the mounted slot. See
+        # Test-ClaudeRunning.
+        It 'warms even when Claude Code is running' {
             Mock Test-ClaudeRunning { $true }
             $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
 
             $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x'
 
-            $out | Should -Be '[Warmup] Re-warm refused! Claude Code is running.'
-            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+            $out | Should -Match 'Re-warmed'
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
         }
 
         # The round-robin overwrites .credentials.json once per slot, and this

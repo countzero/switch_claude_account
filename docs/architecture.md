@@ -107,9 +107,9 @@ User-facing form: `README.md` → *File permissions (Linux and macOS)*.
 ### Hot-swapping a live client
 
 Claude Code >= 2.1.274 polls `~/.claude.json` at 1 s and re-`stat`s
-`.credentials.json` on every refresh check, so `switch` and `monitor` run with it
-open. `save`, `warmup` and `monitor -KeepWarm` still refuse. `Test-ClaudeRunning` owns
-the evidence and the exceptions.
+`.credentials.json` on every refresh check, so every action but `save` runs with it
+open, `warmup` and `monitor -KeepWarm` included. `save` alone still refuses.
+`Test-ClaudeRunning` owns the evidence and that one exception.
 
 ### POSIX has no mandatory locking
 
