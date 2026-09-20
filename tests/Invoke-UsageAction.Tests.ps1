@@ -1137,6 +1137,19 @@ Describe 'switch_claude_account' {
             ($out.IndexOf('alpha')) | Should -BeLessThan ($out.IndexOf('HELLO-FROM-FOOTER'))
         }
 
+        # The no-slots frame is still a frame. In the watch loop it is the
+        # whole screen, so dropping the footer there would take the
+        # [Monitor] / [Watch] state lines with it and leave a user who has
+        # not saved a slot yet looking at one static sentence.
+        It 'Format-UsageFrame keeps the footer on the no-slots frame' {
+            $snap = [pscustomobject]@{ Results = @(); NoSlots = $true }
+
+            $out = Format-UsageFrame -Snapshot $snap -Footer 'HELLO-FROM-FOOTER' 6>&1 | Out-String
+
+            $out | Should -Match 'No slots saved yet'
+            $out | Should -Match 'HELLO-FROM-FOOTER'
+        }
+
         It 'Format-UsageTable renders bucket percentages for a rate-limited row that carries cached data' {
             # A rate-limited row served from the (possibly stale) cache
             # fallback carries last-known Data; its numbers must show so the
@@ -2681,6 +2694,28 @@ Describe 'switch_claude_account' {
             $Script:SlotUsageCache[$script:boSlot].ContainsKey('RateLimitedUntil') | Should -BeFalse
         }
 
+        # The backoff suppresses HTTP for RateLimitBackoffSec, but the entry it
+        # serves instead can be arbitrarily older than that. Past the age
+        # ceiling the suppression still applies, because the point is not to
+        # re-trip a hot limiter, but the numbers stop being shown: a row that
+        # renders em-dashes must not also claim to be showing last known usage.
+        It 'stops serving cached numbers past the age ceiling but still suppresses HTTP' {
+            $script:staleCount = 0
+            Mock Invoke-RestMethod -MockWith { $script:staleCount++; throw 'HTTP must not be called during backoff' }
+            $Script:SlotUsageCache[$script:boSlot] = @{
+                Data             = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 7.0 } }
+                Timestamp        = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheMaxAgeMin + 1))
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:boSlot
+
+            $r.Status           | Should -Be 'rate-limited'
+            $r.Data             | Should -BeNullOrEmpty
+            $r.IsCachedFallback | Should -BeFalse
+            $script:staleCount  | Should -Be 0
+        }
+
         It 'Clear-SlotRateLimitBackoff drops the stamp but keeps cached Data' {
             $Script:SlotUsageCache[$script:boSlot] = @{
                 Data = 'D'; Timestamp = [DateTime]::UtcNow; RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
@@ -3003,6 +3038,19 @@ Describe 'switch_claude_account' {
             })
             $cells.Five  | Should -Match '12'
             $cells.Seven | Should -Match '—'
+        }
+
+        # Every row Get-UsageSnapshot builds carries an Email property, even
+        # when its value is null. A row assembled anywhere else may not, and
+        # reading a missing property would hand Format-AccountCell whatever
+        # PowerShell returns for one rather than the absence of an address.
+        It 'treats a row with no Email property as having no address' {
+            $cells = ConvertTo-UsageTableRow -Row ([pscustomobject]@{
+                Name = 'a'; IsActive = $false; Status = 'ok'; Data = $null
+            })
+
+            # Same cell an explicit $null Email produces: the em-dash.
+            $cells.Account | Should -Be '—'
         }
     }
 

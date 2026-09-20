@@ -422,6 +422,101 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Invoke-Main action dispatch' {
+        # The switch at the end of Invoke-Main is the only place that maps an
+        # action name to a body, and a typo in one arm is invisible to every
+        # other test in the suite: they all call the Invoke-*Action functions
+        # directly. Each case here mocks the destination and asserts the
+        # routing, which is the whole contract of the arm.
+        #
+        # Same dynamic-scope pattern as the two contexts above: assign the
+        # script's Param() variables in the It body and let Invoke-Main read
+        # them.
+
+        It 'prints the help screen for the help action' {
+            $Action = 'help'
+            $out = (Invoke-Main 6>&1 | Out-String)
+            $out | Should -Match 'ACTIONS'
+        }
+
+        # The data key is ActionName, not Action: a -ForEach key collides with
+        # the script's own [ValidateSet] $Action parameter, which is in scope
+        # here because the BeforeEach dot-sourced the script. Under the
+        # collision Pester expands <Action> to empty and the assignment never
+        # reaches Invoke-Main, so all eight cases fail identically.
+        It 'routes <ActionName> to <Target>' -ForEach @(
+            @{ ActionName = 'install';   Target = 'Add-To-Profile' }
+            @{ ActionName = 'uninstall'; Target = 'Remove-From-Profile' }
+            @{ ActionName = 'save';      Target = 'Invoke-SaveAction' }
+            @{ ActionName = 'switch';    Target = 'Invoke-SwitchAction' }
+            @{ ActionName = 'list';      Target = 'Invoke-ListAction' }
+            @{ ActionName = 'remove';    Target = 'Invoke-RemoveAction' }
+            @{ ActionName = 'usage';     Target = 'Invoke-UsageAction' }
+            @{ ActionName = 'warmup';    Target = 'Invoke-WarmupAction' }
+        ) {
+            Mock -CommandName $Target -MockWith { }
+            $Action = $ActionName
+            Invoke-Main 6>$null
+            Should -Invoke -CommandName $Target -Times 1 -Exactly
+        }
+
+        It 'passes -Name through to the dispatched action' {
+            Mock Invoke-SaveAction { }
+            $Action = 'save'
+            $Name   = 'work'
+            Invoke-Main 6>$null
+            Should -Invoke Invoke-SaveAction -Times 1 -Exactly -ParameterFilter { $Name -eq 'work' }
+        }
+
+        It 'emits the config-directory advisory when there is one' {
+            Mock Get-ConfigDirAdvisory { '[Config] CLAUDE_CONFIG_DIR is set; using somewhere else.' }
+            Mock Invoke-ListAction { }
+            $Action = 'list'
+            $out = (Invoke-Main 6>&1 | Out-String)
+            $out | Should -Match '\[Config\] CLAUDE_CONFIG_DIR is set'
+        }
+
+        # -Json exists so a scripted caller gets nothing but the document, and
+        # the advisory is the one line emitted before the action body runs.
+        It 'suppresses the config-directory advisory under -Json' {
+            Mock Get-ConfigDirAdvisory { '[Config] CLAUDE_CONFIG_DIR is set; using somewhere else.' }
+            Mock Invoke-UsageAction { }
+            $Action = 'usage'
+            $Json   = $true
+            $out = (Invoke-Main 6>&1 | Out-String)
+            $out | Should -Not -Match '\[Config\]'
+        }
+
+        # Repair-CredentialFileModes is a no-op returning 0 on Windows, so the
+        # count is mocked rather than produced: the line under test is the
+        # report, and the repair itself is pinned in State-File.Tests.ps1.
+        It 'reports how many credential files the mode repair tightened' {
+            Mock Repair-CredentialFileModes { 2 }
+            Mock Invoke-ListAction { }
+            $Action = 'list'
+            $out = (Invoke-Main 6>&1 | Out-String)
+            $out | Should -Match '\[Security\] Tightened 2 credential file\(s\) to 0600'
+        }
+
+        It 'stays silent about the mode repair when it changed nothing' {
+            Mock Repair-CredentialFileModes { 0 }
+            Mock Invoke-ListAction { }
+            $Action = 'list'
+            $out = (Invoke-Main 6>&1 | Out-String)
+            $out | Should -Not -Match '\[Security\]'
+        }
+
+        # The dot-source guard at the foot of the file. Every other test in the
+        # suite dot-sources the script, which is exactly the case the guard
+        # suppresses, so nothing else proves `sca` runs anything at all when
+        # invoked as a script. -Version is the one action that reaches
+        # Invoke-Main and returns without touching disk or network.
+        It 'runs Invoke-Main when the script is invoked rather than dot-sourced' {
+            $out = (& $script:ScriptPath -Version 6>&1 | Out-String).Trim()
+            $out | Should -Match '^\d+\.\d+\.\d+$'
+        }
+    }
+
     Context 'Format-WatchTitle' {
         # Pure string-builder for the OSC 0 watch-mode terminal title.
         # The title carries the active slot's two utilization numbers +
@@ -1332,6 +1427,35 @@ Describe 'switch_claude_account' {
                 Should -Match ([regex]::Escape("`e[?25h"))
         }
 
+        # Both restores are belt-and-suspenders for .NET-side state: the VT
+        # sequences above are what the user's terminal actually obeys. Neither
+        # may therefore unwind the caller's finally, which is the last thing
+        # standing between a crashed watch and a terminal left in the alt
+        # buffer with no cursor.
+        It 'Exit-WatchTerminal never lets a cursor restore failure escape' {
+            # The API restore runs only where the capture succeeded, i.e. off
+            # an attached Windows console. Under a redirected test host the
+            # setter throws instead, which is exactly the case being pinned.
+            $state = [pscustomobject]@{
+                Cursor = $true; Encoding = $null; Title = $null; EnteredAlt = $false
+            }
+            { Exit-WatchTerminal -State $state } | Should -Not -Throw
+        }
+
+        It 'Exit-WatchTerminal never lets an encoding restore failure escape' {
+            $orig = [Console]::OutputEncoding
+            try {
+                # Truthy, so the guard lets it through, but not an Encoding, so
+                # the assignment throws on conversion.
+                $state = [pscustomobject]@{
+                    Cursor = $null; Encoding = [pscustomobject]@{ NotAnEncoding = $true }
+                    Title  = $null; EnteredAlt = $false
+                }
+                { Exit-WatchTerminal -State $state } | Should -Not -Throw
+            }
+            finally { [Console]::OutputEncoding = $orig }
+        }
+
         It 'Exit-WatchTerminal restores a captured console encoding and skips a null one' {
             $orig = [Console]::OutputEncoding
             try {
@@ -1880,6 +2004,26 @@ Describe 'switch_claude_account' {
             ([regex]::Matches($out, [regex]::Escape("`e[?2026h"))).Count | Should -Be 3
         }
 
+        # -Warmup front-loads one billable pass over every slot before the
+        # loop starts, so which flag reaches that call is the difference
+        # between `sca usage -Watch` costing nothing and costing ~$0.004 a
+        # slot. Both directions are pinned for that reason.
+        It 'runs the startup warm pass before the loop under -Warmup' {
+            Mock Invoke-WatchStartupWarm -MockWith { }
+
+            Invoke-BoundedWatch -WatchArgs @{ Warmup = $true } | Out-Null
+
+            Should -Invoke Invoke-WatchStartupWarm -Times 1 -Exactly
+        }
+
+        It 'does not warm anything without -Warmup' {
+            Mock Invoke-WatchStartupWarm -MockWith { }
+
+            Invoke-BoundedWatch | Out-Null
+
+            Should -Invoke Invoke-WatchStartupWarm -Times 0 -Exactly
+        }
+
         It 'polls on the first tick and not again inside the interval' {
             # The redraw cadence is 1 s and the poll cadence is -Interval;
             # conflating them would hammer the unofficial endpoint once a
@@ -2119,12 +2263,6 @@ Describe 'switch_claude_account' {
     }
 
     Context 'ConvertTo-ScaJsonString' {
-        # Note: the function's `if ($null -eq $Value) { return 'null' }`
-        # branch is defensive-dead. PowerShell binds $null to a [string]
-        # parameter as '', so external callers cannot exercise it; the
-        # one internal caller in Set-OAuthAccountInClaudeJson short-
-        # circuits before calling. We do NOT test that branch.
-
         It 'escapes embedded double-quotes, backslashes, and control characters' {
             ConvertTo-ScaJsonString -Value 'a "b" \ c' | Should -Be '"a \"b\" \\ c"'
             ConvertTo-ScaJsonString -Value "line1`nline2`tend" | Should -Be '"line1\nline2\tend"'
@@ -2834,6 +2972,34 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'ConvertTo-UpdatedClaudeJson' {
+        # The transform reports "nothing to write" as $null, and its caller
+        # uses that to skip the write entirely. Skipping matters because every
+        # write is a read-modify-write race against Claude Code, which holds
+        # the lock and merges while sca does not: a no-op write is a chance to
+        # lose someone else's edit in exchange for nothing.
+
+        It 'returns null when every whitelisted field already holds the new value' {
+            # Spaced exactly as the substitution would emit it, so a
+            # byte-identical result really is a no-op rather than a reformat.
+            $raw = '{"numStartups":1,"oauthAccount":{"emailAddress": "a@b.com"}}'
+            $oa  = [pscustomobject]@{ emailAddress = 'a@b.com' }
+
+            ConvertTo-UpdatedClaudeJson -Raw $raw -OAuthAccount $oa | Should -BeNullOrEmpty
+        }
+
+        It 'returns the rewritten document when a field actually changes' {
+            $raw = '{"numStartups":1,"oauthAccount":{"emailAddress": "a@b.com"}}'
+            $oa  = [pscustomobject]@{ emailAddress = 'c@d.com' }
+
+            $updated = ConvertTo-UpdatedClaudeJson -Raw $raw -OAuthAccount $oa
+
+            $updated | Should -Match 'c@d\.com'
+            # Everything outside the block is carried through untouched.
+            $updated | Should -Match '"numStartups":1'
+        }
+    }
+
     # The contending writer is Claude Code, which holds ~/.claude.json.lock and
     # merges under it while sca does not, so only sca's side can lose a write.
     # Driven by mocking the transform and letting the mock move the file
@@ -3105,6 +3271,41 @@ Describe 'switch_claude_account' {
             $out | Should -Match "Token refreshed in slot 'active'"
             $out | Should -Match 'propagation to \.credentials\.json failed'
             $out | Should -Match 'propagation denied'
+        }
+
+        # The mirror is blocked only by a PROVEN divergence. A file that cannot
+        # be hashed proves nothing, and treating it as divergence would strand
+        # the active slot's refreshed tokens in the slot file while
+        # .credentials.json kept serving the expired ones.
+        It 'still mirrors when the live credentials file cannot be hashed' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $credFile = Join-Path $credDir '.credentials.json'
+
+            $slot = New-SlotPair -CredDir $credDir -Name 'active' -Email 'a@b.com' -Content (@{
+                claudeAiOauth = @{
+                    accessToken  = 'OLD'
+                    refreshToken = 'RT'
+                    expiresAt    = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+                }
+            } | ConvertTo-Json -Compress)
+            Copy-Item -LiteralPath $slot -Destination $credFile -Force
+            Update-ScaState -ActiveSlot 'active' -LastSyncHash 'A_HASH_THAT_DIFFERS' | Out-Null
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]@{ access_token = 'NEW'; refresh_token = 'NEW-RT'; expires_in = 3600 }
+            }
+            # Only the live-file hash fails; the -Bytes form the mirror uses
+            # afterwards must still work.
+            Mock Get-SHA256Hex -ParameterFilter { $Path -eq $credFile } -MockWith {
+                throw [System.IO.IOException]::new('handle went away')
+            }
+
+            $out = Update-SlotTokens -SlotPath $slot 6>&1 | Out-String
+
+            $out | Should -Not -Match 'left alone rather than overwritten'
+            (Get-Content -LiteralPath $credFile -Raw | ConvertFrom-Json).claudeAiOauth.accessToken |
+                Should -Be 'NEW'
         }
     }
 
@@ -3692,6 +3893,79 @@ Describe 'switch_claude_account' {
 
         It 'defaults to the script-scope directory, which the sandbox always resolves' {
             { Assert-CredentialDir } | Should -Not -Throw
+        }
+    }
+
+    Context 'Credential paths with no resolvable home' {
+        # Every derived path stays $null when neither CLAUDE_CONFIG_DIR nor the
+        # platform's home variable resolves, so `sca help` and `sca -Version`
+        # still run in a container or a systemd unit started without one.
+        # Join-Path's binder rejects a null base, so without the guards these
+        # assignments would abort at load with "Cannot bind argument to
+        # parameter 'Path'" before either command could name the variable to
+        # set.
+        #
+        # These bind at load, so the only way to drive them is to load the
+        # script again under a blanked environment, in-process. $HOME is
+        # ReadOnly rather than Constant, so -Force can blank it; it is also
+        # AllScope, which is why the restore is doubled below.
+
+        BeforeEach {
+            $script:SavedHomeVariable = $HOME
+            $script:SavedUserProfile  = $env:USERPROFILE
+            $script:SavedHomeEnv      = $env:HOME
+        }
+
+        AfterEach {
+            # Paired with each It's own finally. A failure between the blanking
+            # and the restore would otherwise point every later test in the run
+            # at a home directory that does not exist.
+            Set-Variable -Name HOME -Value $script:SavedHomeVariable -Force -Scope Global
+            $env:USERPROFILE = $script:SavedUserProfile
+            $env:HOME        = $script:SavedHomeEnv
+        }
+
+        It 'leaves every derived path null instead of throwing at load' {
+            try {
+                $env:USERPROFILE       = ''
+                $env:HOME              = ''
+                $env:CLAUDE_CONFIG_DIR = $null
+                Set-Variable -Name HOME -Value '' -Force -Scope Global
+
+                { . $script:ScriptPath } | Should -Not -Throw
+                . $script:ScriptPath
+
+                $CredDir        | Should -BeNullOrEmpty
+                $CredFile       | Should -BeNullOrEmpty
+                $StateFile      | Should -BeNullOrEmpty
+                $ClaudeJsonPath | Should -BeNullOrEmpty
+            }
+            finally {
+                Set-Variable -Name HOME -Value $script:SavedHomeVariable -Force -Scope Global
+                $env:USERPROFILE = $script:SavedUserProfile
+                $env:HOME        = $script:SavedHomeEnv
+            }
+        }
+
+        # The refusal that stands in for the load-time throw. Assert-CredentialDir
+        # defaults to the script-scope $CredDir, which the reload above made
+        # null, so this is the production call path rather than an argument.
+        It 'refuses the actions that need a directory, naming the variables to set' {
+            try {
+                $env:USERPROFILE       = ''
+                $env:HOME              = ''
+                $env:CLAUDE_CONFIG_DIR = $null
+                Set-Variable -Name HOME -Value '' -Force -Scope Global
+
+                . $script:ScriptPath
+
+                { Assert-CredentialDir } | Should -Throw -ExpectedMessage '*CLAUDE_CONFIG_DIR*'
+            }
+            finally {
+                Set-Variable -Name HOME -Value $script:SavedHomeVariable -Force -Scope Global
+                $env:USERPROFILE = $script:SavedUserProfile
+                $env:HOME        = $script:SavedHomeEnv
+            }
         }
     }
 

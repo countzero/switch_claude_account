@@ -17,7 +17,7 @@ pwsh -NoProfile -Command "Import-Module Pester -MinimumVersion 5.5.0; Invoke-Pes
 
 The runner auto-installs Pester 5 (CurrentUser scope) on first use. PSScriptAnalyzer,
 if installed, runs in advisory mode. Coverage on `switch_claude_account.ps1` runs by
-default with a **90% gate** (`-CoverageThreshold <int>` to override, `0` disables the
+default with a **97% gate** (`-CoverageThreshold <int>` to override, `0` disables the
 gate but keeps the summary); JaCoCo XML lands in `tests/TestResults/coverage.xml`
 (gitignored). `-SkipCoverage` for the fastest local loop.
 
@@ -43,8 +43,8 @@ exit the failures are the `[-]` lines.
 
 - **Layout**: one file per action at `tests/Invoke-<Action>Action.Tests.ps1`, plus
   cross-cutting suites (`Helpers`, `Profile-Install`, `Invoke-Reconcile`,
-  `Invoke-AutoRotation`, `State-File`). Every outer `Describe` is named
-  `'switch_claude_account'` so `-FullNameFilter` recipes work uniformly.
+  `Invoke-AutoRotation`, `State-File`, `Test-ClaudeRunning`). Every outer `Describe`
+  is named `'switch_claude_account'` so `-FullNameFilter` recipes work uniformly.
 - **Sandboxing**: `tests/Common.ps1`, dot-sourced from each `BeforeEach`, sandboxes
   `$env:USERPROFILE`, `$env:HOME`, `$env:CLAUDE_CONFIG_DIR` and
   `$PROFILE.CurrentUserAllHosts` per test via `$TestDrive` (both home variables,
@@ -54,10 +54,50 @@ exit the failures are the `[-]` lines.
   assertions see ANSI-stripped output.
 - **Direct-call pattern**: the script is dot-sourced and tests call `Invoke-*Action`
   directly, bypassing `Invoke-Main`. The `-NoColor` `try/finally` in `Invoke-Main`
-  therefore never fires in tests; `Common.ps1` substitutes for it.
+  therefore never fires in tests; `Common.ps1` substitutes for it. `Invoke-Main`'s own
+  dispatch is covered in `Helpers.Tests.ps1` by assigning the script's `Param()`
+  variables in the `It` body; a `-ForEach` key may not be named `Action`, which
+  collides with that parameter and expands to empty.
+- **Blanket mocks**: `Common.ps1` mocks `Test-ClaudeRunning` for the whole suite so no
+  action refuses on the developer's own processes. A mock cannot be lifted once set, so
+  the one file that needs the real body sets `$script:ScaKeepRealClaudeRunning` before
+  dot-sourcing `Common.ps1` and mocks `Get-Process` instead. Nothing else may.
 - **Output capture**: `6>&1 | Out-String` captures `Write-Host` (information stream
   6). Stream 4 (`Write-Progress`) is not captured by that pattern; relevant when
   adding rendering helpers.
+
+## The ceiling
+
+Coverage is collected on one OS (`windows-latest` in CI, per the comment on that
+workflow step), so **100% is not reachable and is not the target**. A full Windows run
+lands at about **98.6%**, leaving 34 instructions in three groups. Check a new gap
+against these before assuming it is a missing test.
+
+| Group                    | Instr | What it is                                                                  |
+| ------------------------ | ----- | --------------------------------------------------------------------------- |
+| Unix-only code           | 25    | The non-Windows arms, all covered on the Linux and macOS legs               |
+| No seam in the harness   | 5     | Failures the test host cannot provoke                                       |
+| Deliberately not tested  | 4     | Defense-in-depth arms reachable only by mocking an internal                 |
+
+**Unix-only**: the `$ScaHomeDir` and `Test-SamePath` platform arms, `UnixCreateMode`
+in `Write-PrivateFileBytes`, the `HOME` name in `Assert-CredentialDir`, the 0700
+`New-CredentialDirectory` path, the whole `Repair-CredentialFileModes` body, and
+`Test-ClaudeRunning`'s command-line probe. Each has tests; they run on the other legs.
+
+**No seam**: `Write-PrivateFileBytes`' cleanup needs a write that fails after the
+stream opened, which means a real ENOSPC. `Enter-WatchTerminal`'s two `catch` arms
+need `$Host.UI.RawUI` or the `OutputEncoding` setter to throw, and `$Host` is a
+**Constant** variable, so it cannot be swapped for a stub that does.
+
+**Not tested on purpose**: the `emailAddress`-less refusal in `Invoke-SaveAction`
+(both identity sources already reject a blank address), the two `Format-AggregateBars`
+clamps, and the negative-budget floor in `Format-UsageAdvisory`. Reaching any of them
+means mocking the function immediately upstream, which pins the mock rather than
+anything that can regress.
+
+Raising the gate above 97 is therefore the wrong reflex: the headroom is what the next
+platform-conditional branch spends, and losing it fails the run for a branch that is
+tested, just not on this leg.
 
 ## What the suite cannot catch
 

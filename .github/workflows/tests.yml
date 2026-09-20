@@ -112,7 +112,9 @@ jobs:
 
       # Coverage runs on one OS only. The gate counts lines executed in a
       # single run, and each platform necessarily leaves the other's branches
-      # untouched, so requiring 90% on every leg would fail for the wrong reason.
+      # untouched, so requiring 97% on every leg would fail for the wrong reason.
+      # What that leaves unmeasured on this leg is `docs/testing.md` → *The
+      # ceiling*, which also says why the gate sits below the number a run reaches.
       - name: Run tests with coverage
         if: matrix.os == 'windows-latest'
         shell: pwsh

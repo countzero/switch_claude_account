@@ -17,8 +17,14 @@ Param (
     # threshold, $result.Result becomes 'Failed' and the exit predicate
     # below honors it. Pass -CoverageThreshold 0 to disable the gate
     # without losing the printed summary (-SkipCoverage skips both).
+    #
+    # 97 rather than the ~98.6% a full Windows run reaches, because the
+    # headroom above it is what a new platform-conditional branch spends:
+    # coverage is measured on one OS, so the other's arms are never executed
+    # and each one added lowers the number without anything being untested.
+    # `docs/testing.md` → *The ceiling* has the residue this leaves.
     [ValidateRange(0, 100)]
-    [int] $CoverageThreshold = 90
+    [int] $CoverageThreshold = 97
 )
 
 $ErrorActionPreference = 'Stop'

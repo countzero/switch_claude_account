@@ -564,6 +564,21 @@ Describe 'switch_claude_account' {
 
             Read-ScaState | Should -BeNullOrEmpty
         }
+
+        # Persisting the migration is an optimisation: it makes the next read
+        # O(1). The read itself already has the answer, so a failed write must
+        # cost the caller nothing, and the migration simply runs again next
+        # time.
+        It 'reports the migrated state even when persisting it fails' {
+            Set-Content -LiteralPath (Join-Path $script:SandboxCredDir '.credentials.json')                         -Value 'PAYLOAD' -NoNewline
+            Set-Content -LiteralPath (Join-Path $script:SandboxCredDir '.credentials.work(alice@example.com).json') -Value 'PAYLOAD' -NoNewline
+            Mock Write-ScaState -MockWith { throw [System.IO.IOException]::new('read-only volume') }
+
+            $r = Read-ScaState
+
+            $r.active_slot | Should -Be 'work'
+            Test-Path -LiteralPath $StateFile | Should -BeFalse
+        }
     }
 
     Context 'Update-ScaState' {
@@ -618,6 +633,22 @@ Describe 'switch_claude_account' {
             $r.last_sync_hash | Should -Be 'h1'
         }
 
+        # Read-ScaState always supplies auth_verdicts, so the only way in is a
+        # caller that built the state object itself. Without the block the next
+        # assignment to it would fail on a property that is not there, which
+        # would take down whichever action happened to record a verdict first.
+        It 'adds the auth_verdicts block to a state object that predates it' {
+            Mock Read-ScaState -MockWith {
+                [pscustomobject]@{ schema = 1; active_slot = 'work'; last_sync_hash = 'h' }
+            }
+
+            $r = Update-ScaState -LastSyncHash 'h2'
+
+            $r.PSObject.Properties['auth_verdicts'] | Should -Not -BeNullOrEmpty
+            $r.auth_verdicts       | Should -BeOfType [hashtable]
+            $r.auth_verdicts.Count | Should -Be 0
+            $r.last_sync_hash      | Should -Be 'h2'
+        }
     }
 
     Context 'Legacy state-file tolerance (v2.3.0 - v2.4.0-draft compatibility)' {
@@ -758,6 +789,45 @@ Describe 'switch_claude_account' {
             $r = Read-ScaState
             $r.auth_verdicts.Count | Should -Be 1
             $r.auth_verdicts.ContainsKey('kept') | Should -BeTrue
+        }
+
+        # error is optional in the stored shape: claude -p can prove a grant is
+        # dead without producing a sentence about it. The reader has to keep
+        # such an entry, because status and cred_hash are what make it usable.
+        It 'keeps a verdict that carries no error text' {
+            $stateJson = '{"schema":1,"active_slot":"work","last_sync_hash":"h","auth_verdicts":{' +
+                         '"quiet":{"status":"expired","cred_hash":"abc"}}}'
+            Set-Content -LiteralPath $StateFile -Value $stateJson -NoNewline -Encoding utf8NoBOM
+
+            $r = Read-ScaState
+            $r.auth_verdicts.ContainsKey('quiet') | Should -BeTrue
+            $r.auth_verdicts['quiet'].status      | Should -Be 'expired'
+            $r.auth_verdicts['quiet'].error       | Should -BeNullOrEmpty
+        }
+
+        # A verdict is a label. Losing one costs a row the honest word for why
+        # it failed; failing the action that was recording it costs the user
+        # the thing they actually asked for.
+        It 'does not throw when the verdict cannot be recorded' {
+            Mock Update-ScaState -MockWith { throw [System.IO.IOException]::new('state file locked') }
+
+            { Set-SlotAuthVerdict -SlotName 'work' -SlotPath $script:vSlot -Status 'expired' -ErrorMessage 'boom' } |
+                Should -Not -Throw
+        }
+
+        It 'does not throw when the verdict cannot be cleared' {
+            Set-SlotAuthVerdict -SlotName 'work' -SlotPath $script:vSlot -Status 'expired' -ErrorMessage 'boom'
+            Mock Update-ScaState -MockWith { throw [System.IO.IOException]::new('state file locked') }
+
+            { Clear-SlotAuthVerdict -SlotName 'work' } | Should -Not -Throw
+        }
+
+        # Verdicts are keyed by slot name, which only a parseable slot filename
+        # yields. Anything else has no key to look up.
+        It 'returns null for a path that is not a slot filename' {
+            Set-SlotAuthVerdict -SlotName 'work' -SlotPath $script:vSlot -Status 'expired' -ErrorMessage 'boom'
+
+            Get-SlotAuthVerdict -SlotPath (Join-Path $script:vCredDir 'notes.txt') | Should -BeNullOrEmpty
         }
 
         It 'tolerates a state file with no auth_verdicts block at all' {
