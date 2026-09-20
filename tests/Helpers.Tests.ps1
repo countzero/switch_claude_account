@@ -1840,6 +1840,41 @@ Describe 'switch_claude_account' {
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
 
+        # `sca warmup` prints and pauses; the watch paints into an alt-screen
+        # buffer and cannot, so the footer latch is its only channel.
+
+        It 'latches the live-client notice when Claude Code is running' {
+            Mock Test-ClaudeRunning -MockWith { $true }
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+
+            $s.WarmLatch | Should -Match 'Claude Code is running'
+            $s.WarmLatch | Should -Match 'bills whichever slot is mounted'
+        }
+
+        It 'keeps the seeded latch when no Claude Code is running' {
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+            $s.WarmLatch | Should -Be '[Warmup] Keeping all slots warm.'
+        }
+
+        It 'latches the advisory when the pass stopped early' {
+            # Invoke-WarmAllSlots stops rather than overwrite bytes nothing
+            # captured, which leaves the user on a slot they did not choose.
+            Mock Invoke-WarmAllSlots -MockWith {
+                [pscustomobject]@{
+                    Results        = @([pscustomobject]@{ Name = 'alpha' })
+                    NoSlots        = $false
+                    HasRateLimited = $false
+                    Advisory       = "[Warmup] Stopped at 'alpha': nothing captured the credentials Claude Code left active."
+                }
+            }
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+
+            $s.WarmLatch | Should -Match "Stopped at 'alpha'"
+        }
+
         It 'stamps the last-poll time so the loop redraws instead of re-polling' {
             # The pass already produced a frame; leaving LastPoll at MinValue
             # would make the loop's first iteration fire a second full poll

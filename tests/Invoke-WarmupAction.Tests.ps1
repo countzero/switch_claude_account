@@ -71,6 +71,58 @@ Describe 'switch_claude_account' {
             Should -Invoke Invoke-SlotActivator -Times 1 -Exactly
         }
 
+        # The warning alone is not a decision: the first billable `claude -p`
+        # follows it by milliseconds, so a user reads it with the round-robin
+        # already under way. The pause is what makes the Ctrl-C it implies
+        # reachable. Common.ps1 zeroes the constant for the rest of the suite.
+        It 'pauses before the first activation when Claude Code is running' {
+            Mock Test-ClaudeRunning -MockWith { $true }
+            Mock Start-Sleep -MockWith { }
+            $Script:WarmupLiveClientPauseSec = 5
+            New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null
+
+            $out = Invoke-WarmupAction -Name '' 6>&1 | Out-String
+
+            $out | Should -Match 'Ctrl-C to abort'
+            Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 5 }
+        }
+
+        It 'does not pause when no Claude Code is running' {
+            Mock Start-Sleep -MockWith { }
+            $Script:WarmupLiveClientPauseSec = 5
+            New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null
+
+            Invoke-WarmupAction -Name '' 6>$null
+
+            Should -Invoke Start-Sleep -Times 0 -Exactly
+        }
+
+        # The pass stops rather than overwrite bytes nothing captured, which
+        # leaves the user on a slot they did not choose. That is the one thing
+        # they have to read, so it precedes the table.
+        It 'prints the pass advisory ahead of the usage table' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null
+            Mock Invoke-WarmAllSlots -MockWith {
+                [pscustomobject]@{
+                    Results        = @(
+                        [pscustomobject]@{
+                            Name = 'a'; Email = 'a@test.local'; IsActive = $true
+                            Status = 'ok'; Data = $null; Error = $null
+                            IsCachedFallback = $false; HttpStatus = $null; FallbackReason = $null
+                        }
+                    )
+                    NoSlots        = $false
+                    HasRateLimited = $false
+                    Advisory       = "[Warmup] Stopped at 'a': nothing captured the credentials Claude Code left active."
+                }
+            }
+
+            $out = Invoke-WarmupAction -Name '' 6>&1 | Out-String
+
+            $out | Should -Match "Stopped at 'a'"
+            $out.IndexOf('Stopped at') | Should -BeLessThan $out.IndexOf('Plan usage')
+        }
+
         It 'refuses when the claude CLI is not on PATH' {
             Mock Get-Command -ParameterFilter { $Name -eq 'claude' } -MockWith { $null }
             New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null

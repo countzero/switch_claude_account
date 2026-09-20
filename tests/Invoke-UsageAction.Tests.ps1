@@ -4246,15 +4246,13 @@ Describe 'switch_claude_account' {
                     throw [System.Exception]::new('synthetic restore failure on a')
                 }
             }
-            Mock Write-Color -MockWith { }
-
-            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
 
             # Call order: a (round-robin), b (round-robin), c (throws),
             # a (restore, throws).
-            $script:swapNames | Should -Be @('a', 'b', 'c', 'a')
-            Should -Invoke Write-Color -Times 1 -Exactly -ParameterFilter { $Message -match "active on 'b'" }
-            Should -Invoke Write-Color -Times 0 -Exactly -ParameterFilter { $Message -match "active on 'c'" }
+            $script:swapNames  | Should -Be @('a', 'b', 'c', 'a')
+            $snap.Advisory     | Should -Match "active on 'b'"
+            $snap.Advisory     | Should -Not -Match "active on 'c'"
         }
 
         It 'restore-failure advisory names the last primed slot when every round-robin swap succeeded' {
@@ -4277,12 +4275,129 @@ Describe 'switch_claude_account' {
                     throw [System.Exception]::new('synthetic restore failure on a')
                 }
             }
-            Mock Write-Color -MockWith { }
-
-            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
 
             $script:swapNames | Should -Be @('a', 'b', 'c', 'a')
-            Should -Invoke Write-Color -Times 1 -Exactly -ParameterFilter { $Message -match "active on 'c'" }
+            $snap.Advisory    | Should -Match "active on 'c'"
+        }
+
+        # The three ways the mirror that the round-robin depends on can fail to
+        # happen. Each ends with a slot holding a refresh token the server has
+        # already rotated unless the pass stops, which is the one loss here no
+        # later pass repairs. See Invoke-Reconcile's `Captured`.
+
+        It 'mirrors the slot even when the activator throws after claude -p ran' {
+            # The activator can throw AFTER `claude -p` has run and refreshed
+            # (reading its output files, reaching for its exit code). The
+            # reconcile has to run anyway, or the next swap discards that
+            # refresh; a sequential call would have been skipped by the catch.
+            New-WarmupSlot -Name 'a' | Out-Null
+
+            Mock Invoke-SlotActivator -MockWith {
+                throw [System.Exception]::new('synthetic post-spawn activator failure')
+            }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            Should -Invoke Invoke-Reconcile -Times 1 -Exactly
+            (Get-RowStatus $snap 'a')                          | Should -Be 'error'
+            ($snap.Results | Where-Object Name -eq 'a').Error  | Should -Match 'synthetic post-spawn'
+            # The mirror vouched for the bytes, so the pass is not an abort.
+            $snap.Advisory | Should -BeNullOrEmpty
+        }
+
+        It 'stops the pass and skips the restore when the mirror reports Captured = $false' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            New-WarmupSlot -Name 'c' | Out-Null
+            $statePath = Join-Path $script:CredDirPath '.sca-state.json'
+            $stateBody = @{ schema = 1; active_slot = 'a'; last_sync_hash = 'deadbeef' } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $statePath -Value $stateBody -NoNewline -Encoding utf8NoBOM
+
+            Mock Invoke-Reconcile -MockWith {
+                New-ReconcileResult -Action 'noop' -Reason 'identity-unresolved' -Slot 'a' -Captured $false
+            }
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith { Param ($Slot); $script:swapNames += $Slot.Name }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            # One swap only: 'b' is never reached and the restore to 'a' is
+            # skipped, because both would overwrite the uncaptured bytes.
+            $script:swapNames | Should -Be @('a')
+            $snap.Advisory    | Should -Match "Stopped at 'a'"
+            $snap.Advisory    | Should -Match 'identity-unresolved'
+            $snap.Advisory    | Should -Match "sca save a"
+        }
+
+        It 'stops the pass when the mirror itself throws' {
+            # Invoke-Reconcile's mirror branch writes through
+            # Set-CredentialFileAtomic, which throws. That proves nothing about
+            # the bytes either way, so it is as unsafe to write over as an
+            # explicit Captured = $false.
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            $statePath = Join-Path $script:CredDirPath '.sca-state.json'
+            $stateBody = @{ schema = 1; active_slot = 'a'; last_sync_hash = 'deadbeef' } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $statePath -Value $stateBody -NoNewline -Encoding utf8NoBOM
+
+            Mock Invoke-Reconcile -MockWith {
+                throw [System.Exception]::new('synthetic atomic write failure')
+            }
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith { Param ($Slot); $script:swapNames += $Slot.Name }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            $script:swapNames | Should -Be @('a')
+            $snap.Advisory    | Should -Match "Stopped at 'a'"
+            $snap.Advisory    | Should -Match 'synthetic atomic write failure'
+        }
+
+        It 'treats a reconcile that returned nothing as proof of nothing' {
+            # `Mock Invoke-Reconcile { }` returns $null, which Common.ps1 warns
+            # reads as Captured = $false to every caller. Production always
+            # returns an object, so this guards the harness shape rather than a
+            # reachable path: a stub must not be able to wave the pass through.
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+
+            Mock Invoke-Reconcile -MockWith { }
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith { Param ($Slot); $script:swapNames += $Slot.Name }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            $script:swapNames | Should -Be @('a')
+            $snap.Advisory    | Should -Match 'the reconcile returned nothing'
+        }
+
+        It 'a swap failure fails its own slot only, because an atomic rename leaves the file captured' {
+            # The counterpart to the three aborts above: Invoke-SlotSwap writes
+            # through an atomic rename, so a throw leaves .credentials.json
+            # exactly as the previous slot's mirror captured it. Nothing is at
+            # risk, so the pass must NOT stop.
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith {
+                Param ($Slot)
+                $script:swapNames += $Slot.Name
+                if ($Slot.Name -eq 'a') { throw [System.Exception]::new('synthetic swap failure on a') }
+            }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            $script:swapNames        | Should -Be @('a', 'b')
+            (Get-RowStatus $snap 'a') | Should -Be 'error'
+            (Get-RowStatus $snap 'b') | Should -Be 'ok'
+            $snap.Advisory           | Should -BeNullOrEmpty
+            # The failed swap never activated, so it must not have mirrored.
+            Should -Invoke Invoke-Reconcile -Times 1 -Exactly
         }
     }
 
@@ -4680,6 +4795,41 @@ Describe 'switch_claude_account' {
                                 -CooldownMin 5 -CurrentLatch 'x' | Out-Null
 
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
+        }
+
+        # The watch suppresses Invoke-WarmAllSlots' information stream, so the
+        # footer latch is the only channel these two facts have.
+
+        It 'latches the live-client notice alongside the re-warm line' {
+            # `sca warmup` pauses to say this; a watch cannot, and its round-
+            # robin repeats for the life of the session, so the latch carries
+            # it. Re-tested per re-warm because a client opened mid-watch is
+            # dragged across every account by the very next pass.
+            Mock Test-ClaudeRunning { $true }
+            $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x'
+
+            $lines = $out -split "`n"
+            $lines[0] | Should -Match 'Claude Code is running'
+            $lines[0] | Should -Match 'bills whichever slot is mounted'
+            # The slot roll-call survives the prepend.
+            $lines[1] | Should -Match "^\[Warmup\] Re-warmed 'a' at"
+        }
+
+        It 'latches the pass advisory over the re-warm line' {
+            Mock Invoke-WarmAllSlots {
+                [pscustomobject]@{
+                    Results  = @([pscustomobject]@{ Name = 'a'; Status = 'error' })
+                    Advisory = "[Warmup] Stopped at 'a': nothing captured the credentials Claude Code left active."
+                }
+            }
+            $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x'
+
+            $out | Should -Match "Stopped at 'a'"
+            $out | Should -Not -Match 'Re-warmed'
         }
     }
 

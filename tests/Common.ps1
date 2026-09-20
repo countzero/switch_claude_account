@@ -88,9 +88,12 @@ if (-not $script:ScaKeepRealClaudeRunning) {
 # because $Script:TokenRefreshRetryMax stays at its production value;
 # only the wall-clock wait between attempts goes to zero. Same trick
 # for $Script:WarmupSpacingMs so the warmup loop's per-slot 300 ms
-# pacing does not multiply across many-slot tests.
+# pacing does not multiply across many-slot tests, and for
+# $Script:WarmupLiveClientPauseSec, which would otherwise add 5 real
+# seconds to every test that lets Test-ClaudeRunning answer $true.
 $Script:TokenRefreshRetryDelayMs   = 0
 $Script:WarmupSpacingMs            = 0
+$Script:WarmupLiveClientPauseSec   = 0
 
 # --- Test fixtures --------------------------------------------------------
 

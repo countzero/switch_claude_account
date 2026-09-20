@@ -1078,9 +1078,12 @@ function Update-ScaState {
 # (docs/claude-code-internals.md -> Token refresh). The real loss was sca's
 # own: the round-robin discarded a refresh claude had landed whenever the
 # activation then failed for some other reason. That is fixed where it
-# happened, in Invoke-WarmAllSlots' mirror, so what is left is a prompt sent
-# mid-pass billing whichever slot is mounted. A surprise, not a loss, and
-# `sca warmup` says so before it starts.
+# happened, in Invoke-WarmAllSlots: the mirror runs in a finally so no throw
+# can skip it, and the pass stops instead of swapping again whenever that
+# mirror cannot vouch for the bytes. What is left is a prompt sent mid-pass
+# billing whichever slot is mounted. A surprise, not a loss, which `sca
+# warmup` both states and pauses for, and which the watch carries in its
+# footer latch for as long as the round-robin keeps running.
 #
 # What sca risks by writing beside a live client, in both files:
 #
@@ -5848,8 +5851,17 @@ function Invoke-WarmupAction {
     # rather than refuse: nothing here is destructive (Test-ClaudeRunning owns
     # the evidence), but a prompt sent mid-pass bills whichever slot happens to
     # be mounted, and only the user knows whether they are about to type one.
+    #
+    # Then wait, because the warning alone is not a decision: the first
+    # `claude -p` follows it by milliseconds, so a user reads it with the
+    # round-robin already under way. The pause is what makes the Ctrl-C it
+    # implies reachable.
     if (Test-ClaudeRunning) {
-        Write-Color "[Warmup] Claude Code is running. Each slot becomes active in turn and your session follows; a prompt sent during the pass bills whichever slot is mounted." 'Yellow'
+        Write-Color $Script:WarmupLiveClientNotice 'Yellow'
+        if ($Script:WarmupLiveClientPauseSec -gt 0) {
+            Write-Color "[Warmup] Starting in $($Script:WarmupLiveClientPauseSec)s; press Ctrl-C to abort." 'Yellow'
+            Start-Sleep -Seconds $Script:WarmupLiveClientPauseSec
+        }
     }
 
     Write-Color "[Warmup] Activating saved slots via 'claude -p' (billable; ~`$0.004/slot on Haiku, a few seconds each)..." 'DarkYellow'
@@ -5864,6 +5876,11 @@ function Invoke-WarmupAction {
         Write-Color "[Warmup] No slots $scope to activate. Use: sca save <name>" 'Yellow'
         return
     }
+
+    # Ahead of the table rather than after it: it says which account the user
+    # is left on, and a table of percentages is not what they need to read
+    # first when the answer is "not the one you started on".
+    if ($snapshot.Advisory) { Write-Color $snapshot.Advisory 'Yellow' }
 
     Write-Host ''
     Format-UsageFrame -Name $Name -Snapshot $snapshot
@@ -6333,6 +6350,24 @@ $Script:WarmupCooldownMin  = 5
 # warm, so nothing is sticky once the condition clears.
 $Script:WarmupBackoffMaxDoublings = 5
 
+# What a live Claude Code costs the warm round-robin, in one line, shared by
+# `sca warmup` and `monitor -KeepWarm` so the two cannot describe the same
+# hazard differently. Test-ClaudeRunning owns why this is a notice and not a
+# refusal. One line because the watch renders it as a footer latch.
+$Script:WarmupLiveClientNotice = "[Warmup] Claude Code is running. Each slot becomes active in turn and your session follows; a prompt sent during the pass bills whichever slot is mounted."
+
+# How long `sca warmup` waits after printing that notice before the first
+# billable `claude -p`, so it is a decision point (Ctrl-C) rather than a label
+# read once the pass is already under way. A prompt would be the stronger gate
+# and was rejected: it needs a rule for a redirected stdin, and `sca warmup`
+# is a command people put in a scheduler.
+#
+# The watch has no equivalent. Its round-robin is the thing the user asked
+# for and it repeats for the life of the session, so a one-time pause would
+# answer for a hazard that outlives it; the footer latch carries it instead.
+# Tunable for tests (Common.ps1 overrides to zero).
+$Script:WarmupLiveClientPauseSec = 5
+
 # Slot activator (`claude -p`) settings. Warmup opens a slot's 5h session
 # window by running the real Claude Code CLI as that slot, exactly as a
 # user typing one message would (Invoke-SlotActivator). This delegates the
@@ -6398,10 +6433,15 @@ $Script:ActivatorTimeoutSec = 90
 # The original active slot is captured before the loop via Read-ScaState
 # + Find-SlotByName. A finally block restores it via one more Invoke-Slot-
 # Swap so a clean exit (or Ctrl-C, which still runs finally) returns the
-# user where they started. Restore failure logs a yellow advisory naming
-# the slot the user is now active on. No active slot captured (fresh
-# install, sidecar-hidden active) is fine: the finally guard skips the
-# restore and the user ends on the last activated slot.
+# user where they started. No active slot captured (fresh install,
+# sidecar-hidden active) is fine: the finally guard skips the restore and
+# the user ends on the last activated slot.
+#
+# The pass stops the moment a reconcile cannot vouch for the bytes claude
+# left active, and the restore is then skipped too, because it is one more
+# overwrite of exactly those bytes. That and a failed restore are the two
+# outcomes the user has to be told about, and both land on the returned
+# snapshot's `Advisory` rather than on stdout; see the field.
 #
 # $Repaint is invoked as: & $Repaint $snapshot. The `claude -p` spawn
 # (seconds) naturally floors the 'priming' label's on-screen visibility,
@@ -6453,6 +6493,13 @@ function Invoke-WarmAllSlots {
         Results        = $rows
         NoSlots        = $false
         HasRateLimited = $false
+        # The one thing a caller must tell the user about where this pass left
+        # their credentials: it stopped early, or the restore failed. $null
+        # when neither happened. Carried on the snapshot rather than written
+        # here because both watch call sites suppress this function's
+        # information stream (6>$null), so a Write-Color would reach nobody
+        # there; each caller renders it on the surface it owns.
+        Advisory       = $null
     }
     & $Repaint $snapshot
 
@@ -6472,11 +6519,26 @@ function Invoke-WarmAllSlots {
     $lastSwapped = $origActive
 
     $last = $rows.Count - 1
+    # Set when a reconcile could not vouch for the bytes claude left active.
+    # Separate from $snapshot.Advisory because it gates the restore below,
+    # which the restore's own failure message must not do.
+    $uncaptured = $false
     try {
         for ($i = 0; $i -le $last; $i++) {
             $row = $rows[$i]
             $row.Status = 'priming'
             & $Repaint $snapshot
+
+            # $activated is set the instant the swap succeeds, which is the
+            # instant `claude -p` may begin refreshing this slot's grant. It
+            # gates the capture check after the loop body: a swap that throws
+            # never reaches it and leaves .credentials.json exactly as the
+            # previous iteration captured it (Set-CredentialFileAtomic is an
+            # atomic rename, so a failed write is a no-op), which is why such a
+            # slot fails alone instead of stopping the pass.
+            $activated = $false
+            $sync      = $null
+            $syncError = $null
 
             # 6>$null suppresses [Switch] / [Sync] advisories so they
             # don't paint outside the DEC 2026 sync envelope. The try/
@@ -6493,13 +6555,27 @@ function Invoke-WarmAllSlots {
                 # Swap succeeded (it throws on failure): this slot is now
                 # the live active slot. Record it for the restore advisory.
                 $lastSwapped = $row
-                $r = Invoke-SlotActivator -SlotPath $row.Path 6>$null
+                $activated   = $true
 
-                # Capture whatever claude left in .credentials.json before the
-                # next iteration's swap overwrites it. Mirror-then-verify on
-                # the docblock owns why this runs on every outcome and why it
-                # must precede the usage read. Never throws.
-                $sync = Invoke-Reconcile 6>$null
+                try {
+                    $r = Invoke-SlotActivator -SlotPath $row.Path 6>$null
+                }
+                finally {
+                    # Capture whatever claude left in .credentials.json before
+                    # the next iteration's swap overwrites it. Mirror-then-
+                    # verify on the docblock owns why this runs on every
+                    # outcome and why it must precede the usage read.
+                    #
+                    # In a finally because by the time anything above can throw,
+                    # `claude -p` has already run and its refresh exists only in
+                    # .credentials.json; the catch below would otherwise let the
+                    # next swap discard it. Caught separately so a throw from
+                    # the mirror's own atomic write neither replaces the
+                    # activator's exception nor passes for a capture: $sync
+                    # stays $null and the check below stops the pass.
+                    try   { $sync = Invoke-Reconcile 6>$null }
+                    catch { $syncError = $_.Exception.Message }
+                }
 
                 if ($r.Status -eq 'ok') {
                     # Drop any backoff stamp first: a successful activation is
@@ -6558,15 +6634,37 @@ function Invoke-WarmAllSlots {
             $snapshot.HasRateLimited = (@($rows | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0)
             & $Repaint $snapshot
 
+            # claude refreshed the grant, nothing mirrored it into a slot, and
+            # every write this pass has left -- the next iteration's swap and
+            # the restore below -- would discard it, leaving that slot holding a
+            # refresh token the server has already rotated. The one loss here
+            # no later pass can repair, so stop and leave the bytes in
+            # .credentials.json where `sca save` can still reach them. Read as
+            # a field rather than an Action allowlist, per Invoke-Reconcile's
+            # `Captured`; a $null $sync means the reconcile itself threw and
+            # proved nothing either way, which is equally unsafe to write over.
+            if ($activated -and (-not $sync -or -not $sync.Captured)) {
+                $uncaptured = $true
+                $detail = if ($syncError) { Format-StatusErrorTail -Message $syncError }
+                          elseif ($sync)  { "reconcile reported '$($sync.Reason)'" }
+                          else            { 'the reconcile returned nothing' }
+                $snapshot.Advisory = "[Warmup] Stopped at '$($row.Name)': nothing captured the credentials Claude Code left active ($detail), and warming on would discard a token refresh. You are active on '$($row.Name)'; close Claude Code and run 'sca save $($row.Name)' to keep them."
+                break
+            }
+
             if ($i -lt $last -and $Script:WarmupSpacingMs -gt 0) {
                 Start-Sleep -Milliseconds $Script:WarmupSpacingMs
             }
         }
     }
     finally {
-        if ($origActive) {
+        # The restore is itself a .credentials.json overwrite, so it is exactly
+        # what the abort above exists to prevent; skipping it is what leaves
+        # the uncaptured bytes reachable. That Advisory already names the slot
+        # the user is left on, so nothing is repeated here.
+        if ($origActive -and -not $uncaptured) {
             try { Invoke-SlotSwap -Slot $origActive 6>$null }
-            catch { Write-Color "[Warmup] Restore of original active slot '$($origActive.Name)' failed: $($_.Exception.Message). You are now active on '$($lastSwapped.Name)'." 'Yellow' 6>$null }
+            catch { $snapshot.Advisory = "[Warmup] Restore of original active slot '$($origActive.Name)' failed: $(Format-StatusErrorTail -Message $_.Exception.Message). You are now active on '$($lastSwapped.Name)'." }
         }
     }
     return $snapshot
@@ -6730,7 +6828,22 @@ function Invoke-KeepWarmStep {
             if ($outcome[$n] -eq 'ok') { $WarmupFailures.Remove($n) }
             else { $WarmupFailures[$n] = 1 + [int]$WarmupFailures[$n] }
         }
-        return "[Warmup] Re-warmed $list at $($now.ToString('HH:mm:ss'))"
+
+        # Takes the latch over the re-warm line: the pass stopped early, or it
+        # left the user on a slot they did not choose, and either outranks a
+        # roll-call of what was warmed. The 6>$null above is why this has to
+        # come off the snapshot rather than off stdout.
+        if ($warmed.Advisory) { return $warmed.Advisory }
+
+        $latch = "[Warmup] Re-warmed $list at $($now.ToString('HH:mm:ss'))"
+
+        # Re-tested per re-warm rather than once at startup: a watch runs for
+        # hours, and a client opened at hour three is dragged across every
+        # account by the very next pass. Prepended rather than replacing the
+        # line, so the latch still says which slots moved; Format-UsageFooter
+        # splits on the newline and renders both.
+        if (Test-ClaudeRunning) { return "$Script:WarmupLiveClientNotice`n$latch" }
+        return $latch
     }
     catch {
         # Stamp the attempt anyway so a hard failure does not re-fire every
@@ -7074,6 +7187,13 @@ function Invoke-WatchStartupWarm {
         throw (Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca monitor -KeepWarm')
     }
 
+    # Set before the pass so the very first frame carries it: this round-robin
+    # walks a live session across every saved account, and unlike `sca warmup`
+    # the watch cannot pause to say so. Overwrites New-WatchSession's seeded
+    # '[Warmup] Keeping all slots warm.', which describes the same activity
+    # without the part that costs the user money.
+    if (Test-ClaudeRunning) { $Session.WarmLatch = $Script:WarmupLiveClientNotice }
+
     # -Auto's right-aligned "▶ switching slot at N%" header indicator stays
     # off when -Auto is absent.
     $autoHeader = if ($Auto) { $Threshold } else { 0 }
@@ -7087,6 +7207,13 @@ function Invoke-WatchStartupWarm {
         }
     }
     if ($null -eq $Session.Snapshot) { return }
+
+    # The pass suppresses nothing here, but its own advisories are written
+    # through Write-Color, which would paint outside the frame's sync
+    # envelope; the latch is the loop's channel for them. Overwrites the
+    # seeded '[Warmup] Keeping all slots warm.' because that claim is exactly
+    # what an advisory contradicts.
+    if ($Session.Snapshot.Advisory) { $Session.WarmLatch = $Session.Snapshot.Advisory }
 
     $Session.LastPoll = [DateTime]::Now
     try {
