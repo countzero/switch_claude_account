@@ -3,6 +3,23 @@
 This changelog follows [Common Changelog](https://common-changelog.org) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.0] - 2026-09-20
+
+_Upgrading is replacing one file. `sca warmup` and `sca monitor -KeepWarm` now run beside an open Claude Code instead of refusing, and the `Session` aggregate bar reports a different number wherever a slot has capped its week._
+
+### Changed
+- Run the warm round-robin of `sca warmup` and `sca monitor -KeepWarm` beside a live Claude Code.
+- Average the `Session` aggregate bar over reachable slots only, dropping any slot whose week has capped.
+- Pause `sca warmup` for five seconds before the first billable activation when Claude Code is running.
+
+### Fixed
+- Mirror the active credentials after every activation, including one whose `claude -p` then threw.
+- Stop the warm pass, and skip its restore, when nothing could capture the credentials left active.
+- Show the warm pass's restore failure instead of discarding it into a suppressed stream.
+- Carry the live-client warning into `sca monitor -KeepWarm`, at startup and at every re-warm.
+- Guard the watch's console cursor restore so a failure there cannot unwind the terminal restore.
+- Correct the README's claim that a full `Session` bar means the week has capped every slot.
+
 ## [4.1.0] - 2026-09-19
 
 _Upgrading is replacing one file. A hot swap is only followed without a restart by Claude Code >= 2.1.274 or opencode-claude-auth >= 1.5.4, and `sca switch` can now refuse, and exit non-zero, where it previously always succeeded._
@@ -295,6 +312,7 @@ _Upgrading migrates active-slot tracking from hardlinks to a state file on first
 - Add a README with installation, usage, workflow, Windows notes and testing sections.
 - Add `CLAUDE.md` with agent guidance for the repo structure, gotchas and script-shape conventions.
 
+[4.2.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.2.0
 [4.1.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.1.0
 [4.0.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.0.0
 [3.0.1]: https://github.com/countzero/switch_claude_account/releases/tag/v3.0.1
