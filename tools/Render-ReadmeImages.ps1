@@ -289,43 +289,44 @@ $watchAutoLines = New-HeroLines -Palette $campbellPalette
 #
 # The whole monitor scene is repeated per theme rather than a swatch strip:
 # the question a reader brings here is "what will this look like", and the
-# answer is the view they will actually sit in front of. Each panel is painted
-# on that theme's own base00, so the canvas `usage -Watch` and `monitor` apply
-# is shown rather than described.
+# answer is the view they will actually sit in front of.
 #
-# `default` leads, unpainted. It spells its roles as named ANSI and so owns no
-# background, taking whatever the terminal supplies; Campbell stands in for
-# that here and docs/themes.md says so, because no single image can be honest
-# about a palette-relative theme.
+# The canvas is freeze's own --background, NOT an SGR painted behind each row.
+# Painting per row leaves the window's 30px padding showing the default
+# terminal black around the edges, so the panel reads as a themed rectangle
+# floating on somebody else's background. Handing the color to --background
+# fills the whole window face, and makes the per-row paint and the
+# pad-to-width that went with it unnecessary.
+#
+# `default` uses Campbell. It spells its roles as named ANSI and so owns no
+# background, taking whatever the terminal supplies; docs/themes.md says as
+# much, because no single image can be honest about a palette-relative theme.
 . (Join-Path $repoRoot 'switch_claude_account.ps1')
 
 function Get-GallerySgr {
-    Param ([int] $Rgb, [switch] $Background)
+    Param ([int] $Rgb)
 
-    $layer = if ($Background) { 48 } else { 38 }
     $r = ($Rgb -shr 16) -band 0xFF
     $g = ($Rgb -shr 8)  -band 0xFF
     $b =  $Rgb          -band 0xFF
-    return "$ESC[$layer;2;$r;$g;${b}m"
+    return "$ESC[38;2;$r;$g;${b}m"
 }
 
 $galleryThemes = @(
     [pscustomobject]@{
-        Name    = 'default'
-        Bg      = ''
-        PanelFg = ''
-        Label   = $DKYEL
-        Palette = $campbellPalette
+        Name       = 'default'
+        Background = '#0C0C0C'
+        PanelFg    = ''
+        Palette    = $campbellPalette
     }
 )
 foreach ($schemeName in ($Script:Base16Schemes.Keys | Sort-Object)) {
     $scheme = $Script:Base16Schemes[$schemeName]
     $galleryThemes += [pscustomobject]@{
-        Name    = $schemeName
-        Bg      = (Get-GallerySgr $scheme.base00 -Background)
-        PanelFg = (Get-GallerySgr $scheme.base05)
-        Label   = (Get-GallerySgr $scheme.base0D)
-        Palette = @{
+        Name       = $schemeName
+        Background = ('#{0:X6}' -f $scheme.base00)
+        PanelFg    = (Get-GallerySgr $scheme.base05)
+        Palette    = @{
             Heading = (Get-GallerySgr $scheme.base0D)
             Warning = (Get-GallerySgr $scheme.base0A)
             Success = (Get-GallerySgr $scheme.base0B)
@@ -339,38 +340,26 @@ foreach ($schemeName in ($Script:Base16Schemes.Keys | Sort-Object)) {
     }
 }
 
-# Paint a scene onto a theme's canvas.
+# Give a scene the theme's body-text color.
 #
-# Two details do the work. Every ESC[0m in the scene is followed by the canvas
-# being re-asserted, because a reset drops the background along with the
-# foreground and would otherwise punch a hole from that point to the end of
-# the line -- the same rule ConvertTo-WatchFrameSequence follows at runtime.
-# And each line is padded to a common width measured on the text with its SGR
-# stripped, so the blocks end flush; a ragged right edge would read as a
-# rendering fault rather than as a difference between palettes.
+# Only the foreground needs doing here; --background owns the canvas. The
+# re-assertion after every ESC[0m is what makes it work: Write-Color's scenes
+# end each colored run with a full reset, which would otherwise drop the
+# uncolored remainder of a line back to freeze's own #c4c4c4 rather than the
+# theme's base05.
 function ConvertTo-ThemedPanel {
     Param (
         # AllowEmptyString because the scene uses blank lines as spacing, and
         # Mandatory alone rejects an array element that is ''.
         [Parameter(Mandatory)] [AllowEmptyString()] [string[]] $Lines,
-        [string] $Bg,
-        [string] $Fg,
-        [Parameter(Mandatory)] [int] $Width
+        [string] $Fg
     )
 
-    $canvas = $Bg + $Fg
     foreach ($line in $Lines) {
-        $painted = $canvas + $line.Replace($RESET, $RESET + $canvas)
-        $visible = ($line -replace "$ESC\[[0-9;]*m", '').Length
-        $painted + (' ' * [Math]::Max(0, $Width - $visible)) + $RESET
+        if (-not $Fg) { $line; continue }
+        $Fg + $line.Replace($RESET, $RESET + $Fg) + $RESET
     }
 }
-
-# Measured from the scene itself so an edit to a table column cannot leave the
-# canvas too narrow for it.
-$panelWidth = 2 + ((New-HeroLines -Palette $campbellPalette |
-    ForEach-Object { ($_ -replace "$ESC\[[0-9;]*m", '').Length } |
-    Measure-Object -Maximum).Maximum)
 
 $scenarios = @(
     [pscustomobject]@{ Name = 'usage-watch';   Lines = $watchLines     },
@@ -386,13 +375,11 @@ $scenarios = @(
 # longer carries a label of its own.
 foreach ($gt in $galleryThemes) {
     $scenarios += [pscustomobject]@{
-        Name      = "theme-$($gt.Name)"
-        ShareFont = $true
-        Lines     = ConvertTo-ThemedPanel `
+        Name       = "theme-$($gt.Name)"
+        Background = $gt.Background
+        Lines      = ConvertTo-ThemedPanel `
             -Lines (New-HeroLines -Palette $gt.Palette) `
-            -Bg    $gt.Bg `
-            -Fg    $gt.PanelFg `
-            -Width $panelWidth
+            -Fg    $gt.PanelFg
     }
 }
 
@@ -431,34 +418,17 @@ foreach ($gt in $galleryThemes) {
 #   --font.size 14       : default; readable in README at GitHub's render width
 #   --line-height 1.4    : avoids cramped vertical spacing
 # Font defaults to JetBrains Mono and is embedded as a base64 woff2 in the
-# SVG, so the rendered output is pixel-identical regardless of the
-# viewer's installed fonts. Adds ~300 KB per SVG, acceptable for README
-# assets -- but see Set-SharedFont for the scenes where it is not.
+# SVG, so the rendered output is pixel-identical regardless of the viewer's
+# installed fonts. That costs ~365 KB of every file against ~1 KB of actual
+# drawing, and is paid once per image including each theme panel.
+#
+# Stripping it for a fallback chain was tried and reverted. freeze emits no
+# per-glyph positions and no textLength: the advance of every line comes from
+# the font, so a substituted face moves the text off the geometry freeze
+# computed from JetBrains Mono metrics. The visible symptom is the usage bars,
+# whose block glyphs (U+2588 / U+2593) stop filling their cell. Pixel fidelity
+# here is load-bearing, not a nicety.
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-
-# Drop the embedded face and name a fallback chain instead.
-#
-# Measured: a rendered SVG is 367 KB, of which 970 bytes is the drawing and
-# all the rest is one base64 woff2. Embedding is the right trade for the four
-# README scenes, which are the front door and number four. It is the wrong
-# trade for a per-theme gallery, where the same font would be paid for eleven
-# times over -- about 4 MB to say something about color.
-#
-# Safe here because the panels are column-aligned monospace text and the chain
-# resolves to SOME monospace in every viewer: a substituted face changes the
-# glyph shapes without disturbing the alignment the scene depends on. The four
-# hero images keep their embedded copy, so nothing on the README front page
-# changes.
-function Set-SharedFont {
-    Param ([Parameter(Mandatory)] [string] $Path)
-
-    $svg = [System.IO.File]::ReadAllText($Path)
-    $svg = [regex]::Replace($svg, '(?s)@font-face\s*\{.*?\}', '')
-    $svg = $svg.Replace(
-        'font-family="JetBrains Mono"',
-        'font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"')
-    [System.IO.File]::WriteAllText($Path, $svg, $utf8NoBom)
-}
 
 foreach ($s in $scenarios) {
     $ansiPath = Join-Path $tmpRoot ("{0}.ansi" -f $s.Name)
@@ -467,11 +437,15 @@ foreach ($s in $scenarios) {
 
     [System.IO.File]::WriteAllText($ansiPath, $body, $utf8NoBom)
 
+    # Campbell unless the scene names its own; a theme panel hands its base00
+    # here so the color reaches the padding too, not just the text rows.
+    $background = if ($s.Background) { $s.Background } else { '#0C0C0C' }
+
     Write-Host "Rendering $($s.Name) -> $svgPath" -ForegroundColor Cyan
     & $freezeExe `
         --language    ansi `
         --window `
-        --background  '#0C0C0C' `
+        --background  $background `
         --padding     30 `
         --margin      0 `
         --width       720 `
@@ -482,7 +456,6 @@ foreach ($s in $scenarios) {
     if ($LASTEXITCODE -ne 0) {
         throw "freeze failed for $($s.Name) (exit $LASTEXITCODE)"
     }
-    if ($s.ShareFont) { Set-SharedFont -Path $svgPath }
 }
 
 # --- Cleanup ----------------------------------------------------------------
