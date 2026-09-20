@@ -1723,12 +1723,21 @@ function New-ThemePalette {
     }
 }
 
-# The seven slots of each scheme this tool ships, transcribed from the
-# base16 definitions in tinted-theming/schemes (MIT). Dark variants only:
-# a light scheme is legible but doubles the list for a view that is read at a
-# glance, and none was asked for. Adding a theme is a row here and nothing
-# else; the integrity tests pick it up automatically.
+# The seven slots of each scheme this tool ships. All but `claude` are
+# transcribed from the base16 definitions in tinted-theming/schemes (MIT),
+# dark variants only: a light scheme is legible but doubles a list that is
+# read at a glance. Adding a theme is a row here and nothing else; the
+# integrity tests pick it up automatically.
+#
+# `claude` has no upstream. It is an original palette in the same seven-slot
+# shape, keyed to the warm accent and near-black of the Claude Code interface
+# this tool manages logins for. Its Danger is pulled to hue 349 rather than a
+# true red on purpose: the accent that makes the theme recognizable sits at
+# hue 15, and a Danger within ~20 degrees of the heading is the same glance
+# ambiguity that disqualified github, so the two are held 26 degrees apart.
+# Monokai is the precedent for a rose-leaning Danger reading correctly.
 $Script:Base16Schemes = @{
+    claude     = @{ base00 = 0x1F1E1D; base03 = 0x6C6A66; base05 = 0xF0EEE6; base08 = 0xC9485F; base0A = 0xD9A441; base0B = 0x7D9663; base0D = 0xD97757 }
     dracula    = @{ base00 = 0x282A36; base03 = 0x6272A4; base05 = 0xF8F8F2; base08 = 0xFF5555; base0A = 0xF1FA8C; base0B = 0x50FA7B; base0D = 0xBD93F9 }
     everforest = @{ base00 = 0x2D353B; base03 = 0x859289; base05 = 0xD3C6AA; base08 = 0xE67E80; base0A = 0xDBBC7F; base0B = 0xA7C080; base0D = 0x7FBBB3 }
     flexoki    = @{ base00 = 0x100F0F; base03 = 0x575653; base05 = 0xCECDC3; base08 = 0xD14D41; base0A = 0xD0A215; base0B = 0x879A39; base0D = 0x4385BE }
