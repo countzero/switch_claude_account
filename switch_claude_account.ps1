@@ -6778,16 +6778,14 @@ function Test-WatchInteractive {
 # lines instead of the entire loop body. Enter- returns the token Exit-
 # consumes; nothing else may read it.
 #
-# Enter-'s read of [Console]::CursorVisible and its write are both guarded:
-# neither is reliable off an attached Windows console, and an unguarded read
-# aborted the whole watch engine at startup on Linux and macOS. Exit- restores
-# through the API only where the capture succeeded, which confines its own
-# unguarded write to a console that already answered once.
-# A $null Cursor means "not captured",
-# and Exit-WatchTerminal skips the API restore on it rather than coercing
-# $null to $false and leaving the user's cursor hidden. The ESC[?25h in the
-# alt-buffer leave is what the cursor actually depends on; the API call is
-# belt-and-suspenders for the .NET-side state.
+# Every [Console] call in both halves is guarded: none is reliable off an
+# attached Windows console, and an unguarded read of CursorVisible once
+# aborted the whole watch engine at startup on Linux and macOS. A $null
+# Cursor means "not captured", and Exit-WatchTerminal skips the API restore
+# on it rather than coercing $null to $false and leaving the user's cursor
+# hidden. The ESC[?25h in the alt-buffer leave is what the cursor actually
+# depends on; the API call is belt-and-suspenders for the .NET-side state,
+# so failing it is not worth unwinding the caller's finally.
 # `docs/architecture.md` → *Console APIs*.
 #
 # The alt-buffer entry is the LAST mutation on purpose: it is the one that
@@ -6847,7 +6845,9 @@ function Exit-WatchTerminal {
         Write-VTSequence ("`e]0;{0}`a" -f $restoreTitle)
         Write-VTSequence "`e[?25h`e[?1049l"
     }
-    if ($null -ne $State.Cursor) { [Console]::CursorVisible = $State.Cursor }
+    if ($null -ne $State.Cursor) {
+        try { [Console]::CursorVisible = $State.Cursor } catch { Write-Verbose "Cursor restore via console API not available: $_" }
+    }
     # Encoding last, after the alt-buffer leave and title restore have been
     # written through the UTF-8 writer (the original title may itself carry
     # non-ASCII).
