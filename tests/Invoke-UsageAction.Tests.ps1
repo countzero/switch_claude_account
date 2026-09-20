@@ -1723,19 +1723,19 @@ Describe 'switch_claude_account' {
         # Runs the threshold boundaries explicitly so a future tweak of
         # $Script:AggregateRedPct / $Script:AggregateYellowPct shows up
         # here as a failing test rather than a silent visual change.
-        It 'returns Green below AggregateYellowPct (50%)' {
-            Get-AggregateBarColor -UsedPct  0 | Should -Be 'Green'
-            Get-AggregateBarColor -UsedPct 49 | Should -Be 'Green'
+        It 'returns Success below AggregateYellowPct (50%)' {
+            Get-AggregateBarColor -UsedPct  0 | Should -Be 'Success'
+            Get-AggregateBarColor -UsedPct 49 | Should -Be 'Success'
         }
 
-        It 'returns Yellow between AggregateYellowPct (50%) and AggregateRedPct-1 (89%)' {
-            Get-AggregateBarColor -UsedPct 50 | Should -Be 'Yellow'
-            Get-AggregateBarColor -UsedPct 89 | Should -Be 'Yellow'
+        It 'returns Warning between AggregateYellowPct (50%) and AggregateRedPct-1 (89%)' {
+            Get-AggregateBarColor -UsedPct 50 | Should -Be 'Warning'
+            Get-AggregateBarColor -UsedPct 89 | Should -Be 'Warning'
         }
 
-        It 'returns Red at and above AggregateRedPct (90%)' {
-            Get-AggregateBarColor -UsedPct  90 | Should -Be 'Red'
-            Get-AggregateBarColor -UsedPct 100 | Should -Be 'Red'
+        It 'returns Danger at and above AggregateRedPct (90%)' {
+            Get-AggregateBarColor -UsedPct  90 | Should -Be 'Danger'
+            Get-AggregateBarColor -UsedPct 100 | Should -Be 'Danger'
         }
     }
 
@@ -3799,15 +3799,15 @@ Describe 'switch_claude_account' {
             ([regex]::Matches($out, '\bpriming\b')).Count | Should -Be 1
         }
 
-        It 'Get-StatusColor maps "warming up" to Yellow' {
-            Get-StatusColor -Label 'warming up' -IsActive $false | Should -Be 'Yellow'
-            Get-StatusColor -Label 'warming up' -IsActive $true  | Should -Be 'Yellow'
+        It 'Get-StatusColor maps "warming up" to Warning' {
+            Get-StatusColor -Label 'warming up' -IsActive $false | Should -Be 'Warning'
+            Get-StatusColor -Label 'warming up' -IsActive $true  | Should -Be 'Warning'
         }
 
-        It 'Get-StatusColor maps "priming" to Yellow' {
-            # 'priming' is transient like 'warming up' -> Yellow.
-            Get-StatusColor -Label 'priming' -IsActive $false | Should -Be 'Yellow'
-            Get-StatusColor -Label 'priming' -IsActive $true  | Should -Be 'Yellow'
+        It 'Get-StatusColor maps "priming" to Warning' {
+            # 'priming' is transient like 'warming up' -> Warning.
+            Get-StatusColor -Label 'priming' -IsActive $false | Should -Be 'Warning'
+            Get-StatusColor -Label 'priming' -IsActive $true  | Should -Be 'Warning'
         }
     }
 

@@ -318,6 +318,35 @@ These rules are Windows-strict on every platform by design, so a slot name yield
 - `foo.` → `foo`
 - `CON` → error (reserved device name)
 
+### Theming
+By default `sca` colors its output with the standard ANSI colors, which means your terminal decides what they actually look like: the output already matches whatever color scheme you have set, on a light background as well as a dark one.
+
+If you would rather pin an exact palette, set `SCA_THEME`:
+
+```powershell
+$env:SCA_THEME = 'material'      # PowerShell; add to $PROFILE to make it stick
+```
+
+```bash
+export SCA_THEME=material        # bash / zsh
+```
+
+Available themes are `default` and `material`. The name is case-insensitive, and an unrecognized one quietly falls back to `default` (run any action with `-Verbose` to see which names exist). `sca help` lists them too.
+
+A named theme emits 24-bit truecolor, which every modern terminal supports (Windows Terminal, iTerm2, kitty, Alacritty, WezTerm, recent GNOME Terminal). Setting the variable is taken as your word that yours does; `sca` does not probe, because the usual probe (`COLORTERM`) is unset on Windows even where truecolor works perfectly.
+
+To turn color off entirely, use `-NoColor` or the standard [`NO_COLOR`](https://no-color.org) variable. Both outrank `SCA_THEME`, since a theme says *which* colors to use, not *whether* to use any:
+
+```bash
+export NO_COLOR=1
+```
+
+`material` also paints its own background, but **only** in the full-screen views, `sca usage -Watch` and `sca monitor`. Those own the whole alternate screen, so a canvas there reads as deliberate and the screen is handed back untouched on exit. Everything else prints into your scrollback, where a background would leave ragged colored bars in your shell history for good.
+
+Whichever theme is active, the layout never changes: every column lines up identically.
+
+If you would rather theme every tool at once instead of each one separately, set your terminal's own 16-color palette — Windows Terminal's *Color schemes*, or [`concfg`](https://github.com/lukesampson/concfg) for CMD and legacy consoles. The `default` theme uses the standard ANSI colors precisely so it inherits that work.
+
 ### Profile encoding
 `sca install` and `sca uninstall` preserve your PowerShell profile's existing encoding (UTF-8 with or without BOM, UTF-16 LE/BE). ANSI-encoded profiles are treated as UTF-8 no-BOM (indistinguishable without a BOM).
 

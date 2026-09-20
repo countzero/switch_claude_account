@@ -104,10 +104,12 @@ Param (
     # -NoColor: suppress ANSI colour for this invocation. Mechanism is on
     # Write-Color; Invoke-Main flips $PSStyle.OutputRendering to strip the
     # inline SGR that helper emits.
-    # Precedence: -NoColor > $env:NO_COLOR non-empty > colored.
+    # Precedence: -NoColor > $env:NO_COLOR non-empty > $env:SCA_THEME > colored.
     # NO_COLOR (https://no-color.org) is the de facto standard for opting out
     # without a per-invocation flag. Watch mode still works in B&W: its
     # alt-buffer / sync / cursor VT sequences are not SGR and survive.
+    # There is no -Theme flag to pair with this one: a palette is a standing
+    # preference that belongs in a shell profile, not a per-invocation choice.
     [switch] $NoColor,
 
     # -Version: print $Script:ScriptVersion and exit before any action runs.
@@ -430,14 +432,15 @@ $Script:UtilLimitPct           = 100
 # aggregates flip to red sooner because one fully-burned slot in a
 # multi-slot pool barely moves the aggregate):
 #
-#   usedPct >= AggregateRedPct      -> Red     (pool nearly exhausted)
-#   usedPct >= AggregateYellowPct   -> Yellow  (half or more burned)
-#   otherwise                       -> Green
+#   usedPct >= AggregateRedPct      -> Danger   (pool nearly exhausted)
+#   usedPct >= AggregateYellowPct   -> Warning  (half or more burned)
+#   otherwise                       -> Success
 #
-# Red anchored to UtilWarnPct (90) so 'red' carries the same near-cap
-# meaning at per-slot and pool scale; pure 100% would be a knife-edge
-# transition that fires only after the pool is already exhausted.
-# Yellow at the half-burned mark.
+# The constants keep their color names because they are calibrated against
+# what the default palette renders. Danger is anchored to UtilWarnPct (90)
+# so 'red' carries the same near-cap meaning at per-slot and pool scale;
+# pure 100% would be a knife-edge transition that fires only after the pool
+# is already exhausted. Warning sits at the half-burned mark.
 $Script:AggregateRedPct        = 90
 $Script:AggregateYellowPct     = 50
 
@@ -1577,6 +1580,7 @@ function Show-Help {
     # letting Join-Path's binder throw mid-render.
     $unresolved = '(unresolved: set HOME or CLAUDE_CONFIG_DIR)'
     $slotGlob   = if ($CredDir) { Join-Path $CredDir '.credentials.<name>(<email>).json' } else { $unresolved }
+    $themeNames = ($Script:ThemePalettes.Keys | Sort-Object) -join ', '
 
     $lines = @(
         "",
@@ -1643,6 +1647,13 @@ function Show-Help {
         "  State        : $(if ($StateFile) { $StateFile } else { $unresolved })",
         "  PS profile   : $ProfilePath",
         "",
+        # Theme names come from the palette table itself so this list cannot
+        # drift as themes are added.
+        "ENVIRONMENT",
+        "  SCA_THEME          Color theme: $themeNames",
+        "  NO_COLOR           Set non-empty to suppress all color (no-color.org)",
+        "  CLAUDE_CONFIG_DIR  Override the directory holding the files above",
+        "",
         "NOTES",
         "  • 'switch', 'monitor' and 'warmup' work with Claude Code open; it follows the swap.",
         "  • Close Claude Code / VS Code before 'save'; every other action runs beside it.",
@@ -1651,6 +1662,106 @@ function Show-Help {
     )
 
     $lines | ForEach-Object { Write-Host $_ }
+}
+
+# Role -> SGR sequence, one entry per selectable theme.
+#
+# `default` spells the roles as `$PSStyle`'s NAMED foregrounds, which emit
+# ANSI 30-37 / 90-97. Those are palette-relative: the terminal decides what
+# they look like, so the default rendering already follows whatever theme
+# the user's terminal is set to and stays legible on any background. A named
+# theme instead burns in truecolor (`ESC[38;2;R;G;Bm`), overriding the
+# terminal palette -- which is the whole point of asking for one, and why
+# no theme is ever selected for the user automatically.
+#
+# `material` is the base16 "Material" scheme (tinted-theming/schemes),
+# assigned by ROLE rather than by hue: base0D blue carries a heading better
+# at a terminal's default weight than base0A amber does.
+#
+# Neutral is deliberately absent from every truecolor theme. It marks a
+# steady-state row carrying no verdict, so it has to stay readable on a light
+# AND a dark background; any fixed hex loses one of the two. Omitting it
+# falls through to uncolored, which inherits the terminal foreground and is
+# therefore correct on both.
+$Script:ThemePalettes = @{
+    default = @{
+        Heading = $PSStyle.Foreground.Yellow
+        Warning = $PSStyle.Foreground.BrightYellow
+        Success = $PSStyle.Foreground.BrightGreen
+        Danger  = $PSStyle.Foreground.BrightRed
+        Muted   = $PSStyle.Foreground.BrightBlack
+        Neutral = $PSStyle.Foreground.White
+    }
+    material = @{
+        Heading = $PSStyle.Foreground.FromRgb(0x82AAFF)  # base0D blue
+        Warning = $PSStyle.Foreground.FromRgb(0xFFCB6B)  # base0A amber
+        Success = $PSStyle.Foreground.FromRgb(0xC3E88D)  # base0B green
+        Danger  = $PSStyle.Foreground.FromRgb(0xF07178)  # base08 red
+        Muted   = $PSStyle.Foreground.FromRgb(0x546E7A)  # base03 gray
+
+        # Alt-screen chrome; see Get-WatchChrome for where it applies and
+        # why it stops at the edge of the watch frame.
+        Background = $PSStyle.Background.FromRgb(0x263238)  # base00
+        Foreground = $PSStyle.Foreground.FromRgb(0xEEFFFF)  # base05
+    }
+}
+
+# The palette `Write-Color` renders through. Bound at load time, not inside
+# Invoke-Main, because the test suite dot-sources this file and calls the
+# Invoke-*Action bodies directly; that path never reaches Invoke-Main and
+# would otherwise render through a $null palette.
+$Script:Palette = $Script:ThemePalettes['default']
+
+# Resolve a theme name to its palette. Unknown, unset or blank -> default.
+#
+# An unrecognized name falls back quietly instead of warning. A typo lives in
+# a shell profile, so a warning would print on EVERY invocation for as long as
+# it sits there -- louder and longer-lived than the cosmetic problem it
+# reports. `-Verbose` surfaces it on demand, and `sca help` lists the names.
+#
+# Matching is case-insensitive for free: PowerShell's `@{}` literal builds a
+# Hashtable with a case-insensitive comparer.
+function Resolve-ThemePalette {
+    Param ([AllowEmptyString()] [AllowNull()] [String] $Name)
+
+    $key = if ($Name) { $Name.Trim() } else { '' }
+    if (-not $key) { return $Script:ThemePalettes['default'] }
+    if ($Script:ThemePalettes.ContainsKey($key)) { return $Script:ThemePalettes[$key] }
+
+    $known = ($Script:ThemePalettes.Keys | Sort-Object) -join ', '
+    Write-Verbose "Unknown theme '$Name'; falling back to 'default'. Available: $known."
+    return $Script:ThemePalettes['default']
+}
+
+# The active theme's alt-screen chrome (background + base foreground) as one
+# SGR run, or '' when the frame should keep the terminal's own colors.
+#
+# Chrome stops at the edge of the watch frame on purpose. `usage -Watch` and
+# `monitor` own the whole alternate screen, so a background there reads as a
+# deliberate canvas; every other action prints into the user's scrollback,
+# where a background would leave ragged colored bars behind in their history
+# for good. That is the entire reason a theme's Background is not simply a
+# seventh role on Write-Color.
+#
+# Background and Foreground travel together. Painting a background without
+# pinning a foreground would leave a light-terminal user reading their dark
+# default text on our dark canvas. Inside the frame this pair becomes the
+# effective default, which is also why `Neutral` must stay absent from the
+# palette: it inherits the chrome foreground here and the terminal's
+# foreground everywhere else, and both are right.
+#
+# The PlainText check is load-bearing and cannot be dropped as redundant.
+# Chrome reaches the terminal through `Write-VTSequence` ->
+# `[Console]::Out.Write`, which deliberately bypasses the `StringDecorated`
+# filter that strips `Write-Color`'s SGR under `-NoColor` / `NO_COLOR`. Every
+# other color path gets no-color mode for free; this one has to ask.
+function Get-WatchChrome {
+    if ($PSStyle.OutputRendering -eq 'PlainText') { return '' }
+
+    $bg = $Script:Palette['Background']
+    if (-not $bg) { return '' }
+
+    return $bg + $Script:Palette['Foreground']
 }
 
 # Single chokepoint for ALL colored output. No production path may call
@@ -1681,23 +1792,25 @@ function Show-Help {
 # effective at all: the toggle cannot reach the legacy `-ForegroundColor`
 # path, only SGR bytes in the stream.
 #
-# Color name mapping: PowerShell legacy `ConsoleColor` and PS7's
-# `$PSStyle.Foreground` use opposite naming conventions. Legacy
-# "Dark*" names = the standard ANSI 30-37 colors; legacy un-prefixed
-# names (Yellow, Green, Red...) = ANSI bright 90-97. So our existing
-# `DarkYellow` (warm amber/mustard headers) maps to
-# `$PSStyle.Foreground.Yellow` (ANSI 33), and `Yellow` (advisory)
-# maps to `BrightYellow` (ANSI 93). Visually equivalent to the
-# pre-refactor rendering on every modern terminal palette.
+# Callers name a semantic ROLE, never a color, so a palette can change
+# without touching any of the ~60 call sites.
 #
 # Palette convention. Not derivable from any single call site, so it is
-# recorded once here; pick from this set rather than inventing a colour:
-#   DarkYellow : section-title headers ('[Usage] Plan usage', '[List] Saved
-#                slots'). Never a sentence.
-#   Yellow     : advisories and warnings. "Attention required", never a header.
-#   Green      : success on a side-effecting action ('[Save] Saved ...').
-#   Red        : destructive completion ('[Remove] Removed ...').
-#   DarkGray   : dimmed metadata (verbose account row, watch footer).
+# recorded once here; pick from this set rather than inventing a role:
+#   Heading : section-title headers ('[Usage] Plan usage', '[List] Saved
+#             slots'). Never a sentence.
+#   Warning : advisories and warnings. "Attention required", never a header.
+#   Success : success on a side-effecting action ('[Save] Saved ...').
+#   Danger  : destructive completion ('[Remove] Removed ...'), and the
+#             at-or-over-cap end of the usage scale.
+#   Muted   : dimmed metadata (verbose account row, watch footer).
+#   Neutral : a steady-state row carrying no verdict.
+# An unknown role renders uncolored, which is also how a caller opts out
+# deliberately by passing $null (Invoke-ListAction's inactive rows).
+#
+# Which SGR sequence renders a role is $Script:ThemePalettes' business; see
+# its comment for why the default palette is palette-relative and a named
+# theme is not.
 #
 # FORCE_COLOR is deliberately unsupported: Write-Host writes to the
 # information stream (6), not stdout, so a pipe or redirect never captures
@@ -1709,16 +1822,10 @@ function Write-Color {
         [switch] $NoNewline
     )
 
-    $sgr = switch ($Color) {
-        'Yellow'     { $PSStyle.Foreground.BrightYellow }
-        'DarkYellow' { $PSStyle.Foreground.Yellow       }
-        'Green'      { $PSStyle.Foreground.BrightGreen  }
-        'Red'        { $PSStyle.Foreground.BrightRed    }
-        'Cyan'       { $PSStyle.Foreground.BrightCyan   }
-        'Gray'       { $PSStyle.Foreground.White        }
-        'DarkGray'   { $PSStyle.Foreground.BrightBlack  }
-        default      { '' }
-    }
+    # Guarded rather than indexed straight through: a Hashtable throws on a
+    # $null index, and only the [String] coercion of $null to '' keeps that
+    # from firing on the deliberate `Write-Color $line $null` call sites.
+    $sgr = if ($Color) { $Script:Palette[$Color] } else { '' }
 
     if ($sgr) { $Message = "$sgr$Message$($PSStyle.Reset)" }
 
@@ -1819,11 +1926,44 @@ function Get-WatchFrameText {
 # produces when the terminal lacks DEC 2026 or is too busy to honor it.
 # This is the ANSI equivalent of how PSReadLine / SetBufferContents repaint:
 # overwrite in place, never clear.
+#
+# -Chrome (from Get-WatchChrome, '' when the frame keeps the terminal's own
+# colors) is woven in at three points, because a background is screen STATE
+# rather than a property of any one string:
+#   1. Once after ESC[H, so text written into the frame carries it.
+#   2. Re-asserted after every ESC[0m in the body. Write-Color terminates
+#      each colored run with a full reset, which clears the background as
+#      well as the foreground; without this every colored row would punch a
+#      hole in the canvas from that point to the end of the line.
+#   3. Immediately before each ESC[K and the trailing ESC[0J, so the erases
+#      fill with the theme background instead of the terminal's.
+# Point 3 is the one that leans on the terminal: filling on erase is
+# `back_color_erase`, which Windows Terminal, conhost, iTerm2, kitty,
+# Alacritty, VTE and WezTerm all implement, but which is not universal. Where
+# it is missing the written cells still carry the background and only the
+# erased tail keeps the terminal's, so the frame degrades to a ragged right
+# edge rather than breaking. Not probed, for the same reason truecolor is
+# not: the capability databases are absent or wrong on Windows.
 function ConvertTo-WatchFrameSequence {
-    Param ([AllowEmptyString()] [AllowNull()] [string] $FrameText)
+    Param (
+        [AllowEmptyString()] [AllowNull()] [string] $FrameText,
+        [AllowEmptyString()] [AllowNull()] [string] $Chrome
+    )
 
-    $body = (($FrameText -split "`n") | ForEach-Object { $_ + "`e[K" }) -join "`n"
-    return "`e[H" + $body + "`e[0J"
+    if ($Chrome) {
+        $FrameText = $FrameText -replace "`e\[0m", "`e[0m$Chrome"
+    }
+    $body = (($FrameText -split "`n") | ForEach-Object { $_ + $Chrome + "`e[K" }) -join "`n"
+    $sequence = "`e[H" + $Chrome + $body + $Chrome + "`e[0J"
+
+    # A line ending in a colored run gets chrome twice: once re-asserted after
+    # its ESC[0m, once again before its ESC[K. Collapsing runs of the same
+    # sequence is always safe (repeating an SGR is a no-op) and keeps a 1 Hz
+    # repaint from carrying ~35 redundant bytes per colored row.
+    if ($Chrome) {
+        $sequence = $sequence -replace "(?:$([regex]::Escape($Chrome)))+", $Chrome
+    }
+    return $sequence
 }
 
 # We are sanitizing names by replacing invalid characters with underscores,
@@ -1873,7 +2013,7 @@ function Get-SafeName {
     }
 
     if ($clean -ne $inputName) {
-        Write-Color "Sanitized to: '$clean'" 'Yellow'
+        Write-Color "Sanitized to: '$clean'" 'Warning'
     }
 
     return $clean
@@ -2057,7 +2197,7 @@ function Get-NextSlotName {
     }
 
     if ($slots.Count -eq 1 -and $activeIdx -eq 0) {
-        Write-Color "[Switch] Only one slot ($(Format-SlotIdentity -Name $slots[0].Name -Email $slots[0].Email)) and it is already active. Nothing to do." 'Yellow'
+        Write-Color "[Switch] Only one slot ($(Format-SlotIdentity -Name $slots[0].Name -Email $slots[0].Email)) and it is already active. Nothing to do." 'Warning'
         return $null
     }
 
@@ -2108,7 +2248,7 @@ function Add-To-Profile {
     $encoding = Get-ProfileEncoding $ProfilePath
     Add-Content -LiteralPath $ProfilePath -Value $block -Encoding $encoding
 
-    Write-Color "[Install] Installed! Close and reopen PowerShell, then use: sca save <name>" 'Green'
+    Write-Color "[Install] Installed! Close and reopen PowerShell, then use: sca save <name>" 'Success'
     Write-Host "   Quick ref: sca | sca -h | sca list | sca save <name> | sca switch <name> | sca remove <name>"
 }
 
@@ -2144,7 +2284,7 @@ function Remove-From-Profile {
 
     if (-not $hasStart -and -not $hasEnd) {
         if (-not $Quiet) {
-            Write-Color "[Uninstall] No Switch Claude Account block found; profile unchanged." 'Yellow'
+            Write-Color "[Uninstall] No Switch Claude Account block found; profile unchanged." 'Warning'
         }
         return
     }
@@ -2176,7 +2316,7 @@ function Remove-From-Profile {
     Set-Content -LiteralPath $ProfilePath -Value $new -Encoding $encoding -Force -NoNewline
 
     if (-not $Quiet) {
-        Write-Color "[Uninstall] Uninstalled. Close and reopen PowerShell to remove the alias." 'Red'
+        Write-Color "[Uninstall] Uninstalled. Close and reopen PowerShell to remove the alias." 'Danger'
     }
 }
 
@@ -2212,7 +2352,7 @@ function New-AutoSaveSlot {
             Write-Sidecar -SlotPath $autoPath -OAuthAccount $OAuthAccount -Source $SourceLabel
         }
         catch {
-            Write-Color "[Sync] Auto-save sidecar write failed for '$autoName': $($_.Exception.Message)" 'Yellow'
+            Write-Color "[Sync] Auto-save sidecar write failed for '$autoName': $($_.Exception.Message)" 'Warning'
         }
     }
     Update-ScaState -ActiveSlot $autoName -LastSyncHash $LastSyncHash | Out-Null
@@ -2581,7 +2721,7 @@ function Invoke-Reconcile {
         $claudeJsonState = if ($identityError) { (Read-ClaudeJson).State } else { 'ok' }
         if ($identityError -and (($claudeJsonState -eq 'unreadable') -or
                                  ($newEmail -and $newEmail -ne $twin.Email))) {
-            Write-Color "[Sync] Active credentials match saved slot $twinIdent, but ~/.claude.json could not be pointed at it ($identityError), so the active slot is left as it was rather than split across the two files. Fix that and re-run, or run 'sca switch $($twin.Name)'." 'Yellow'
+            Write-Color "[Sync] Active credentials match saved slot $twinIdent, but ~/.claude.json could not be pointed at it ($identityError), so the active slot is left as it was rather than split across the two files. Fix that and re-run, or run 'sca switch $($twin.Name)'." 'Warning'
             return [pscustomobject]@{
                 Action   = 'noop'
                 Reason   = 'adopt-identity-write-failed'
@@ -2593,9 +2733,9 @@ function Invoke-Reconcile {
         }
 
         Update-ScaState -ActiveSlot $twin.Name -LastSyncHash $hash | Out-Null
-        Write-Color "[Sync] Active credentials match saved slot $twinIdent; tracking it as active." 'Yellow'
+        Write-Color "[Sync] Active credentials match saved slot $twinIdent; tracking it as active." 'Warning'
         if ($identityError) {
-            Write-Color "[Sync] ~/.claude.json was not updated ($identityError); Claude Code's /status email may lag until you run 'sca switch $($twin.Name)'." 'Yellow'
+            Write-Color "[Sync] ~/.claude.json was not updated ($identityError); Claude Code's /status email may lag until you run 'sca switch $($twin.Name)'." 'Warning'
         }
 
         return [pscustomobject]@{
@@ -2621,7 +2761,7 @@ function Invoke-Reconcile {
         } else {
             "so nothing was written. The next run that can resolve an identity will capture these credentials; if this persists while online, run 'sca save <name>' to capture them under a name you choose."
         }
-        Write-Color "[Sync] Active credentials changed but no account could be read from ~/.claude.json or /api/oauth/profile, $tail" 'Yellow'
+        Write-Color "[Sync] Active credentials changed but no account could be read from ~/.claude.json or /api/oauth/profile, $tail" 'Warning'
         return [pscustomobject]@{
             Action   = 'noop'
             Reason   = 'identity-unresolved'
@@ -2651,7 +2791,7 @@ function Invoke-Reconcile {
             }
 
             if ($verdict.Verdict -eq 'moved') {
-                Write-Color "[Sync] Active credentials changed while their account was being verified, so slot '$($state.active_slot)' is left untouched rather than risk filing one account's tokens under another's name. The next run reads them afresh." 'Yellow'
+                Write-Color "[Sync] Active credentials changed while their account was being verified, so slot '$($state.active_slot)' is left untouched rather than risk filing one account's tokens under another's name. The next run reads them afresh." 'Warning'
                 return [pscustomobject]@{
                     Action   = 'noop'
                     Reason   = 'credentials-changed-mid-probe'
@@ -2669,7 +2809,7 @@ function Invoke-Reconcile {
                                          -LastSyncHash $hash
 
             $oldIdent = Format-SlotIdentity -Name $state.active_slot -Email $verdict.SlotEmail
-            Write-Color "[Sync] Active credentials are now $($verdict.Email); previous slot $oldIdent preserved. Active slot is now '$autoName'." 'Yellow'
+            Write-Color "[Sync] Active credentials are now $($verdict.Email); previous slot $oldIdent preserved. Active slot is now '$autoName'." 'Warning'
             return [pscustomobject]@{
                 Action       = 'identity-change'
                 Slot         = $autoName
@@ -2691,7 +2831,7 @@ function Invoke-Reconcile {
                                  -LastSyncHash $hash
 
     $autoIdent = Format-SlotIdentity -Name $autoName -Email $newEmail
-    Write-Color "[Sync] Auto-saved unknown active credentials as $autoIdent." 'Yellow'
+    Write-Color "[Sync] Auto-saved unknown active credentials as $autoIdent." 'Warning'
     return [pscustomobject]@{
         Action   = 'auto-save'
         Slot     = $autoName
@@ -2831,14 +2971,14 @@ function Invoke-SaveAction {
             # Read failure (file locked / unreadable). Mark non-restorable
             # but proceed with the save: refusing on a stale file the
             # user is explicitly overwriting would be surprising.
-            Write-Color "[Save] WARNING: could not snapshot $($rf.FullName) ($($_.Exception.Message)); rollback for this path will be skipped." 'Yellow'
+            Write-Color "[Save] WARNING: could not snapshot $($rf.FullName) ($($_.Exception.Message)); rollback for this path will be skipped." 'Warning'
         }
         if (Test-Path -LiteralPath $snap.SidecarPath) {
             try {
                 $snap.SidecarBytes = [System.IO.File]::ReadAllBytes($snap.SidecarPath)
             }
             catch {
-                Write-Color "[Save] WARNING: could not snapshot $($snap.SidecarPath) ($($_.Exception.Message)); rollback for this path will be skipped." 'Yellow'
+                Write-Color "[Save] WARNING: could not snapshot $($snap.SidecarPath) ($($_.Exception.Message)); rollback for this path will be skipped." 'Warning'
             }
         }
         $snapshots += $snap
@@ -2872,7 +3012,7 @@ function Invoke-SaveAction {
                     Set-CredentialFileAtomic -Path $snap.Path -Bytes $snap.Bytes
                 }
                 catch {
-                    Write-Color "[Save] WARNING: could not restore $($snap.Path) ($($_.Exception.Message))." 'Yellow'
+                    Write-Color "[Save] WARNING: could not restore $($snap.Path) ($($_.Exception.Message))." 'Warning'
                 }
             }
             if ($null -ne $snap.SidecarBytes) {
@@ -2880,7 +3020,7 @@ function Invoke-SaveAction {
                     Set-CredentialFileAtomic -Path $snap.SidecarPath -Bytes $snap.SidecarBytes
                 }
                 catch {
-                    Write-Color "[Save] WARNING: could not restore $($snap.SidecarPath) ($($_.Exception.Message))." 'Yellow'
+                    Write-Color "[Save] WARNING: could not restore $($snap.SidecarPath) ($($_.Exception.Message))." 'Warning'
                 }
             }
         }
@@ -2907,7 +3047,7 @@ function Invoke-SaveAction {
     Update-ScaState -ActiveSlot $safeName -LastSyncHash $hash | Out-Null
 
     $sourceTail = if ($sourceLabel -eq 'api_profile') { ' [identity from /api/oauth/profile]' } else { '' }
-    Write-Color "[Save] Saved as $(Format-SlotIdentity -Name $safeName -Email $email)$sourceTail" 'Green'
+    Write-Color "[Save] Saved as $(Format-SlotIdentity -Name $safeName -Email $email)$sourceTail" 'Success'
 }
 
 # Pure swap mechanism, factored out of Invoke-SwitchAction so the watch
@@ -2955,8 +3095,8 @@ function Invoke-SlotSwap {
         Set-OAuthAccountInClaudeJson -OAuthAccount $Slot.Sidecar.oauthAccount
     }
     catch {
-        Write-Color "[Switch] Tokens swapped to '$($Slot.Name)' but ~/.claude.json oauthAccount update failed: $($_.Exception.Message)" 'Yellow'
-        Write-Color "[Switch] Claude Code's /status email may not reflect the new slot until you fix and re-run." 'Yellow'
+        Write-Color "[Switch] Tokens swapped to '$($Slot.Name)' but ~/.claude.json oauthAccount update failed: $($_.Exception.Message)" 'Warning'
+        Write-Color "[Switch] Claude Code's /status email may not reflect the new slot until you fix and re-run." 'Warning'
     }
 
     $hash = Get-SHA256Hex -Bytes $slotBytes
@@ -3000,7 +3140,7 @@ function Invoke-SwitchAction {
         # emits no advisory; the slot table beneath the success line
         # makes the transition self-evident via the `*` marker.
         if (-not $rotation.HasActiveSlot) {
-            Write-Color "[Switch] No currently active slot detected. Rotating to $toIdent." 'Yellow'
+            Write-Color "[Switch] No currently active slot detected. Rotating to $toIdent." 'Warning'
         }
     } else {
         $safeName = Get-SafeName $Name
@@ -3022,12 +3162,12 @@ function Invoke-SwitchAction {
     # even when the identity update fails.
     Invoke-SlotSwap -Slot $slot
 
-    # DarkYellow header line; matches the `[List] Saved slots` /
+    # Heading role; matches the `[List] Saved slots` /
     # `[Usage] Plan usage` convention so the table-rendering actions present a
     # consistent table-header look. No trailing period: this is a
     # header, not a complete sentence.
     $toIdent = Format-SlotIdentity -Name $slot.Name -Email $slot.Email
-    Write-Color "[Switch] Switched to $toIdent" 'DarkYellow'
+    Write-Color "[Switch] Switched to $toIdent" 'Heading'
 
     # Render the saved-slot table beneath the success line so the user
     # sees the new active slot in context (the `*` marker now points at
@@ -3056,7 +3196,7 @@ function Invoke-ListAction {
     $slots = @(Get-Slots)
 
     if ($slots.Count -eq 0) {
-        Write-Color "[List] No slots saved yet. Use: sca save <name>" 'Yellow'
+        Write-Color "[List] No slots saved yet. Use: sca save <name>" 'Warning'
         return
     }
 
@@ -3097,7 +3237,7 @@ function Invoke-RemoveAction {
         Remove-Item -LiteralPath $rf.FullName -Force
         Remove-Sidecar -SlotPath $rf.FullName
     }
-    Write-Color "[Remove] Removed '$safeName'" 'Red'
+    Write-Color "[Remove] Removed '$safeName'" 'Danger'
 }
 
 # --- usage action internals ---
@@ -3443,7 +3583,7 @@ function Update-SlotTokens {
             # hash to compare against, must not be able to freeze the mirror.
             $liveHash = try { Get-SHA256Hex -Path $CredFile } catch { $null }
             if ($state.last_sync_hash -and $liveHash -and $liveHash -ne $state.last_sync_hash) {
-                Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but .credentials.json holds bytes no slot has captured, so they were left alone rather than overwritten. Re-run once an account can be resolved, or run 'sca switch $($state.active_slot)' to propagate this slot's tokens deliberately." 'Yellow'
+                Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but .credentials.json holds bytes no slot has captured, so they were left alone rather than overwritten. Re-run once an account can be resolved, or run 'sca switch $($state.active_slot)' to propagate this slot's tokens deliberately." 'Warning'
             }
             else {
                 try {
@@ -3464,7 +3604,7 @@ function Update-SlotTokens {
                     # have rotated the refresh_token we just consumed; Claude
                     # Code reading the stale .credentials.json could fail its
                     # own next refresh and require re-login.
-                    Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but propagation to .credentials.json failed: $($_.Exception.Message). Run 'sca switch $($state.active_slot)' to propagate manually; otherwise Claude Code's own refresh may fail and require re-login." 'Yellow'
+                    Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but propagation to .credentials.json failed: $($_.Exception.Message). Run 'sca switch $($state.active_slot)' to propagate manually; otherwise Claude Code's own refresh may fail and require re-login." 'Warning'
                 }
             }
         }
@@ -3495,7 +3635,7 @@ function Update-SlotTokens {
             # <name>` (force propagation).
             $parsed = Get-SlotFileInfo -FileName ([System.IO.Path]::GetFileName($SlotPath))
             if ($parsed -and $parsed.Name -eq $state.active_slot) {
-                Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but its identity sidecar is missing, so propagation to .credentials.json was skipped. Run 'sca save $($state.active_slot)' to recapture the sidecar, or 'sca switch $($state.active_slot)' to force propagation now; otherwise Claude Code's own refresh may fail and require re-login." 'Yellow'
+                Write-Color "[Sync] Token refreshed in slot '$($state.active_slot)' but its identity sidecar is missing, so propagation to .credentials.json was skipped. Run 'sca save $($state.active_slot)' to recapture the sidecar, or 'sca switch $($state.active_slot)' to force propagation now; otherwise Claude Code's own refresh may fail and require re-login." 'Warning'
             }
         }
     }
@@ -4592,31 +4732,31 @@ function Get-StatusColor {
         [bool]   $IsActive
     )
 
-    $okColor = if ($IsActive) { 'Green' } else { 'Gray' }
+    $okColor = if ($IsActive) { 'Success' } else { 'Neutral' }
     switch -Regex ($Label) {
-        '^limited'      { return 'Red' }
-        '^near limit'   { return 'Yellow' }
+        '^limited'      { return 'Danger' }
+        '^near limit'   { return 'Warning' }
         '^ok \(no plan' { return $okColor }
         '^ok$'          { return $okColor }
-        '^no-oauth'     { return 'DarkGray' }
-        '^expired'      { return 'Yellow' }
-        '^unauthorized' { return 'Red' }
-        '^error'        { return 'Red' }
-        '^rate-limited' { return 'Yellow' }
+        '^no-oauth'     { return 'Muted' }
+        '^expired'      { return 'Warning' }
+        '^unauthorized' { return 'Danger' }
+        '^error'        { return 'Danger' }
+        '^rate-limited' { return 'Warning' }
         # 'warming up' is the transient monitor -KeepWarm queued state
-        # (slot not yet processed). Yellow matches its "attention
+        # (slot not yet processed). Warning matches its "attention
         # required" cousins (near limit, rate-limited, expired) so
         # the user immediately knows the row is in flight, not in
         # steady state.
-        '^warming up'    { return 'Yellow' }
+        '^warming up'    { return 'Warning' }
         # 'priming' is the per-slot in-flight state during the warmup
         # pass: Invoke-SlotActivator's `claude -p` call is running for
         # this row right now. Once the call completes, the row
         # transitions directly to a real status ('ok' / 'rate-limited' /
         # 'no-oauth' / 'expired' / 'unauthorized' / 'error'), which are
         # already mapped above.
-        '^priming$'      { return 'Yellow' }
-        default          { return 'Gray' }
+        '^priming$'      { return 'Warning' }
+        default          { return 'Neutral' }
     }
 }
 
@@ -4649,9 +4789,9 @@ function Get-StatusRationale {
 function Get-AggregateBarColor {
     Param ([int] $UsedPct)
 
-    if ($UsedPct -ge $Script:AggregateRedPct)    { return 'Red'    }
-    if ($UsedPct -ge $Script:AggregateYellowPct) { return 'Yellow' }
-    return 'Green'
+    if ($UsedPct -ge $Script:AggregateRedPct)    { return 'Danger'    }
+    if ($UsedPct -ge $Script:AggregateYellowPct) { return 'Warning' }
+    return 'Success'
 }
 
 # Compute the pool-mean utilization for a single bucket key across the
@@ -4956,10 +5096,10 @@ function Measure-UsageTableColumns {
 # footer's [Monitor] line carries the same state. An unknown width (0) counts
 # as narrow.
 #
-# Rendered as three -NoNewline segments so each carries its own SGR: white
-# glyph (U+25B6, a high-contrast lozenge so the auto-mode signal pops) and
-# DarkGray text (the footer's ambient-metadata weight, so the indicator
-# recedes). The trailing blank Write-Host terminates the logical row.
+# Rendered as three -NoNewline segments so each carries its own SGR: a
+# Neutral glyph (U+25B6, a high-contrast lozenge so the auto-mode signal
+# pops) and Muted text (the footer's ambient-metadata weight, so the
+# indicator recedes). The trailing blank Write-Host terminates the row.
 function Write-UsageTableHeader {
     Param ([int] $AutoThreshold = 0)
 
@@ -4981,12 +5121,12 @@ function Write-UsageTableHeader {
     }
 
     if ($glyph) {
-        Write-Color $headerLeft 'DarkYellow' -NoNewline
-        Write-Host  $padding               -NoNewline
-        Write-Color $glyph      'Gray'      -NoNewline
-        Write-Color $text       'DarkGray'
+        Write-Color $headerLeft 'Heading' -NoNewline
+        Write-Host  $padding              -NoNewline
+        Write-Color $glyph      'Neutral' -NoNewline
+        Write-Color $text       'Muted'
     } else {
-        Write-Color $headerLeft 'DarkYellow'
+        Write-Color $headerLeft 'Heading'
     }
     Write-Host ''
 
@@ -5084,7 +5224,7 @@ function Format-ListTable {
         # When set, skip the `[List] Saved slots` header and the leading
         # blank line. Used by Invoke-SwitchAction so the table renders
         # cleanly under the switch's own success line without a redundant
-        # second DarkYellow header.
+        # second Heading-role line.
         [switch]   $SuppressHeader
     )
 
@@ -5114,14 +5254,14 @@ function Format-ListTable {
     $fmt = "  {0} {1,-$nameW}  {2}"
 
     if (-not $SuppressHeader) {
-        Write-Color "[List] Saved slots" 'DarkYellow'
+        Write-Color "[List] Saved slots" 'Heading'
         Write-Host ''
     }
     Write-Host ($fmt -f ' ',  'Slot',         'Account')
     Write-Host ($fmt -f ' ', ('-' * $nameW), ('-' * $acctW))
 
     foreach ($entry in $rows) {
-        $color = if ($entry.Slot.IsActive) { 'Green' } else { $null }
+        $color = if ($entry.Slot.IsActive) { 'Success' } else { $null }
         if ($color) {
             Write-Color ($fmt -f $entry.Marker, $entry.Name, $entry.Account) $color
         } else {
@@ -5147,13 +5287,13 @@ function Format-UsageVerbose {
     Param ([object] $Result)
 
     $name = $Result.Name
-    Write-Color "[Usage] Slot '$name'$(if ($Result.IsActive) { ' (active)' })" 'DarkYellow'
+    Write-Color "[Usage] Slot '$name'$(if ($Result.IsActive) { ' (active)' })" 'Heading'
 
     # Surface the OAuth account email whenever we could resolve it, so the
     # verbose drill-down answers the "which account is this?" question
     # without forcing the user to cross-reference the table.
     if ($Result.PSObject.Properties['Email'] -and $Result.Email) {
-        Write-Color "  Account: $($Result.Email)" 'DarkGray'
+        Write-Color "  Account: $($Result.Email)" 'Muted'
     }
 
     if ($Result.Status -ne 'ok') {
@@ -5161,7 +5301,7 @@ function Format-UsageVerbose {
         return
     }
     if (-not $Result.Data) {
-        Write-Color "  (empty response)" 'DarkGray'
+        Write-Color "  (empty response)" 'Muted'
         return
     }
 
@@ -5199,7 +5339,7 @@ function Format-UsageVerbose {
     $seven = $Result.Data.seven_day
 
     if (-not $five -and -not $seven) {
-        Write-Color "  No plan-usage data (account may not have a subscription, or has not made a live API call yet)." 'DarkGray'
+        Write-Color "  No plan-usage data (account may not have a subscription, or has not made a live API call yet)." 'Muted'
         return
     }
 
@@ -5504,7 +5644,7 @@ function Format-UsageAdvisory {
 # -Footer         : optional string printed below the table / verbose view
 #                   for the watch-mode "Last poll" line. Multi-line
 #                   strings are split and each line rendered in the
-#                   DarkGray information color.
+#                   Muted information role.
 # -AutoThreshold  : when set (1..100), append a right-aligned
 #                   '▶ switching slot at N%' indicator to the
 #                   `[Usage] Plan usage` header. Used by `sca monitor`
@@ -5524,7 +5664,7 @@ function Format-UsageFrame {
     )
 
     if (-not $Snapshot -or $Snapshot.NoSlots) {
-        Write-Color "[Usage] No slots saved yet. Use: sca save <name>" 'Yellow'
+        Write-Color "[Usage] No slots saved yet. Use: sca save <name>" 'Warning'
         if ($Footer) { Format-UsageFooter $Footer }
         return
     }
@@ -5561,11 +5701,11 @@ function Format-UsageFrame {
 # for Format-UsageFrame; extracted so the watch loop and any future
 # footer-consumers share one wrapping policy.
 #
-# -Footer   : the [Watch] / [Monitor] lines (DarkGray). Kept as the first
+# -Footer   : the [Watch] / [Monitor] lines (Muted). Kept as the first
 #             positional parameter so the existing positional call sites
 #             (`Format-UsageFooter $Footer`) bind unchanged.
-# -Advisory : optional usage advisory (Yellow), one line per condition.
-#             Leads the footer block, above the DarkGray footer lines, so the
+# -Advisory : optional usage advisory (Warning), one line per condition.
+#             Leads the footer block, above the Muted footer lines, so the
 #             warning stays visually distinct while grouping with the
 #             per-frame status. Split on newlines like $Footer, because
 #             several conditions (a throttled peer and an unreadable active
@@ -5586,12 +5726,12 @@ function Format-UsageFooter {
     Write-Host ""
     if ($Advisory) {
         foreach ($line in ($Advisory -split "`r?`n")) {
-            Write-Color $line 'Yellow'
+            Write-Color $line 'Warning'
         }
     }
     if ($Footer) {
         foreach ($line in ($Footer -split "`r?`n")) {
-            Write-Color $line 'DarkGray'
+            Write-Color $line 'Muted'
         }
     }
 }
@@ -5857,14 +5997,14 @@ function Invoke-WarmupAction {
     # round-robin already under way. The pause is what makes the Ctrl-C it
     # implies reachable.
     if (Test-ClaudeRunning) {
-        Write-Color $Script:WarmupLiveClientNotice 'Yellow'
+        Write-Color $Script:WarmupLiveClientNotice 'Warning'
         if ($Script:WarmupLiveClientPauseSec -gt 0) {
-            Write-Color "[Warmup] Starting in $($Script:WarmupLiveClientPauseSec)s; press Ctrl-C to abort." 'Yellow'
+            Write-Color "[Warmup] Starting in $($Script:WarmupLiveClientPauseSec)s; press Ctrl-C to abort." 'Warning'
             Start-Sleep -Seconds $Script:WarmupLiveClientPauseSec
         }
     }
 
-    Write-Color "[Warmup] Activating saved slots via 'claude -p' (billable; ~`$0.004/slot on Haiku, a few seconds each)..." 'DarkYellow'
+    Write-Color "[Warmup] Activating saved slots via 'claude -p' (billable; ~`$0.004/slot on Haiku, a few seconds each)..." 'Heading'
 
     # No-op repaint: the one-shot path has no live frame to redraw, so the
     # per-slot state transitions are not rendered; only the final snapshot
@@ -5873,14 +6013,14 @@ function Invoke-WarmupAction {
 
     if ($null -eq $snapshot) {
         $scope = if ($Name) { "matching '$(Get-SafeName $Name)'" } else { 'saved' }
-        Write-Color "[Warmup] No slots $scope to activate. Use: sca save <name>" 'Yellow'
+        Write-Color "[Warmup] No slots $scope to activate. Use: sca save <name>" 'Warning'
         return
     }
 
     # Ahead of the table rather than after it: it says which account the user
     # is left on, and a table of percentages is not what they need to read
     # first when the answer is "not the one you started on".
-    if ($snapshot.Advisory) { Write-Color $snapshot.Advisory 'Yellow' }
+    if ($snapshot.Advisory) { Write-Color $snapshot.Advisory 'Warning' }
 
     Write-Host ''
     Format-UsageFrame -Name $Name -Snapshot $snapshot
@@ -6931,6 +7071,14 @@ function Enter-WatchTerminal {
     # (atomic) repaint.
     Write-VTSequence "`e[?1049h`e[?25l"
 
+    # Paint the themed canvas once on entry. Without this the alt buffer
+    # shows the terminal's own background until the first frame lands, which
+    # on a slow first poll is a visible flash of the wrong color. A one-shot
+    # fill, not a per-frame clear, so it cannot reintroduce the flicker the
+    # ESC[2J ban exists to prevent.
+    $chrome = Get-WatchChrome
+    if ($chrome) { Write-VTSequence ($chrome + "`e[H`e[0J") }
+
     return [pscustomobject]@{
         Cursor     = $origCursor
         Encoding   = $origEncoding
@@ -7156,7 +7304,7 @@ function Write-WatchFrame {
     Param ([Parameter(Mandatory)] [scriptblock] $RenderScript)
 
     $frameText = Get-WatchFrameText $RenderScript
-    Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence $frameText) + "`e[?2026l")
+    Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence -FrameText $frameText -Chrome (Get-WatchChrome)) + "`e[?2026l")
 }
 
 # The -Warmup startup pass, run once before the polling loop. Mutates
@@ -7296,7 +7444,7 @@ function Invoke-UsageWatch {
     }
 
     if ($Interval -lt $Script:UsageWatchMinInterval) {
-        Write-Color "[Usage] -Interval below minimum; clamping to $($Script:UsageWatchMinInterval)s (polite to the unofficial endpoint)." 'Yellow'
+        Write-Color "[Usage] -Interval below minimum; clamping to $($Script:UsageWatchMinInterval)s (polite to the unofficial endpoint)." 'Warning'
         $Interval = $Script:UsageWatchMinInterval
     }
 
@@ -7336,7 +7484,7 @@ function Invoke-UsageWatch {
                     # is set), so a single Format-UsageFooter call places
                     # auto-mode state above the 'Waiting...' advisory; no
                     # separate standalone print needed.
-                    Write-Color "[Watch] Waiting for first successful /api/oauth/usage response..." 'Yellow'
+                    Write-Color "[Watch] Waiting for first successful /api/oauth/usage response..." 'Warning'
                     Format-UsageFooter $footer
                 }
             }
@@ -7368,9 +7516,16 @@ function Invoke-UsageWatch {
 # Precedence (most -> least specific):
 #   1. -NoColor switch (CLI flag)
 #   2. $env:NO_COLOR non-empty (https://no-color.org de facto standard)
-#   3. default colored
-# The previous $PSStyle.OutputRendering value is captured up-front and
-# restored in the `finally` block so the toggle is scoped to this
+#   3. $env:SCA_THEME names a palette
+#   4. default colored
+# NO_COLOR outranks SCA_THEME rather than conflicting with it: naming a
+# theme says WHICH colors, not WHETHER, so it cannot re-enable color that
+# was opted out of. The two are independent settings, and PlainText strips
+# a theme's truecolor SGR by the same regex that strips the default
+# palette's named SGR, so no-color mode needs no theme-specific handling.
+#
+# Both $PSStyle.OutputRendering and $Script:Palette are captured up-front
+# and restored in the `finally` block so the toggles are scoped to this
 # invocation -- callers that dot-source this script (notably the test
 # suite, which calls Invoke-*Action directly and bypasses Invoke-Main)
 # are unaffected.
@@ -7427,10 +7582,16 @@ function Invoke-Main {
     }
 
     $previousRendering = $PSStyle.OutputRendering
+    $previousPalette   = $Script:Palette
     try {
         if ($NoColor -or -not [string]::IsNullOrEmpty($env:NO_COLOR)) {
             $PSStyle.OutputRendering = 'PlainText'
         }
+
+        # Resolved once per invocation rather than per Write-Color call: the
+        # environment cannot change mid-run, and a watch loop repaints the
+        # same roles hundreds of times.
+        $Script:Palette = Resolve-ThemePalette -Name $env:SCA_THEME
 
         # Suppressed under -Json so scripted callers get nothing but the
         # document. Write-Host targets the information stream, which `|` and
@@ -7440,7 +7601,7 @@ function Invoke-Main {
         # before the frame takes over rather than fighting the repaint.
         if (-not $Json) {
             $configAdvisory = Get-ConfigDirAdvisory
-            if ($configAdvisory) { Write-Color $configAdvisory 'Yellow' }
+            if ($configAdvisory) { Write-Color $configAdvisory 'Warning' }
         }
 
         # Heals files a pre-4.0.0 sca wrote at the temp file's umask-default
@@ -7457,7 +7618,7 @@ function Invoke-Main {
         if (-not $profileOnly) {
             $tightened = Repair-CredentialFileModes
             if ($tightened -gt 0 -and -not $Json) {
-                Write-Color "[Security] Tightened $tightened credential file(s) to 0600; they were readable by other users on this machine." 'Yellow'
+                Write-Color "[Security] Tightened $tightened credential file(s) to 0600; they were readable by other users on this machine." 'Warning'
             }
         }
 
@@ -7475,6 +7636,7 @@ function Invoke-Main {
     }
     finally {
         $PSStyle.OutputRendering = $previousRendering
+        $Script:Palette          = $previousPalette
     }
 }
 

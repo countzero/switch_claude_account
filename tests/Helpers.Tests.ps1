@@ -46,6 +46,7 @@ BeforeAll {
             'Format-WatchFooter'
             'Write-WatchFrame'
             'Invoke-WatchStartupWarm'
+            'Get-WatchChrome'
         )
         $ast = [System.Management.Automation.Language.Parser]::ParseFile(
             $Path, [ref]$null, [ref]$null)
@@ -913,7 +914,7 @@ Describe 'switch_claude_account' {
                 Should -Be '49% | 49% | Switch Claude Account'
         }
 
-        It '-Aggregate [!] wins over [~] when one bucket is at Red and the other at Yellow' {
+        It '-Aggregate [!] wins over [~] when one bucket is at Danger and the other at Warning' {
             $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 90; SevenUtil = 50; IsActive = $true })
             Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
                 Should -Be '[!] 90% | 50% | Switch Claude Account'
@@ -1546,6 +1547,46 @@ Describe 'switch_claude_account' {
             }
         }
 
+        It 'Enter-WatchTerminal paints the canvas once when the theme asks for one' {
+            # Without this the alt buffer shows the terminal's own background
+            # until the first frame lands, which on a slow first poll is a
+            # visible flash of the wrong color. One-shot fill, not a clear:
+            # the ESC[2J ban that keeps the repaint flicker-free covers this
+            # function too, so the entry path must not smuggle one in.
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                Invoke-WithEnteredWatchTerminal {
+                    Param ($term, $enterText)
+                    $enterText | Should -Match "`e\[\?1049h`e\[\?25l"
+                    $enterText | Should -Match "`e\[48;2;38;50;56m"
+                    $enterText | Should -Match "`e\[0J"
+                    $enterText | Should -Not -Match "`e\[2J"
+                }
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'Enter-WatchTerminal writes nothing beyond the entry when no theme asks for a canvas' {
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'default'
+                Invoke-WithEnteredWatchTerminal {
+                    Param ($term, $enterText)
+                    $enterText | Should -Be "`e[?1049h`e[?25l"
+                }
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
         It 'Enter-WatchTerminal reports the alt buffer as entered so the restore fires' {
             # Exit-WatchTerminal skips the whole restore on a falsy
             # EnteredAlt, which would strand the user in the alt buffer.
@@ -2150,7 +2191,7 @@ Describe 'switch_claude_account' {
             # Common.ps1 sets PlainText for the session. The captured
             # .Message carries raw SGR that [Console]::Out.Write would not
             # strip, so Get-WatchFrameText must drop it itself in PlainText.
-            $text = Get-WatchFrameText { Write-Color 'X' 'Red' }
+            $text = Get-WatchFrameText { Write-Color 'X' 'Danger' }
             $text | Should -Be "X`n"
             $text.Contains("`e[") | Should -BeFalse
         }
@@ -2159,7 +2200,7 @@ Describe 'switch_claude_account' {
             $prev = $PSStyle.OutputRendering
             try {
                 $PSStyle.OutputRendering = 'Ansi'
-                $text = Get-WatchFrameText { Write-Color 'X' 'Red' }
+                $text = Get-WatchFrameText { Write-Color 'X' 'Danger' }
                 $text.Contains("`e[") | Should -BeTrue -Because 'color frames keep their SGR for [Console]::Out.Write'
             } finally {
                 $PSStyle.OutputRendering = $prev
@@ -2297,6 +2338,335 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Theming (SCA_THEME)' {
+        # The palette indirection: Write-Color takes a ROLE and looks its SGR
+        # up in $Script:Palette, which Invoke-Main binds from $env:SCA_THEME.
+        #
+        # Common.ps1 forces OutputRendering=PlainText, which strips SGR before
+        # a test can see it, so every rendering assertion here flips to 'Ansi'
+        # and restores in a finally. $Script:Palette is restored the same way:
+        # it is script-scope state on the dot-sourced file, so a test that
+        # leaves it on 'material' would recolor the rest of the file's run.
+        BeforeEach {
+            $script:themeSgrRegex = "`e\[[0-9;]*m"
+            if (Test-Path Env:\SCA_THEME) { Remove-Item Env:\SCA_THEME }
+            if (Test-Path Env:\NO_COLOR)  { Remove-Item Env:\NO_COLOR  }
+        }
+
+        It 'resolves an unset, empty or blank name to the default palette' {
+            $expected = $Script:ThemePalettes['default']
+            (Resolve-ThemePalette -Name $null)  | Should -Be $expected
+            (Resolve-ThemePalette -Name '')     | Should -Be $expected
+            (Resolve-ThemePalette -Name '   ')  | Should -Be $expected
+        }
+
+        It 'resolves a known name case-insensitively and tolerates surrounding blanks' {
+            $expected = $Script:ThemePalettes['material']
+            (Resolve-ThemePalette -Name 'material') | Should -Be $expected
+            (Resolve-ThemePalette -Name 'MATERIAL') | Should -Be $expected
+            (Resolve-ThemePalette -Name 'Material') | Should -Be $expected
+            (Resolve-ThemePalette -Name ' material ') | Should -Be $expected
+        }
+
+        It 'falls back to default on an unknown name instead of throwing' {
+            # A typo lives in a shell profile, so it must never break a run.
+            { Resolve-ThemePalette -Name 'no-such-theme' } | Should -Not -Throw
+            (Resolve-ThemePalette -Name 'no-such-theme') |
+                Should -Be $Script:ThemePalettes['default']
+        }
+
+        It 'names the available themes on the verbose stream when a name misses' {
+            # Driven by $VerbosePreference rather than a -Verbose argument:
+            # Resolve-ThemePalette is a simple function, so it has no common
+            # parameters. The preference is how `sca <action> -Verbose`
+            # actually reaches it, the script itself carrying CmdletBinding.
+            $saved = $VerbosePreference
+            try {
+                $VerbosePreference = 'Continue'
+                $v = Resolve-ThemePalette -Name 'no-such-theme' 4>&1 |
+                    Where-Object { $_ -is [System.Management.Automation.VerboseRecord] } |
+                    ForEach-Object { $_.Message }
+                $v | Should -Match 'no-such-theme'
+                $v | Should -Match 'default'
+                $v | Should -Match 'material'
+            }
+            finally { $VerbosePreference = $saved }
+        }
+
+        It 'omits Neutral from every truecolor theme so it inherits the terminal foreground' {
+            # Neutral marks a steady-state row with no verdict, so it has to
+            # stay readable on a light AND a dark background. Any fixed hex
+            # loses one of the two; absence falls through to uncolored.
+            foreach ($name in $Script:ThemePalettes.Keys) {
+                if ($name -eq 'default') { continue }
+                $Script:ThemePalettes[$name].ContainsKey('Neutral') |
+                    Should -BeFalse -Because "theme '$name' must leave Neutral to the terminal"
+            }
+        }
+
+        It 'renders every non-Neutral role in a theme, so no role silently loses its color' {
+            foreach ($name in $Script:ThemePalettes.Keys) {
+                foreach ($role in 'Heading','Warning','Success','Danger','Muted') {
+                    $Script:ThemePalettes[$name][$role] |
+                        Should -Not -BeNullOrEmpty -Because "theme '$name' must define '$role'"
+                }
+            }
+        }
+
+        It 'emits truecolor SGR under material and named SGR under default' {
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'default'
+                $out = Write-Color 'H' 'Heading' 6>&1 | Out-String
+                $out | Should -Match "`e\[33m" -Because 'default Heading is ANSI 33, resolved by the terminal palette'
+
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                $out = Write-Color 'H' 'Heading' 6>&1 | Out-String
+                $out | Should -Match "`e\[38;2;130;170;255m" -Because 'material Heading is base0D #82AAFF'
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'leaves Neutral uncolored under material but colored under default' {
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'default'
+                (Write-Color 'N' 'Neutral' 6>&1 | Out-String) | Should -Match "`e\["
+
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                (Write-Color 'N' 'Neutral' 6>&1 | Out-String) | Should -Not -Match "`e\["
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'still renders an unknown role uncolored under a theme' {
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                (Write-Color 'x' 'not-a-role' 6>&1 | Out-String) | Should -Not -Match "`e\["
+                # $null is the deliberate opt-out at Invoke-ListAction's
+                # inactive rows; a Hashtable throws on a $null index, so this
+                # guards the [String] coercion Write-Color leans on.
+                { Write-Color 'x' $null 6>$null } | Should -Not -Throw
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'PlainText strips a theme truecolor SGR exactly as it strips a named one' {
+            # This is what lets NO_COLOR outrank SCA_THEME for free: the
+            # StringDecorated regex matches ESC[38;2;R;G;Bm just as it matches
+            # ESC[33m, so no-color mode needs no theme-specific handling.
+            $saved = $Script:Palette
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                $PSStyle.OutputRendering = 'PlainText'
+                $out = Write-Color 'payload' 'Heading' 6>&1 | Out-String
+                $out | Should -Not -Match "`e\["
+                $out | Should -Match 'payload'
+            }
+            finally { $Script:Palette = $saved }
+        }
+
+        It 'Get-WatchFrameText strips a theme truecolor SGR under PlainText' {
+            # The watch path strips SGR by hand (Console.Out.Write does no
+            # filtering), so its regex needs the same truecolor guard.
+            $saved = $Script:Palette
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                $PSStyle.OutputRendering = 'PlainText'
+                $text = Get-WatchFrameText { Write-Color 'X' 'Heading' }
+                $text | Should -Not -Match "`e\["
+                $text | Should -Match 'X'
+            }
+            finally { $Script:Palette = $saved }
+        }
+
+        It 'keeps layout byte-identical across themes once SGR is stripped' {
+            # The regression this guards: truecolor sequences are ~3x longer
+            # than named ones. If any renderer measured a COLORED string to
+            # compute padding, switching theme would shift every column.
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            Mock Get-ConsoleWidth { 100 }
+            try {
+                $rendered = foreach ($name in 'default','material') {
+                    $Script:Palette = Resolve-ThemePalette -Name $name
+                    $raw = Write-UsageTableHeader -AutoThreshold 95 6>&1 | Out-String
+                    , ($raw -replace $script:themeSgrRegex, '')
+                }
+                $rendered[0] | Should -Be $rendered[1] -Because (
+                    'padding must be computed on plain text, never on a colored string')
+                # Guard against a vacuous pass: the colored forms must differ,
+                # otherwise the strip above could be hiding a no-op.
+                $rendered[0] | Should -Match 'switching slot at 95%'
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'binds the palette from $env:SCA_THEME during dispatch and restores it on exit' {
+            $saved = $Script:Palette
+            Mock Invoke-ListAction { $script:capturedPalette = $Script:Palette }
+            try {
+                $script:capturedPalette = $null
+                $env:SCA_THEME = 'material'
+                $Action = 'list'
+
+                Invoke-Main
+
+                $script:capturedPalette | Should -Be $Script:ThemePalettes['material']
+                $Script:Palette         | Should -Be $saved
+            }
+            finally {
+                Remove-Item Env:\SCA_THEME -ErrorAction SilentlyContinue
+                $Script:Palette = $saved
+            }
+        }
+
+        It 'lets NO_COLOR outrank SCA_THEME: a theme is which colors, not whether' {
+            $saved = $Script:Palette
+            Mock Invoke-ListAction {
+                $script:capturedRendering = $PSStyle.OutputRendering
+                $script:capturedPalette   = $Script:Palette
+            }
+            $PSStyle.OutputRendering = 'Host'
+            try {
+                $env:SCA_THEME = 'material'
+                $env:NO_COLOR  = '1'
+                $Action = 'list'
+
+                Invoke-Main
+
+                # The theme still resolves; PlainText is what suppresses it.
+                $script:capturedPalette   | Should -Be $Script:ThemePalettes['material']
+                $script:capturedRendering | Should -Be 'PlainText'
+            }
+            finally {
+                Remove-Item Env:\SCA_THEME -ErrorAction SilentlyContinue
+                Remove-Item Env:\NO_COLOR  -ErrorAction SilentlyContinue
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'documents SCA_THEME and its available names in the help screen' {
+            $out = Show-Help 6>&1 | Out-String
+            $out | Should -Match 'SCA_THEME'
+            $out | Should -Match 'material'
+            $out | Should -Match 'NO_COLOR'
+        }
+    }
+
+    Context 'Watch chrome (themed alt-screen background)' {
+        # A theme may paint the alternate screen. The chrome is background +
+        # base foreground, applied ONLY inside the watch frame, never to the
+        # scrollback output of list / save / usage.
+        BeforeEach {
+            $script:savedPalette = $Script:Palette
+            $script:sgrRegex     = "`e\[[0-9;]*m"
+        }
+        AfterEach {
+            $Script:Palette          = $script:savedPalette
+            $PSStyle.OutputRendering = 'PlainText'
+        }
+
+        It 'pairs Background with Foreground in every theme, or omits both' {
+            # Painting a background without pinning a foreground leaves a
+            # light-terminal user reading dark default text on a dark canvas.
+            foreach ($name in $Script:ThemePalettes.Keys) {
+                $t = $Script:ThemePalettes[$name]
+                $t.ContainsKey('Background') | Should -Be $t.ContainsKey('Foreground') -Because (
+                    "theme '$name' must declare Background and Foreground together")
+            }
+        }
+
+        It 'yields no chrome for a theme that declares no Background' {
+            $PSStyle.OutputRendering = 'Ansi'
+            $Script:Palette = Resolve-ThemePalette -Name 'default'
+            Get-WatchChrome | Should -BeNullOrEmpty
+        }
+
+        It 'yields background and foreground for a theme that declares them' {
+            $PSStyle.OutputRendering = 'Ansi'
+            $Script:Palette = Resolve-ThemePalette -Name 'material'
+            $chrome = Get-WatchChrome
+            $chrome | Should -Match "`e\[48;2;38;50;56m"    # base00 background
+            $chrome | Should -Match "`e\[38;2;238;255;255m" # base05 foreground
+        }
+
+        It 'yields no chrome under PlainText even for a themed palette' {
+            # The load-bearing guard. Chrome reaches the terminal through
+            # Write-VTSequence -> [Console]::Out.Write, which bypasses the
+            # StringDecorated filter that gives every Write-Color path
+            # no-color mode for free. Drop this check and -NoColor / NO_COLOR
+            # would paint a background anyway.
+            $PSStyle.OutputRendering = 'PlainText'
+            $Script:Palette = Resolve-ThemePalette -Name 'material'
+            Get-WatchChrome | Should -BeNullOrEmpty
+        }
+
+        It 'builds the unthemed frame exactly as it did before chrome existed' {
+            # Regression pin for the default theme: an empty chrome must not
+            # perturb the sequence by so much as a byte.
+            $frame = "alpha`nbeta"
+            ConvertTo-WatchFrameSequence -FrameText $frame -Chrome '' |
+                Should -Be "`e[Halpha`e[K`nbeta`e[K`e[0J"
+        }
+
+        It 're-asserts chrome after every reset so a colored row cannot punch a hole in the canvas' {
+            # Write-Color ends each run with ESC[0m, which clears background
+            # as well as foreground. Unasserted, the canvas would break from
+            # that point to the end of every colored line.
+            $chrome = '<C>'
+            $frame  = "$($PSStyle.Foreground.BrightRed)hot$($PSStyle.Reset)tail"
+            $seq    = ConvertTo-WatchFrameSequence -FrameText $frame -Chrome $chrome
+            $seq | Should -Match "`e\[0m<C>tail"
+        }
+
+        It 'asserts chrome before every erase so the erases fill with the theme background' {
+            $chrome = '<C>'
+            $seq = ConvertTo-WatchFrameSequence -FrameText "one`ntwo" -Chrome $chrome
+            # Every ESC[K and the trailing ESC[0J must be preceded by chrome.
+            [regex]::Matches($seq, "`e\[K").Count | Should -Be 2
+            $seq | Should -Match "one<C>`e\[K"
+            $seq | Should -Match "two<C>`e\[K"
+            $seq | Should -Match "<C>`e\[0J$"
+            $seq | Should -Match "^`e\[H<C>"
+        }
+
+        It 'collapses repeated chrome so a 1 Hz repaint carries no redundant bytes' {
+            $chrome = '<C>'
+            $frame  = "$($PSStyle.Foreground.BrightRed)hot$($PSStyle.Reset)"
+            $seq    = ConvertTo-WatchFrameSequence -FrameText $frame -Chrome $chrome
+            $seq | Should -Not -Match '<C><C>'
+        }
+
+        It 'leaves frame layout byte-identical whether or not chrome is applied' {
+            # The same invariant the themed-foreground test pins, extended to
+            # the background: chrome is color, never geometry.
+            $frame = "$($PSStyle.Foreground.BrightRed)hot$($PSStyle.Reset) row`nplain row"
+            $with  = ConvertTo-WatchFrameSequence -FrameText $frame -Chrome (
+                $PSStyle.Background.FromRgb(0x263238) + $PSStyle.Foreground.FromRgb(0xEEFFFF))
+            $bare  = ConvertTo-WatchFrameSequence -FrameText $frame -Chrome ''
+            ($with -replace $script:sgrRegex, '') | Should -Be ($bare -replace $script:sgrRegex, '')
+        }
+
+    }
+
     Context 'ConvertTo-ScaJsonString' {
         It 'escapes embedded double-quotes, backslashes, and control characters' {
             ConvertTo-ScaJsonString -Value 'a "b" \ c' | Should -Be '"a \"b\" \\ c"'
@@ -2406,17 +2776,17 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Get-StatusColor (uncovered branches)' {
-        It 'returns DarkGray for the no-oauth label' {
-            (Get-StatusColor -Label 'no-oauth' -IsActive $false) | Should -Be 'DarkGray'
+        It 'returns Muted for the no-oauth label' {
+            (Get-StatusColor -Label 'no-oauth' -IsActive $false) | Should -Be 'Muted'
         }
 
-        It 'returns Yellow for the rate-limited label' {
-            (Get-StatusColor -Label 'rate-limited' -IsActive $false) | Should -Be 'Yellow'
+        It 'returns Warning for the rate-limited label' {
+            (Get-StatusColor -Label 'rate-limited' -IsActive $false) | Should -Be 'Warning'
         }
 
-        It 'returns Gray for unknown labels (default arm)' {
-            (Get-StatusColor -Label 'something-new' -IsActive $false) | Should -Be 'Gray'
-            (Get-StatusColor -Label ''             -IsActive $false) | Should -Be 'Gray'
+        It 'returns Neutral for unknown labels (default arm)' {
+            (Get-StatusColor -Label 'something-new' -IsActive $false) | Should -Be 'Neutral'
+            (Get-StatusColor -Label ''             -IsActive $false) | Should -Be 'Neutral'
         }
     }
 
@@ -3562,23 +3932,23 @@ Describe 'switch_claude_account' {
         # Common.ps1 forces OutputRendering=PlainText so the SGR codes
         # Write-Color emits are stripped by PowerShell's host filter
         # before we see them. We can still verify the function does not
-        # throw on each color name (covers the switch arms) and that
+        # throw on each role (covers the switch arms) and that
         # NoNewline is honored.
 
-        It 'emits without throwing for every named color (covers BrightCyan branch)' {
-            foreach ($c in 'Yellow','DarkYellow','Green','Red','Cyan','Gray','DarkGray') {
+        It 'emits without throwing for every documented role' {
+            foreach ($c in 'Heading','Warning','Success','Danger','Muted','Neutral') {
                 { Write-Color "test" $c 6>$null } | Should -Not -Throw
             }
         }
 
-        It 'tolerates an unknown color name via the default branch' {
-            { Write-Color "test" 'not-a-color' 6>$null } | Should -Not -Throw
+        It 'tolerates an unknown role via the default branch' {
+            { Write-Color "test" 'not-a-role' 6>$null } | Should -Not -Throw
         }
 
         It '-NoNewline switch is honored (single Write-Host call without a newline)' {
             # Capture stream 6 and verify the emitted line carries the
             # message text. PlainText stripping leaves the text intact.
-            $out = Write-Color 'sentinel-no-newline' 'Cyan' -NoNewline 6>&1 | Out-String
+            $out = Write-Color 'sentinel-no-newline' 'Neutral' -NoNewline 6>&1 | Out-String
             $out | Should -Match 'sentinel-no-newline'
         }
     }

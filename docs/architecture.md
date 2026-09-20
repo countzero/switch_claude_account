@@ -142,6 +142,74 @@ Verification is by execution, not inspection. `Enter-WatchTerminal` and
 CI legs: the conditions that break them are the conditions the tests run in. A static
 assertion that a guard is present would have passed against code that never executed.
 
+### Color roles and theming
+
+Callers of `Write-Color` name a semantic **role**, never a color: `Heading`, `Warning`,
+`Success`, `Danger`, `Muted`, `Neutral`. What each means is the palette convention on
+`Write-Color` itself; an unknown role and an explicit `$null` both render uncolored,
+which is how `Invoke-ListAction` marks an inactive row. That indirection is the whole
+point: a palette swap touches no call site.
+
+`$Script:ThemePalettes` maps role to SGR per theme and `$env:SCA_THEME` picks one,
+resolved once per run by `Resolve-ThemePalette` in `Invoke-Main`. Precedence is
+`-NoColor` > `$env:NO_COLOR` > `$env:SCA_THEME` > default. `NO_COLOR` outranks a theme
+rather than conflicting with it, because naming a theme says *which* colors, not
+*whether*; `PlainText` strips truecolor `ESC[38;2;R;G;Bm` by the same regex that strips
+a named `ESC[33m`, so no-color mode needs no theme-specific handling. An unknown name
+falls back quietly with a `Write-Verbose`: a typo lives in a shell profile, so warning
+would print on every invocation for as long as it sits there.
+
+Three constraints are deliberate and should not be "fixed":
+
+- **The default palette is palette-relative.** It spells roles as `$PSStyle`'s named
+  foregrounds, which emit ANSI 30-37/90-97 and let the terminal decide what they look
+  like. The tool therefore already follows the user's own terminal theme, and stays
+  legible on any background. A named theme burns in truecolor and overrides that, which
+  is why one is never selected automatically.
+- **Background is chrome, not a role.** A theme may declare `Background` + `Foreground`,
+  and `Get-WatchChrome` applies them only inside the alternate screen. Everywhere else
+  output is line-oriented into the user's scrollback, where a background would leave
+  ragged colored bars in their history for good.
+- **No truecolor capability detection.** `COLORTERM` and `TERM` are both unset in a
+  Windows truecolor terminal, so a probe would answer wrong on the primary platform.
+  Setting `SCA_THEME` is the user's own assertion that their terminal can render it.
+
+### Alt-screen chrome
+
+`Background` and `Foreground` travel together: painting a canvas without pinning a
+foreground leaves a light-terminal user reading dark default text on a dark background.
+Inside the frame the pair becomes the effective default, which is the second reason
+`Neutral` stays out of the palette — it inherits the chrome foreground there and the
+terminal's foreground in scrollback, and both are right.
+
+`ConvertTo-WatchFrameSequence` weaves chrome in at three points, because a background is
+screen state rather than a property of a string: once after `ESC[H`; re-asserted after
+every `ESC[0m`, since `Write-Color` ends each run with a full reset that clears
+background along with foreground; and before each `ESC[K` and the trailing `ESC[0J` so
+the erases fill with it. Consecutive identical runs are collapsed, a repeated SGR being
+a no-op, so a 1 Hz repaint carries no redundant bytes. `Enter-WatchTerminal` fills once
+on entry to avoid a flash of the terminal background before the first frame; that fill
+uses `ESC[0J`, never `ESC[2J`, which the watch-family guard forbids.
+
+Two caveats are deliberate. Erases filling with the current background is
+`back_color_erase`, implemented by Windows Terminal, conhost, iTerm2, kitty, Alacritty,
+VTE and WezTerm but not universal; where it is missing the written cells still carry the
+background and only the erased tail does not, so the frame degrades to a ragged right
+edge rather than breaking. And the `PlainText` check in `Get-WatchChrome` cannot be
+dropped as redundant: chrome reaches the terminal through `Write-VTSequence` →
+`[Console]::Out.Write`, which bypasses the `StringDecorated` filter that gives every
+`Write-Color` path no-color mode for free.
+
+`Neutral` is absent from every truecolor theme on purpose. It marks a steady-state row
+carrying no verdict, so it has to stay readable on a light *and* a dark background; any
+fixed hex loses one of the two, and falling through to uncolored is correct on both.
+
+`tools/Render-ReadmeImages.ps1` hardcodes the Campbell hexes that Windows Terminal
+renders the **default** theme as. It is not a theme entry and the README images are
+rendered with `SCA_THEME` unset.
+
+User-facing form: `README.md` → *Theming*.
+
 ### Token expiry
 
 OAuth tokens refresh after roughly an hour of inactivity. Without a daemon a slot file

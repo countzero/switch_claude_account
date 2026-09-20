@@ -60,20 +60,22 @@
     case 2:` branch in `freeze/ansi.go`). So we sidestep the hardcoded
     palette by emitting Campbell hexes directly via truecolor.
 
-    Color map (logical name -> Campbell hex -> where it shows):
-        DarkYellow -> #C19C00  headers, bar percent label
-        DarkGray   -> #767676  footer, Account label
-        Green      -> #16C60C  active rows, ok status, green bars
-        Yellow     -> #F9F1A5  yellow bars, near-limit rows
-        Red        -> #E74856  red bars, limited rows
-        Gray       -> #CCCCCC  inactive ok rows
+    Color map (role -> Campbell hex -> where it shows):
+        Heading -> #C19C00  headers, bar percent label
+        Muted   -> #767676  footer, Account label
+        Success -> #16C60C  active rows, ok status, green bars
+        Warning -> #F9F1A5  yellow bars, near-limit rows
+        Danger  -> #E74856  red bars, limited rows
+        Neutral -> #CCCCCC  inactive ok rows
 
-    Logical name = the value passed to `Write-Color` in
-    switch_claude_account.ps1 around line 858. The mapping there from
-    logical name to `$PSStyle` SGR (DarkYellow -> 33, Green -> 92, ...)
-    is a runtime artifact of how Windows Terminal renders those SGRs as
-    Campbell hexes; here we burn the hexes in directly so the SVGs are
-    independent of any terminal palette.
+    Role = the value passed to `Write-Color` in switch_claude_account.ps1;
+    `Write-Color`'s own docblock owns what each role means. These hexes
+    are what Windows Terminal renders the DEFAULT theme's SGR codes as
+    (Heading -> 33, Success -> 92, ...), burned in directly so the SVGs
+    are independent of any terminal palette.
+
+    This is not a `SCA_THEME` entry and must not drift into one: the SVGs
+    document the default theme, so they are rendered with SCA_THEME unset.
 
 .PARAMETER OutputDir
     Where to write the rendered SVGs. Default: <repo>/docs/images.
@@ -148,16 +150,16 @@ New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 # .DESCRIPTION above for rationale.
 $ESC = [char]27
 $RESET  = "$ESC[0m"
-$DKYEL  = "$ESC[38;2;193;156;0m"    # #C19C00  Campbell Yellow      (DarkYellow)
-$DKGRY  = "$ESC[38;2;118;118;118m"  # #767676  Campbell Brt Black   (DarkGray)
-$GREEN  = "$ESC[38;2;22;198;12m"    # #16C60C  Campbell Brt Green   (Green)
-$YELLO  = "$ESC[38;2;249;241;165m"  # #F9F1A5  Campbell Brt Yellow  (Yellow)
-$RED    = "$ESC[38;2;231;72;86m"    # #E74856  Campbell Brt Red     (Red)
-$GRAY   = "$ESC[38;2;204;204;204m"  # #CCCCCC  Campbell White       (Gray)
+$DKYEL  = "$ESC[38;2;193;156;0m"    # #C19C00  Campbell Yellow      (Heading)
+$DKGRY  = "$ESC[38;2;118;118;118m"  # #767676  Campbell Brt Black   (Muted)
+$GREEN  = "$ESC[38;2;22;198;12m"    # #16C60C  Campbell Brt Green   (Success)
+$YELLO  = "$ESC[38;2;249;241;165m"  # #F9F1A5  Campbell Brt Yellow  (Warning)
+$RED    = "$ESC[38;2;231;72;86m"    # #E74856  Campbell Brt Red     (Danger)
+$GRAY   = "$ESC[38;2;204;204;204m"  # #CCCCCC  Campbell White       (Neutral)
 
 # --- Block 1: usage -Watch (README ~lines 17-33) ---------------------------
 # Multi-slot watch frame with 5 rows; bars at 25% (green) / 62% (yellow);
-# trailing [Watch] footer in DarkGray.
+# trailing [Watch] footer in Muted.
 $watchLines = @(
     "$DKYEL[Usage] Plan usage$RESET",
     "",
@@ -206,7 +208,7 @@ $verboseLines = @(
 # Same five-row watch frame as Block 1, plus the two auto-rotation artifacts:
 #
 #   1. Right-aligned header indicator '▶ switching slot at 95%'. Glyph
-#      in Gray (white-ish, high-contrast lozenge); text in DarkGray
+#      in Neutral (white-ish, high-contrast lozenge); text in Muted
 #      (matches footer ambient-metadata weight). See Format-UsageTable in
 #      switch_claude_account.ps1 around line 2779-2810 for the runtime's
 #      three-segment Write-Color composition we are imitating here.
