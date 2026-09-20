@@ -258,11 +258,151 @@ $watchAutoLines = @(
     "$DKGRY[Watch] Last poll at 14:32:07$RESET"
 )
 
+# --- Block 5: theme gallery (README Theming) --------------------------------
+# Generated from the palette table the tool actually ships, not transcribed
+# here, so the gallery cannot drift from the themes on offer. Dot-sourcing is
+# inert: the guard at the foot of switch_claude_account.ps1 keeps Invoke-Main
+# from running, and its load path only resolves paths and builds tables --
+# nothing reads or writes a credential.
+#
+# Each named row is painted on its own base00, so the canvas that theme
+# applies in `usage -Watch` / `monitor` is visible beside its role colors.
+# `default` is deliberately left unpainted: it spells its roles as named ANSI
+# and so has no background of its own, taking whatever the terminal supplies.
+# That is the honest depiction -- its row here shows the Campbell resolution
+# on the panel's own background, exactly as the other scenes do.
+. (Join-Path $repoRoot 'switch_claude_account.ps1')
+
+function Get-GallerySgr {
+    Param ([int] $Rgb, [switch] $Background)
+
+    $layer = if ($Background) { 48 } else { 38 }
+    $r = ($Rgb -shr 16) -band 0xFF
+    $g = ($Rgb -shr 8)  -band 0xFF
+    $b =  $Rgb          -band 0xFF
+    return "$ESC[$layer;2;$r;$g;${b}m"
+}
+
+$roleLabels  = 'Heading', 'Warning', 'Success', 'Danger', 'Muted', 'Neutral'
+$roleWidth   = 8
+$nameWidth   = 11
+$galleryCols = 2 + $nameWidth + ($roleLabels.Count * $roleWidth)
+
+$galleryThemes = @(
+    [pscustomobject]@{
+        Name  = 'default'
+        Bg    = ''
+        Label = $GRAY
+        Fg    = @{
+            Heading = $DKYEL; Warning = $YELLO; Success = $GREEN
+            Danger  = $RED;   Muted   = $DKGRY; Neutral = $GRAY
+        }
+    }
+)
+foreach ($schemeName in ($Script:Base16Schemes.Keys | Sort-Object)) {
+    $scheme = $Script:Base16Schemes[$schemeName]
+    $galleryThemes += [pscustomobject]@{
+        Name  = $schemeName
+        Bg    = (Get-GallerySgr $scheme.base00 -Background)
+        Label = (Get-GallerySgr $scheme.base05)
+        Fg    = @{
+            Heading = (Get-GallerySgr $scheme.base0D)
+            Warning = (Get-GallerySgr $scheme.base0A)
+            Success = (Get-GallerySgr $scheme.base0B)
+            Danger  = (Get-GallerySgr $scheme.base08)
+            Muted   = (Get-GallerySgr $scheme.base03)
+            # Neutral holds no color of its own in a truecolor theme; inside a
+            # themed frame it inherits that theme's Foreground, which is what
+            # base05 shows here.
+            Neutral = (Get-GallerySgr $scheme.base05)
+        }
+    }
+}
+
+$themeGalleryLines = @(
+    "$DKYEL[Theme] SCA_THEME palettes$RESET",
+    ""
+)
+foreach ($gt in $galleryThemes) {
+    # No ESC[0m until the row ends: a reset would drop the background as well
+    # as the foreground, so each segment only switches the foreground and the
+    # canvas survives to the padded right edge.
+    $row = $gt.Bg + '  ' + $gt.Label + $gt.Name.PadRight($nameWidth)
+    foreach ($role in $roleLabels) {
+        $row += $gt.Fg[$role] + $role.PadRight($roleWidth)
+    }
+    $themeGalleryLines += $row + $RESET
+}
+
+# --- Block 5: theme gallery (docs/themes.md) --------------------------------
+# Rows are generated from the script's own $Script:Base16Schemes rather than
+# a second transcription of the hexes here, so the gallery cannot drift from
+# the palettes that actually ship. Dot-sourcing is read-only:
+# switch_claude_account.ps1 guards its dispatcher behind an InvocationName
+# check and touches no file at load time. Verified to share no variable name
+# with this script, so nothing above is clobbered.
+. (Join-Path $repoRoot 'switch_claude_account.ps1')
+
+# Unlike the Campbell constants above, these come straight from the scheme
+# data, so they are emitted rather than spelled out.
+function ConvertTo-Sgr {
+    Param ([int] $Rgb, [switch] $Background)
+
+    $r     = ($Rgb -shr 16) -band 0xFF
+    $g     = ($Rgb -shr 8)  -band 0xFF
+    $b     =  $Rgb          -band 0xFF
+    $layer = if ($Background) { 48 } else { 38 }
+    return "$ESC[$layer;2;$r;$g;$($b)m"
+}
+
+# Every row is padded to one width so the background blocks end on the same
+# column. A ragged right edge would read as a rendering fault rather than as
+# a difference between palettes.
+$galleryWidth  = 72
+$galleryNameCol = 11
+$gallerySample = @(
+    @{ Text = '[Usage] Plan usage'; Slot = 'base0D' }  # Heading
+    @{ Text = 'near limit';         Slot = 'base0A' }  # Warning
+    @{ Text = 'ok';                 Slot = 'base0B' }  # Success
+    @{ Text = 'limited';            Slot = 'base08' }  # Danger
+    @{ Text = 'Last poll';          Slot = 'base03' }  # Muted
+)
+
+# -Scheme $null renders the `default` theme, which has no hexes of its own:
+# it spells roles as named ANSI and so looks like whatever the terminal's
+# palette resolves those to. Campbell stands in for that here, and
+# docs/themes.md says so, because no single image can be honest about a
+# palette-relative theme.
+function New-GalleryRow {
+    Param ([string] $Name, [hashtable] $Scheme)
+
+    $fallback = @{ base0D = $DKYEL; base0A = $YELLO; base0B = $GREEN; base08 = $RED; base03 = $DKGRY }
+
+    $bg  = if ($Scheme) { ConvertTo-Sgr $Scheme.base00 -Background } else { '' }
+    $fg  = if ($Scheme) { ConvertTo-Sgr $Scheme.base05 } else { $GRAY }
+    $row = $bg + $fg + '  ' + $Name.PadRight($galleryNameCol)
+    $used = 2 + $galleryNameCol
+
+    foreach ($cell in $gallerySample) {
+        $sgr  = if ($Scheme) { ConvertTo-Sgr $Scheme[$cell.Slot] } else { $fallback[$cell.Slot] }
+        $row += $sgr + $cell.Text + '  '
+        $used += $cell.Text.Length + 2
+    }
+
+    return $row + (' ' * [Math]::Max(0, $galleryWidth - $used)) + $RESET
+}
+
+$themeGalleryLines = @(New-GalleryRow -Name 'default' -Scheme $null)
+foreach ($themeName in ($Script:Base16Schemes.Keys | Sort-Object)) {
+    $themeGalleryLines += New-GalleryRow -Name $themeName -Scheme $Script:Base16Schemes[$themeName]
+}
+
 $scenarios = @(
-    [pscustomobject]@{ Name = 'usage-watch';      Lines = $watchLines     },
-    [pscustomobject]@{ Name = 'usage-table';      Lines = $tableLines     },
-    [pscustomobject]@{ Name = 'usage-verbose';    Lines = $verboseLines   },
-    [pscustomobject]@{ Name = 'monitor';          Lines = $watchAutoLines }
+    [pscustomobject]@{ Name = 'usage-watch';      Lines = $watchLines        },
+    [pscustomobject]@{ Name = 'usage-table';      Lines = $tableLines        },
+    [pscustomobject]@{ Name = 'usage-verbose';    Lines = $verboseLines      },
+    [pscustomobject]@{ Name = 'monitor';          Lines = $watchAutoLines    },
+    [pscustomobject]@{ Name = 'themes';           Lines = $themeGalleryLines }
 )
 
 # --- Render -----------------------------------------------------------------

@@ -321,7 +321,7 @@ These rules are Windows-strict on every platform by design, so a slot name yield
 ### Theming
 By default `sca` colors its output with the standard ANSI colors, which means your terminal decides what they actually look like: the output already matches whatever color scheme you have set, on a light background as well as a dark one.
 
-If you would rather pin an exact palette, set `SCA_THEME`:
+If you would rather pin an exact palette, set `SCA_THEME` to one of `dracula`, `everforest`, `flexoki`, `gruvbox`, `kanagawa`, `material`, `monokai`, `nord` or `onedark`:
 
 ```powershell
 $env:SCA_THEME = 'material'      # PowerShell; add to $PROFILE to make it stick
@@ -331,23 +331,17 @@ $env:SCA_THEME = 'material'      # PowerShell; add to $PROFILE to make it stick
 export SCA_THEME=material        # bash / zsh
 ```
 
-Ten themes ship: `default`, plus `dracula`, `everforest`, `flexoki`, `gruvbox`, `kanagawa`, `material`, `monokai`, `nord` and `onedark`. The name is case-insensitive, and an unrecognized one quietly falls back to `default` (run any action with `-Verbose` to see which names exist). `sca help` lists them too.
+<p align="center">
+  <img src="docs/images/themes.svg" alt="Ten rows, one per theme, each showing a sample sca row painted on that theme's own background: the theme name, a '[Usage] Plan usage' heading, 'near limit', 'ok', 'limited' and 'Last poll' each in the theme's warning, success, danger and muted colors" width="720">
+</p>
 
-The nine named themes are the [base16](https://github.com/tinted-theming/schemes) schemes of the same name, mapped onto `sca`'s six roles by one fixed rule, so a scheme you already know from your editor reads the same here.
-
-A named theme emits 24-bit truecolor, which every modern terminal supports (Windows Terminal, iTerm2, kitty, Alacritty, WezTerm, recent GNOME Terminal). Setting the variable is taken as your word that yours does; `sca` does not probe, because the usual probe (`COLORTERM`) is unset on Windows even where truecolor works perfectly.
+Each named theme is the [base16](https://github.com/tinted-theming/schemes) scheme of the same name, so a palette you know from your editor reads the same here. **[docs/themes.md](docs/themes.md)** has the full gallery, the exact hex values and why the `default` row above is the one the picture cannot show honestly.
 
 To turn color off entirely, use `-NoColor` or the standard [`NO_COLOR`](https://no-color.org) variable. Both outrank `SCA_THEME`, since a theme says *which* colors to use, not *whether* to use any:
 
 ```bash
 export NO_COLOR=1
 ```
-
-Each named theme also paints its own background, but **only** in the full-screen views, `sca usage -Watch` and `sca monitor`. Those own the whole alternate screen, so a canvas there reads as deliberate and the screen is handed back untouched on exit. Everything else prints into your scrollback, where a background would leave ragged colored bars in your shell history for good. `default` never paints one.
-
-Whichever theme is active, the layout never changes: every column lines up identically.
-
-If you would rather theme every tool at once instead of each one separately, set your terminal's own 16-color palette — Windows Terminal's *Color schemes*, or [`concfg`](https://github.com/lukesampson/concfg) for CMD and legacy consoles. The `default` theme uses the standard ANSI colors precisely so it inherits that work.
 
 ### Profile encoding
 `sca install` and `sca uninstall` preserve your PowerShell profile's existing encoding (UTF-8 with or without BOM, UTF-16 LE/BE). ANSI-encoded profiles are treated as UTF-8 no-BOM (indistinguishable without a BOM).
