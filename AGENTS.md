@@ -57,7 +57,7 @@ The exit code is the verdict, so never narrow the run to find one: a filter that
 
 ## README image regeneration
 
-`pwsh -NoProfile -File tools/Render-ReadmeImages.ps1` re-renders the five SVGs in `docs/images/` via `charmbracelet/freeze`. Re-run when a README example number changes, when a `Write-Color` / `Get-StatusColor` / `Get-AggregateBarColor` mapping changes, or when a theme is added: `themes.svg` is generated from `$Script:Base16Schemes` by dot-sourcing the script, so it tracks the shipped palettes but only once re-rendered, and the hex table in `docs/themes.md` is hand-maintained beside it. That script's header owns the palette, the truecolor rationale and the README `width` contract.
+`pwsh -NoProfile -File tools/Render-ReadmeImages.ps1` re-renders every SVG in `docs/images/` via `charmbracelet/freeze`: four README scenes plus one `theme-<name>.svg` per entry in `$Script:Base16Schemes`, which the tool reads by dot-sourcing the script. Re-run when a README example number changes, when a `Write-Color` / `Get-StatusColor` / `Get-AggregateBarColor` mapping changes, or when a theme is added; a new theme's image appears on its own, but its heading, hex line and alt text in `docs/themes.md` are hand-maintained. The theme panels alone drop the embedded font for a fallback chain, which is 99.7% of a rendered file. That script's header owns the palette, the font and truecolor rationale, and the README `width` contract.
 
 ## Default Change Workflow
 

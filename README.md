@@ -331,11 +331,9 @@ $env:SCA_THEME = 'material'      # PowerShell; add to $PROFILE to make it stick
 export SCA_THEME=material        # bash / zsh
 ```
 
-<p align="center">
-  <img src="docs/images/themes.svg" alt="Eleven stacked panels, one per theme, each labelled with its SCA_THEME name and showing the full sca monitor view in that theme: pool-aggregate Session and Week bars, a five-row slot table with ok, near-limit and limited rows, and the Monitor and Watch footer lines, painted on that theme's own background" width="720">
-</p>
+**[docs/themes.md](docs/themes.md) shows every theme**, each rendered as the whole `sca monitor` view so what you see is what you get, with its own heading to link to: [claude](docs/themes.md#claude), [dracula](docs/themes.md#dracula), [everforest](docs/themes.md#everforest), [flexoki](docs/themes.md#flexoki), [gruvbox](docs/themes.md#gruvbox), [kanagawa](docs/themes.md#kanagawa), [material](docs/themes.md#material), [monokai](docs/themes.md#monokai), [nord](docs/themes.md#nord), [onedark](docs/themes.md#onedark).
 
-Every panel is the whole `sca monitor` view in that theme, so what you see is what you get. Nine of them are the [base16](https://github.com/tinted-theming/schemes) scheme of the same name, so a palette you know from your editor reads the same here; `claude` is an original one keyed to the interface this tool manages logins for. **[docs/themes.md](docs/themes.md)** has the exact hex values and why the `default` panel is the one the picture cannot show honestly.
+Nine are the [base16](https://github.com/tinted-theming/schemes) scheme of the same name, so a palette you know from your editor reads the same here; `claude` is an original one keyed to the interface this tool manages logins for.
 
 To turn color off entirely, use `-NoColor` or the standard [`NO_COLOR`](https://no-color.org) variable. Both outrank `SCA_THEME`, since a theme says *which* colors to use, not *whether* to use any:
 

@@ -372,24 +372,29 @@ $panelWidth = 2 + ((New-HeroLines -Palette $campbellPalette |
     ForEach-Object { ($_ -replace "$ESC\[[0-9;]*m", '').Length } |
     Measure-Object -Maximum).Maximum)
 
-$themeGalleryLines = @()
-foreach ($gt in $galleryThemes) {
-    if ($themeGalleryLines.Count) { $themeGalleryLines += '' }
-    $themeGalleryLines += "$($gt.Label)SCA_THEME=$($gt.Name)$RESET"
-    $themeGalleryLines += ConvertTo-ThemedPanel `
-        -Lines (New-HeroLines -Palette $gt.Palette) `
-        -Bg    $gt.Bg `
-        -Fg    $gt.PanelFg `
-        -Width $panelWidth
-}
-
 $scenarios = @(
-    [pscustomobject]@{ Name = 'usage-watch';      Lines = $watchLines        },
-    [pscustomobject]@{ Name = 'usage-table';      Lines = $tableLines        },
-    [pscustomobject]@{ Name = 'usage-verbose';    Lines = $verboseLines      },
-    [pscustomobject]@{ Name = 'monitor';          Lines = $watchAutoLines    },
-    [pscustomobject]@{ Name = 'themes';           Lines = $themeGalleryLines }
+    [pscustomobject]@{ Name = 'usage-watch';   Lines = $watchLines     },
+    [pscustomobject]@{ Name = 'usage-table';   Lines = $tableLines     },
+    [pscustomobject]@{ Name = 'usage-verbose'; Lines = $verboseLines   },
+    [pscustomobject]@{ Name = 'monitor';       Lines = $watchAutoLines }
 )
+
+# One file per theme, not one tall strip. docs/themes.md gives each theme a
+# heading of its own so a reader can link straight to the one they want, and a
+# heading needs its own content underneath for that anchor to be worth
+# following. The theme name lives in the markdown heading, so the panel no
+# longer carries a label of its own.
+foreach ($gt in $galleryThemes) {
+    $scenarios += [pscustomobject]@{
+        Name      = "theme-$($gt.Name)"
+        ShareFont = $true
+        Lines     = ConvertTo-ThemedPanel `
+            -Lines (New-HeroLines -Palette $gt.Palette) `
+            -Bg    $gt.Bg `
+            -Fg    $gt.PanelFg `
+            -Width $panelWidth
+    }
+}
 
 # --- Render -----------------------------------------------------------------
 # freeze flags rationale:
@@ -428,8 +433,32 @@ $scenarios = @(
 # Font defaults to JetBrains Mono and is embedded as a base64 woff2 in the
 # SVG, so the rendered output is pixel-identical regardless of the
 # viewer's installed fonts. Adds ~300 KB per SVG, acceptable for README
-# assets.
+# assets -- but see Set-SharedFont for the scenes where it is not.
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+# Drop the embedded face and name a fallback chain instead.
+#
+# Measured: a rendered SVG is 367 KB, of which 970 bytes is the drawing and
+# all the rest is one base64 woff2. Embedding is the right trade for the four
+# README scenes, which are the front door and number four. It is the wrong
+# trade for a per-theme gallery, where the same font would be paid for eleven
+# times over -- about 4 MB to say something about color.
+#
+# Safe here because the panels are column-aligned monospace text and the chain
+# resolves to SOME monospace in every viewer: a substituted face changes the
+# glyph shapes without disturbing the alignment the scene depends on. The four
+# hero images keep their embedded copy, so nothing on the README front page
+# changes.
+function Set-SharedFont {
+    Param ([Parameter(Mandatory)] [string] $Path)
+
+    $svg = [System.IO.File]::ReadAllText($Path)
+    $svg = [regex]::Replace($svg, '(?s)@font-face\s*\{.*?\}', '')
+    $svg = $svg.Replace(
+        'font-family="JetBrains Mono"',
+        'font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"')
+    [System.IO.File]::WriteAllText($Path, $svg, $utf8NoBom)
+}
 
 foreach ($s in $scenarios) {
     $ansiPath = Join-Path $tmpRoot ("{0}.ansi" -f $s.Name)
@@ -453,6 +482,7 @@ foreach ($s in $scenarios) {
     if ($LASTEXITCODE -ne 0) {
         throw "freeze failed for $($s.Name) (exit $LASTEXITCODE)"
     }
+    if ($s.ShareFont) { Set-SharedFont -Path $svgPath }
 }
 
 # --- Cleanup ----------------------------------------------------------------
