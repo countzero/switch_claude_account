@@ -2563,6 +2563,64 @@ Describe 'switch_claude_account' {
             }
         }
 
+        It 'defines all seven base16 slots in every shipped scheme' {
+            foreach ($name in $Script:Base16Schemes.Keys) {
+                $s = $Script:Base16Schemes[$name]
+                foreach ($slot in 'base00','base03','base05','base08','base0A','base0B','base0D') {
+                    $s.ContainsKey($slot) | Should -BeTrue -Because "scheme '$name' must define $slot"
+                    $s[$slot] | Should -BeGreaterOrEqual 0
+                    $s[$slot] | Should -BeLessOrEqual 0xFFFFFF -Because "$name.$slot must be a 24-bit color"
+                }
+            }
+        }
+
+        It 'keeps Danger actually red and Success actually green in every scheme' {
+            # The rule that disqualified github. base16 slots carry SYNTAX
+            # meaning, which usually but not always lines up with the ANSI
+            # meaning a status table needs: github's port puts orange in
+            # base08 and pale blue in base0B, so Danger would have rendered
+            # orange and Success blue and a glance at the table would have
+            # misread which slots were healthy. Hue-checked rather than
+            # eyeballed, so a scheme added later cannot reintroduce it.
+            function Get-Hue ([int] $Rgb) {
+                $r = (($Rgb -shr 16) -band 0xFF) / 255
+                $g = (($Rgb -shr 8)  -band 0xFF) / 255
+                $b = ( $Rgb          -band 0xFF) / 255
+                $max = [Math]::Max($r, [Math]::Max($g, $b))
+                $min = [Math]::Min($r, [Math]::Min($g, $b))
+                $d   = $max - $min
+                if ($d -eq 0) { return 0 }
+                $h = if ($max -eq $r) { 60 * (((($g - $b) / $d) % 6)) }
+                     elseif ($max -eq $g) { 60 * ((($b - $r) / $d) + 2) }
+                     else { 60 * ((($r - $g) / $d) + 4) }
+                if ($h -lt 0) { $h += 360 }
+                return [int][Math]::Round($h)
+            }
+
+            foreach ($name in $Script:Base16Schemes.Keys) {
+                $s = $Script:Base16Schemes[$name]
+
+                # Red wraps zero, so the band is expressed as two arcs. Wide
+                # enough to admit monokai's magenta-leaning #F92672 (338) and
+                # the several schemes sitting just under 360.
+                $hRed = Get-Hue $s.base08
+                ($hRed -le 25 -or $hRed -ge 330) | Should -BeTrue -Because (
+                    "$name base08 is hue $hRed; Danger must read as red, not orange")
+
+                # Lower bound 55 admits gruvbox's olive #B8BB26 (61), which is
+                # that theme's actual green rather than a mis-slotted yellow.
+                $hGreen = Get-Hue $s.base0B
+                ($hGreen -ge 55 -and $hGreen -le 170) | Should -BeTrue -Because (
+                    "$name base0B is hue $hGreen; Success must read as green, not blue")
+            }
+        }
+
+        It 'builds one palette per scheme, plus the hand-written default' {
+            $expected = @($Script:Base16Schemes.Keys) + 'default'
+            ($Script:ThemePalettes.Keys | Sort-Object) |
+                Should -Be ($expected | Sort-Object)
+        }
+
         It 'documents SCA_THEME and its available names in the help screen' {
             $out = Show-Help 6>&1 | Out-String
             $out | Should -Match 'SCA_THEME'

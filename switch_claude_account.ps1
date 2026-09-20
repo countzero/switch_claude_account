@@ -1580,7 +1580,26 @@ function Show-Help {
     # letting Join-Path's binder throw mid-render.
     $unresolved = '(unresolved: set HOME or CLAUDE_CONFIG_DIR)'
     $slotGlob   = if ($CredDir) { Join-Path $CredDir '.credentials.<name>(<email>).json' } else { $unresolved }
-    $themeNames = ($Script:ThemePalettes.Keys | Sort-Object) -join ', '
+    # Wrapped into the 21-column description gutter rather than joined into
+    # one line: the list grows with every theme added and had already run to
+    # 124 columns, well past the width the rest of this screen keeps to.
+    $themeGutter = ' ' * 21
+    $themeLines  = @()
+    $themeLine   = ''
+    foreach ($themeName in ($Script:ThemePalettes.Keys | Sort-Object)) {
+        $candidate = if ($themeLine) { "$themeLine, $themeName" } else { $themeName }
+        if ($candidate.Length -gt (80 - $themeGutter.Length)) {
+            $themeLines += "$themeLine,"
+            $themeLine   = $themeName
+        } else {
+            $themeLine = $candidate
+        }
+    }
+    if ($themeLine) { $themeLines += $themeLine }
+    # Joined into ONE element rather than spliced in as several: a nested
+    # array reaches Write-Host as a single argument and gets space-joined
+    # back onto one line, undoing the wrap.
+    $themeBlock = ($themeLines | ForEach-Object { $themeGutter + $_ }) -join "`n"
 
     $lines = @(
         "",
@@ -1650,7 +1669,8 @@ function Show-Help {
         # Theme names come from the palette table itself so this list cannot
         # drift as themes are added.
         "ENVIRONMENT",
-        "  SCA_THEME          Color theme: $themeNames",
+        "  SCA_THEME          Color theme. One of:",
+        $themeBlock,
         "  NO_COLOR           Set non-empty to suppress all color (no-color.org)",
         "  CLAUDE_CONFIG_DIR  Override the directory holding the files above",
         "",
@@ -1664,25 +1684,78 @@ function Show-Help {
     $lines | ForEach-Object { Write-Host $_ }
 }
 
+# The base16 slots each role is built from. Stated once, here, so that every
+# scheme below stays pure data and no theme can wire a role differently from
+# its siblings.
+#
+#   Heading    base0D      Warning base0A      Success base0B
+#   Danger     base08      Muted   base03
+#   Background base00      Foreground base05
+#
+# Muted takes base03 ("Comments, Invisibles"), not base04 ("status bars"),
+# even though a status table is literally what it renders. base04 sits close
+# enough to base05 that the row stops reading as de-emphasized, and dimmer
+# than the body text is the whole job. The resulting base03-on-base00 ratio
+# runs 1.7:1 to 3.8:1 across these schemes, which is each theme's own comment
+# contrast rather than something to correct here.
+#
+# base16 slots carry SYNTAX-highlighting meaning, which usually but not
+# always coincides with the ANSI meaning a status table needs. Where it does
+# not, a scheme is unusable no matter how good it looks: github's port puts
+# orange in base08 and pale blue in base0B, so Danger would render orange and
+# Success blue and a glance at the table would misread which slots are
+# healthy. That is why github is absent despite having an upstream, and why
+# the suite hue-checks both slots rather than leaving the rule to review.
+function New-ThemePalette {
+    Param ([Parameter(Mandatory)] [hashtable] $Scheme)
+
+    return @{
+        Heading    = $PSStyle.Foreground.FromRgb($Scheme.base0D)
+        Warning    = $PSStyle.Foreground.FromRgb($Scheme.base0A)
+        Success    = $PSStyle.Foreground.FromRgb($Scheme.base0B)
+        Danger     = $PSStyle.Foreground.FromRgb($Scheme.base08)
+        Muted      = $PSStyle.Foreground.FromRgb($Scheme.base03)
+
+        # Alt-screen chrome; see Get-WatchChrome for where it applies and
+        # why it stops at the edge of the watch frame.
+        Background = $PSStyle.Background.FromRgb($Scheme.base00)
+        Foreground = $PSStyle.Foreground.FromRgb($Scheme.base05)
+    }
+}
+
+# The seven slots of each scheme this tool ships, transcribed from the
+# base16 definitions in tinted-theming/schemes (MIT). Dark variants only:
+# a light scheme is legible but doubles the list for a view that is read at a
+# glance, and none was asked for. Adding a theme is a row here and nothing
+# else; the integrity tests pick it up automatically.
+$Script:Base16Schemes = @{
+    dracula    = @{ base00 = 0x282A36; base03 = 0x6272A4; base05 = 0xF8F8F2; base08 = 0xFF5555; base0A = 0xF1FA8C; base0B = 0x50FA7B; base0D = 0xBD93F9 }
+    everforest = @{ base00 = 0x2D353B; base03 = 0x859289; base05 = 0xD3C6AA; base08 = 0xE67E80; base0A = 0xDBBC7F; base0B = 0xA7C080; base0D = 0x7FBBB3 }
+    flexoki    = @{ base00 = 0x100F0F; base03 = 0x575653; base05 = 0xCECDC3; base08 = 0xD14D41; base0A = 0xD0A215; base0B = 0x879A39; base0D = 0x4385BE }
+    gruvbox    = @{ base00 = 0x282828; base03 = 0x665C54; base05 = 0xD5C4A1; base08 = 0xFB4934; base0A = 0xFABD2F; base0B = 0xB8BB26; base0D = 0x83A598 }
+    kanagawa   = @{ base00 = 0x1F1F28; base03 = 0x54546D; base05 = 0xDCD7BA; base08 = 0xC34043; base0A = 0xC0A36E; base0B = 0x76946A; base0D = 0x7E9CD8 }
+    material   = @{ base00 = 0x263238; base03 = 0x546E7A; base05 = 0xEEFFFF; base08 = 0xF07178; base0A = 0xFFCB6B; base0B = 0xC3E88D; base0D = 0x82AAFF }
+    monokai    = @{ base00 = 0x272822; base03 = 0x75715E; base05 = 0xF8F8F2; base08 = 0xF92672; base0A = 0xF4BF75; base0B = 0xA6E22E; base0D = 0x66D9EF }
+    nord       = @{ base00 = 0x2E3440; base03 = 0x4C566A; base05 = 0xE5E9F0; base08 = 0xBF616A; base0A = 0xEBCB8B; base0B = 0xA3BE8C; base0D = 0x81A1C1 }
+    onedark    = @{ base00 = 0x282C34; base03 = 0x545862; base05 = 0xABB2BF; base08 = 0xE06C75; base0A = 0xE5C07B; base0B = 0x98C379; base0D = 0x61AFEF }
+}
+
 # Role -> SGR sequence, one entry per selectable theme.
 #
-# `default` spells the roles as `$PSStyle`'s NAMED foregrounds, which emit
-# ANSI 30-37 / 90-97. Those are palette-relative: the terminal decides what
-# they look like, so the default rendering already follows whatever theme
-# the user's terminal is set to and stays legible on any background. A named
-# theme instead burns in truecolor (`ESC[38;2;R;G;Bm`), overriding the
-# terminal palette -- which is the whole point of asking for one, and why
-# no theme is ever selected for the user automatically.
-#
-# `material` is the base16 "Material" scheme (tinted-theming/schemes),
-# assigned by ROLE rather than by hue: base0D blue carries a heading better
-# at a terminal's default weight than base0A amber does.
+# `default` is the odd one out and stays hand-written: it spells the roles as
+# `$PSStyle`'s NAMED foregrounds, which emit ANSI 30-37 / 90-97. Those are
+# palette-relative, so the terminal decides what they look like and the
+# default rendering already follows whatever scheme the user's terminal is
+# set to, on a light background as readily as a dark one. Every named theme
+# instead burns in truecolor (`ESC[38;2;R;G;Bm`) and overrides that -- which
+# is the whole point of asking for one, and why none is ever selected
+# automatically.
 #
 # Neutral is deliberately absent from every truecolor theme. It marks a
 # steady-state row carrying no verdict, so it has to stay readable on a light
 # AND a dark background; any fixed hex loses one of the two. Omitting it
-# falls through to uncolored, which inherits the terminal foreground and is
-# therefore correct on both.
+# falls through to uncolored, which inside a watch frame inherits the theme's
+# own Foreground and outside one inherits the terminal's, both correct.
 $Script:ThemePalettes = @{
     default = @{
         Heading = $PSStyle.Foreground.Yellow
@@ -1692,18 +1765,9 @@ $Script:ThemePalettes = @{
         Muted   = $PSStyle.Foreground.BrightBlack
         Neutral = $PSStyle.Foreground.White
     }
-    material = @{
-        Heading = $PSStyle.Foreground.FromRgb(0x82AAFF)  # base0D blue
-        Warning = $PSStyle.Foreground.FromRgb(0xFFCB6B)  # base0A amber
-        Success = $PSStyle.Foreground.FromRgb(0xC3E88D)  # base0B green
-        Danger  = $PSStyle.Foreground.FromRgb(0xF07178)  # base08 red
-        Muted   = $PSStyle.Foreground.FromRgb(0x546E7A)  # base03 gray
-
-        # Alt-screen chrome; see Get-WatchChrome for where it applies and
-        # why it stops at the edge of the watch frame.
-        Background = $PSStyle.Background.FromRgb(0x263238)  # base00
-        Foreground = $PSStyle.Foreground.FromRgb(0xEEFFFF)  # base05
-    }
+}
+foreach ($schemeName in $Script:Base16Schemes.Keys) {
+    $Script:ThemePalettes[$schemeName] = New-ThemePalette -Scheme $Script:Base16Schemes[$schemeName]
 }
 
 # The palette `Write-Color` renders through. Bound at load time, not inside
