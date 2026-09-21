@@ -291,12 +291,19 @@ Describe 'switch_claude_account' {
             New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'old@example.com' -Content 'OLD' | Out-Null
             Set-Content -LiteralPath $script:CredFilePath -Value 'NEW' -NoNewline
 
+            # Mode 000 denies the snapshot read but not the unlink, which the
+            # parent directory's permissions govern, so the save that this
+            # drives to a warning then deletes the path as an obsolete sibling.
+            # The restore is for the case where it survives; the Windows twin
+            # needs no such guard because FileShare::None blocks the delete too.
             [System.IO.File]::SetUnixFileMode($oldSlot, [System.IO.UnixFileMode]::None)
             try {
                 $out = (Invoke-SaveAction -Name 'work' 6>&1 | Out-String)
             }
             finally {
-                [System.IO.File]::SetUnixFileMode($oldSlot, [System.IO.UnixFileMode]'UserRead, UserWrite')
+                if (Test-Path -LiteralPath $oldSlot) {
+                    [System.IO.File]::SetUnixFileMode($oldSlot, [System.IO.UnixFileMode]'UserRead, UserWrite')
+                }
             }
 
             $out | Should -Match '\[Save\] WARNING: could not snapshot .*old@example\.com.*rollback for this path will be skipped'
@@ -329,7 +336,10 @@ Describe 'switch_claude_account' {
                 $out = (Invoke-SaveAction -Name 'work' 6>&1 | Out-String)
             }
             finally {
-                [System.IO.File]::SetUnixFileMode($oldSidecar, [System.IO.UnixFileMode]'UserRead, UserWrite')
+                # Guarded for the reason given on the slot-file twin above.
+                if (Test-Path -LiteralPath $oldSidecar) {
+                    [System.IO.File]::SetUnixFileMode($oldSidecar, [System.IO.UnixFileMode]'UserRead, UserWrite')
+                }
             }
 
             $out | Should -Match '\[Save\] WARNING: could not snapshot .*account\.json.*rollback for this path will be skipped'
