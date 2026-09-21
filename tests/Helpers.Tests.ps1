@@ -2909,6 +2909,87 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Watch frame inset' {
+        # The frame is lifted off the window edge by $Script:FramePad*, which
+        # Write-WatchFrame raises for one paint and drops again. Zero
+        # everywhere else, because scrollback output must stay flush left.
+        AfterEach {
+            $Script:FramePadColumns = 0
+            $Script:FramePadRows    = 0
+        }
+
+        It 'leaves the sequence byte-identical at a zero inset' {
+            # Every non-watch caller sees this. Pins that the inset is a
+            # no-op rather than a reformat when it is not asked for.
+            ConvertTo-WatchFrameSequence -FrameText "alpha`nbeta" -Chrome '' |
+                Should -Be "`e[Halpha`e[K`nbeta`e[K`e[0J"
+        }
+
+        It 'indents every line and opens with the blank inset rows' {
+            $Script:FramePadColumns = 2
+            $Script:FramePadRows    = 1
+            ConvertTo-WatchFrameSequence -FrameText "alpha`nbeta" -Chrome '' |
+                Should -Be "`e[H  `e[K`n  alpha`e[K`n  beta`e[K`e[0J"
+        }
+
+        It 'fills the inset with chrome, so the margin is canvas and not a hole' {
+            # The indent is written before the line, after the chrome set at
+            # ESC[H, so the spaces carry the theme background. A margin in
+            # the terminal's own color would read as a second seam.
+            $Script:FramePadColumns = 2
+            $Script:FramePadRows    = 1
+            $seq = ConvertTo-WatchFrameSequence -FrameText 'alpha' -Chrome '<C>'
+            $seq | Should -Match "^`e\[H<C>  "
+            $seq | Should -Match "`n  alpha<C>`e\[K"
+        }
+
+        It 'needs no right or bottom inset, those edges being reached by the erases' {
+            # ESC[K fills to end of line and ESC[0J to end of screen, both
+            # with chrome, so only the top and left are ever written.
+            $Script:FramePadColumns = 3
+            $Script:FramePadRows    = 2
+            $seq = ConvertTo-WatchFrameSequence -FrameText 'x' -Chrome ''
+            $seq | Should -Be "`e[H   `e[K`n   `e[K`n   x`e[K`e[0J"
+        }
+
+        It 'applies the inset without a theme, geometry being independent of color' {
+            $Script:FramePadColumns = 2
+            $Script:FramePadRows    = 0
+            ConvertTo-WatchFrameSequence -FrameText 'x' -Chrome '' |
+                Should -Be "`e[H  x`e[K`e[0J"
+        }
+
+        It 'raises the inset for the render and drops it again afterwards' {
+            # Both halves need it -- the layout while $RenderScript runs, the
+            # transform after -- so the window has to span the pair.
+            $script:seenColumns = -1
+            $script:seenRows    = -1
+            Get-CapturedConsoleOut {
+                Write-WatchFrame {
+                    $script:seenColumns = $Script:FramePadColumns
+                    $script:seenRows    = $Script:FramePadRows
+                    Write-Host 'row'
+                }
+            } | Out-Null
+            $script:seenColumns     | Should -Be 2
+            $script:seenRows        | Should -Be 1
+            $Script:FramePadColumns | Should -Be 0
+            $Script:FramePadRows    | Should -Be 0
+        }
+
+        It 'drops the inset even when the render script throws' {
+            # A leaked inset would indent the caller's scrollback for the
+            # rest of the process, long after the watch that set it died.
+            {
+                Get-CapturedConsoleOut {
+                    Write-WatchFrame { throw 'render exploded' }
+                }
+            } | Should -Throw
+            $Script:FramePadColumns | Should -Be 0
+            $Script:FramePadRows    | Should -Be 0
+        }
+    }
+
     Context 'ConvertTo-ScaJsonString' {
         It 'escapes embedded double-quotes, backslashes, and control characters' {
             ConvertTo-ScaJsonString -Value 'a "b" \ c' | Should -Be '"a \"b\" \\ c"'
@@ -3491,6 +3572,39 @@ Describe 'switch_claude_account' {
             $w = Get-ConsoleWidth
             $w | Should -BeOfType [int]
             $w | Should -BeGreaterOrEqual 0
+        }
+    }
+
+    Context 'Get-RenderWidth' {
+        # The width a renderer may lay out in: the console width less the
+        # frame inset on both sides. Right-aligned content is the reason it
+        # is separate from Get-ConsoleWidth -- laying out against the raw
+        # width and then indenting would push it past the right edge.
+        AfterEach { $Script:FramePadColumns = 0 }
+
+        It 'passes the console width through when no inset is in force' {
+            Mock Get-ConsoleWidth { 80 }
+            Get-RenderWidth | Should -Be 80
+        }
+
+        It 'subtracts the inset from both sides' {
+            Mock Get-ConsoleWidth { 80 }
+            $Script:FramePadColumns = 2
+            Get-RenderWidth | Should -Be 76
+        }
+
+        It 'keeps an unknown width unknown rather than insetting the sentinel' {
+            # 0 means "no width to lay out against". Subtracting from it would
+            # hand callers a negative they would read as a real width.
+            Mock Get-ConsoleWidth { 0 }
+            $Script:FramePadColumns = 2
+            Get-RenderWidth | Should -Be 0
+        }
+
+        It 'floors at zero when the inset exceeds the terminal' {
+            Mock Get-ConsoleWidth { 3 }
+            $Script:FramePadColumns = 5
+            Get-RenderWidth | Should -Be 0
         }
     }
 

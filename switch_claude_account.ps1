@@ -1961,6 +1961,42 @@ function Get-ConsoleWidth {
     try { return [int][Console]::WindowWidth } catch { return 0 }
 }
 
+# Inset of the watch frame from the terminal edge, in columns and rows.
+#
+# Zero at load and zero everywhere except inside Write-WatchFrame, which
+# raises them for the duration of one paint and drops them again in a
+# finally. That is what keeps the inset out of the scrollback: `sca list`,
+# `sca save` and one-shot `sca usage` print line-oriented output into the
+# user's history, where a leading indent is noise and breaks copy-paste.
+#
+# Ambient rather than a parameter because the two things that need the value
+# sit at opposite ends of the render: ConvertTo-WatchFrameSequence, which
+# applies it, and Get-RenderWidth, which is consulted several frames deep
+# inside the renderer by layout code that has no business taking a
+# presentation argument. Threading it through would put an inset parameter on
+# Format-UsageFrame, Format-UsageTable and Write-UsageTableHeader, all three
+# of which are also reached from non-watch callers that must pass 0.
+$Script:FramePadColumns = 0
+$Script:FramePadRows    = 0
+
+# Columns a renderer may lay out in: the terminal width less the frame inset
+# on both sides, or 0 when the width is unknown.
+#
+# Split from Get-ConsoleWidth rather than folded into it because the two
+# answer different questions and only one of them is honest about the
+# terminal. Right-aligned content is the reason this exists: the -Auto header
+# indicator and the aggregate-bar clamp both position against the width and
+# reserve a 1-column margin, so laying them out against the raw width and
+# THEN indenting the frame would push them a full inset past the right edge
+# and wrap them. Unknown (0) propagates unchanged; those callers already
+# treat it as "do not lay out against a width".
+function Get-RenderWidth {
+    $width = Get-ConsoleWidth
+    if ($width -le 0) { return 0 }
+
+    return [Math]::Max(0, $width - (2 * $Script:FramePadColumns))
+}
+
 # Single chokepoint for ALL non-color VT control sequences in the watch
 # lifecycle (alt screen buffer, cursor hide/show, DEC 2026 synchronized
 # output, clear screen, cursor home).
@@ -2057,6 +2093,14 @@ function Get-WatchFrameText {
 # erased tail keeps the terminal's, so the frame degrades to a ragged right
 # edge rather than breaking. Not probed, for the same reason truecolor is
 # not: the capability databases are absent or wrong on Windows.
+#
+# The frame inset ($Script:FramePad*, raised only for the duration of a
+# Write-WatchFrame paint) is applied here as blank leading rows and a space
+# prefix per line. Only the top and left need writing: the right edge is
+# already reached by each line's ESC[K and the bottom by the trailing
+# ESC[0J, both of which fill with chrome. The inset is independent of the
+# theme, so it applies with an empty -Chrome too; a pad of 0 makes both
+# operations identity, which is what every non-watch path sees.
 function ConvertTo-WatchFrameSequence {
     Param (
         [AllowEmptyString()] [AllowNull()] [string] $FrameText,
@@ -2066,7 +2110,10 @@ function ConvertTo-WatchFrameSequence {
     if ($Chrome) {
         $FrameText = $FrameText -replace "`e\[0m", "`e[0m$Chrome"
     }
-    $body = (($FrameText -split "`n") | ForEach-Object { $_ + $Chrome + "`e[K" }) -join "`n"
+    $FrameText = ("`n" * $Script:FramePadRows) + $FrameText
+    $indent    = ' ' * $Script:FramePadColumns
+
+    $body = (($FrameText -split "`n") | ForEach-Object { $indent + $_ + $Chrome + "`e[K" }) -join "`n"
     $sequence = "`e[H" + $Chrome + $body + $Chrome + "`e[0J"
 
     # A line ending in a colored run gets chrome twice: once re-asserted after
@@ -5233,7 +5280,7 @@ function Write-UsageTableHeader {
     if ($AutoThreshold -gt 0) {
         $glyph     = "$([char]0x25B6)"
         $text      = " switching slot at $AutoThreshold%"
-        $termWidth = Get-ConsoleWidth
+        $termWidth = Get-RenderWidth
         if ($termWidth -ge ($headerLeft.Length + 2 + $glyph.Length + $text.Length + 1)) {
             $padding = ' ' * ($termWidth - $headerLeft.Length - $glyph.Length - $text.Length - 1)
         } else {
@@ -5316,7 +5363,7 @@ function Format-UsageTable {
     # the other end. Unknown width (0) leaves the fit-to-table width alone.
     if ($IncludeAggregateBars) {
         $barLineWidth = $totalLineWidth
-        $termWidth    = Get-ConsoleWidth
+        $termWidth    = Get-RenderWidth
         if ($termWidth -gt 0 -and $barLineWidth -gt ($termWidth - 1)) {
             $barLineWidth = $termWidth - 1
         }
@@ -7510,11 +7557,30 @@ function Format-WatchFooter {
 # Callers repaint unconditionally on every tick, which is also what
 # self-heals a terminal resize within ~1 s: the per-line ESC[K and the
 # trailing ESC[0J reclaim any cells left by the old geometry.
+#
+# This is also the sole owner of the frame inset. Both halves of the render
+# need it -- the layout, through Get-RenderWidth, while $RenderScript runs,
+# and the transform, when it indents the result -- so it is raised around the
+# pair and dropped in a finally, leaving every non-watch renderer at 0. One
+# row and two columns: enough to lift the frame off the window edge (which is
+# the whole point, the alternate screen has no prompt or margin of its own to
+# do it), and small enough that the table still fits the 80-column terminal
+# its column widths are measured against. The table body's own two-space
+# indent is unaffected, so the header-to-row relationship is unchanged and
+# the block simply moves in.
 function Write-WatchFrame {
     Param ([Parameter(Mandatory)] [scriptblock] $RenderScript)
 
-    $frameText = Get-WatchFrameText $RenderScript
-    Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence -FrameText $frameText -Chrome (Get-WatchChrome)) + "`e[?2026l")
+    $Script:FramePadColumns = 2
+    $Script:FramePadRows    = 1
+    try {
+        $frameText = Get-WatchFrameText $RenderScript
+        Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence -FrameText $frameText -Chrome (Get-WatchChrome)) + "`e[?2026l")
+    }
+    finally {
+        $Script:FramePadColumns = 0
+        $Script:FramePadRows    = 0
+    }
 }
 
 # The -Warmup startup pass, run once before the polling loop. Mutates

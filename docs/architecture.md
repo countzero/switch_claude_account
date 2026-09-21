@@ -225,6 +225,22 @@ background, and resetting anyway would discard one the *user* set before launchi
 is written **before** `ESC[?1049l`, where it shows for one frame in the gutter alone;
 after the leave it would flash the theme background across the restored scrollback.
 
+### The frame inset
+
+`$Script:FramePadColumns` / `$Script:FramePadRows` lift the frame two columns and one row
+off the window edge. `Write-WatchFrame` owns them, raising the pair for one paint and
+dropping it in a `finally`, so scrollback renderers see 0 and stay flush left — an indent
+there would be noise and would break copy-paste.
+
+`Get-RenderWidth` is the width a renderer may lay out in. It exists because the `-Auto`
+indicator and the aggregate-bar clamp right-align against the width: doing that against
+the raw terminal and *then* indenting would push them an inset past the edge and wrap
+them. Split from `Get-ConsoleWidth` so one function stays honest about the terminal and
+the other answers what fits; unknown (`0`) propagates unchanged. Ambient rather than a
+parameter because the consumers sit at opposite ends of the render, and threading it would
+put a presentation argument on `Format-UsageFrame`, `Format-UsageTable` and
+`Write-UsageTableHeader`, all reached from non-watch callers that must pass 0.
+
 Two caveats are deliberate. Erases filling with the current background is
 `back_color_erase`, implemented by Windows Terminal, conhost, iTerm2, kitty, Alacritty,
 VTE and WezTerm but not universal; where it is missing the written cells still carry the
