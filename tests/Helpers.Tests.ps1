@@ -1899,6 +1899,23 @@ Describe 'switch_claude_account' {
             $s.WarmLatch | Should -Be '[Warmup] Keeping all slots warm.'
         }
 
+        # Both latch values are claims about a round-robin. Neither survives
+        # discovering there is none: the notice warns about activations that
+        # will not happen, and the seed claims an activity with nothing to
+        # perform it on. The frame already says there are no slots.
+        It 'drops the latch entirely when no slot matched' -ForEach @(
+            @{ Case = 'live client'; Running = $true }
+            @{ Case = 'no client';   Running = $false }
+        ) {
+            Mock Test-ClaudeRunning  -MockWith { $Running }
+            Mock Invoke-WarmAllSlots -MockWith { $null }
+
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+
+            $s.WarmLatch | Should -BeNullOrEmpty
+        }
+
         It 'latches the advisory when the pass stopped early' {
             # Invoke-WarmAllSlots stops rather than overwrite bytes nothing
             # captured, which leaves the user on a slot they did not choose.

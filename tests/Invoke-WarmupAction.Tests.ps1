@@ -97,6 +97,40 @@ Describe 'switch_claude_account' {
             Should -Invoke Start-Sleep -Times 0 -Exactly
         }
 
+        # The notice describes what the round-robin will cost and the pause
+        # offers five seconds to call it off. Neither has anything to say when
+        # the pass is about to report that no slot matched: there is no cost
+        # coming and nothing to abort.
+        It 'says nothing about a live client when <Case>' -ForEach @(
+            @{ Case = 'no slots are saved';   Slot = $null; Filter = '' }
+            @{ Case = '-Name matches nothing'; Slot = 'a';   Filter = 'no-such-slot' }
+        ) {
+            Mock Test-ClaudeRunning -MockWith { $true }
+            Mock Start-Sleep -MockWith { }
+            $Script:WarmupLiveClientPauseSec = 5
+            if ($Slot) {
+                New-SlotPair -CredDir $script:CredDirPath -Name $Slot -Email "$Slot@test.local" -Content '{}' | Out-Null
+            }
+
+            $out = Invoke-WarmupAction -Name $Filter 6>&1 | Out-String
+
+            $out | Should -Not -Match 'Claude Code is running'
+            $out | Should -Not -Match 'Ctrl-C to abort'
+            $out | Should -Match 'No slots'
+            Should -Invoke Start-Sleep -Times 0 -Exactly
+        }
+
+        # Get-SafeName advises when it changes the name. Resolving it once and
+        # reusing the result is what keeps that advisory from being printed by
+        # the preflight, by the pass, and by the no-slots message in turn.
+        It 'advises about a sanitized name exactly once' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null
+
+            $out = Invoke-WarmupAction -Name 'my missing' 6>&1 | Out-String
+
+            ([regex]::Matches($out, "Sanitized to: 'my_missing'")).Count | Should -Be 1
+        }
+
         # The pass stops rather than overwrite bytes nothing captured, which
         # leaves the user on a slot they did not choose. That is the one thing
         # they have to read, so it precedes the table.

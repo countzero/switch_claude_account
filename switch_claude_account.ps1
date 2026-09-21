@@ -6068,6 +6068,11 @@ function Invoke-WarmupAction {
         throw (Get-UncapturedCredentialsRefusal -Sync $sync -ActionLabel 'sca warmup')
     }
 
+    # Sanitized once, here, and used for every lookup and message below.
+    # Get-SafeName advises when it changes the name, so resolving it at each
+    # call site would print that advisory once per site.
+    $safeName = if ($Name) { Get-SafeName $Name } else { $Name }
+
     # The pass makes each slot active in turn, so a live client follows it
     # across every account before the finally restores the original. Warn
     # rather than refuse: nothing here is destructive (Test-ClaudeRunning owns
@@ -6078,7 +6083,12 @@ function Invoke-WarmupAction {
     # `claude -p` follows it by milliseconds, so a user reads it with the
     # round-robin already under way. The pause is what makes the Ctrl-C it
     # implies reachable.
-    if (Test-ClaudeRunning) {
+    #
+    # Both are held until a slot is known to match. A warning about what the
+    # round-robin will cost, followed by five seconds of Ctrl-C window, is a
+    # false alarm when the pass is about to report that it has nothing to
+    # activate: there is no decision to offer and nothing to abort.
+    if ((Get-WarmupSlotSet -Name $safeName).Count -gt 0 -and (Test-ClaudeRunning)) {
         Write-Color $Script:WarmupLiveClientNotice 'Warning'
         if ($Script:WarmupLiveClientPauseSec -gt 0) {
             Write-Color "[Warmup] Starting in $($Script:WarmupLiveClientPauseSec)s; press Ctrl-C to abort." 'Warning'
@@ -6091,10 +6101,13 @@ function Invoke-WarmupAction {
     # No-op repaint: the one-shot path has no live frame to redraw, so the
     # per-slot state transitions are not rendered; only the final snapshot
     # is printed below as the usual usage table.
-    $snapshot = Invoke-WarmAllSlots -Name $Name -Repaint { Param ($snap) }
+    #
+    # Re-resolved rather than reusing the set above: the preflight answered a
+    # yes/no question about the notice, and the pass owns the slots it acts on.
+    $snapshot = Invoke-WarmAllSlots -Name $safeName -Repaint { Param ($snap) }
 
     if ($null -eq $snapshot) {
-        $scope = if ($Name) { "matching '$(Get-SafeName $Name)'" } else { 'saved' }
+        $scope = if ($safeName) { "matching '$safeName'" } else { 'saved' }
         Write-Color "[Warmup] No slots $scope to activate. Use: sca save <name>" 'Warning'
         return
     }
@@ -6105,7 +6118,7 @@ function Invoke-WarmupAction {
     if ($snapshot.Advisory) { Write-Color $snapshot.Advisory 'Warning' }
 
     Write-Host ''
-    Format-UsageFrame -Name $Name -Snapshot $snapshot
+    Format-UsageFrame -Name $safeName -Snapshot $snapshot
 }
 
 # Decide whether the watch loop's -Auto mode should rotate, suggest a
@@ -6669,6 +6682,39 @@ $Script:ActivatorTimeoutSec = 90
 # $Repaint is invoked as: & $Repaint $snapshot. The `claude -p` spawn
 # (seconds) naturally floors the 'priming' label's on-screen visibility,
 # so no artificial min-visibility sleep is needed.
+# The saved slots a warm pass would target, for the same -Name / -Names the
+# pass itself takes. Empty when nothing matches.
+#
+# Split out of Invoke-WarmAllSlots so a caller can ask the question BEFORE the
+# pass starts. Invoke-WarmupAction is the one that needs to: its live-client
+# warning is about activations that are going to happen, and the pause it adds
+# is a decision point about spending money, so both have to stay quiet when the
+# answer is that nothing will be activated at all.
+#
+# Get-SafeName runs here rather than in the callers because the filter is what
+# needs the sanitized form. It is idempotent and only advises when it changes
+# something, so a caller that sanitizes first (Invoke-WarmupAction, which needs
+# the safe name for its own messages) pays for the advisory once rather than
+# once per call site.
+function Get-WarmupSlotSet {
+    Param (
+        [string]   $Name,
+        # Already-sanitized slot names, from Get-Slots output (snapshot rows).
+        # Takes precedence over -Name when both are supplied.
+        [string[]] $Names
+    )
+
+    $slots = @(Get-Slots)
+    if ($Names) {
+        return @($slots | Where-Object { $Names -contains $_.Name })
+    }
+    if ($Name) {
+        $safe = Get-SafeName $Name
+        return @($slots | Where-Object { $_.Name -eq $safe })
+    }
+    return $slots
+}
+
 function Invoke-WarmAllSlots {
     Param (
         [string]                             $Name,
@@ -6682,14 +6728,7 @@ function Invoke-WarmAllSlots {
         [Parameter(Mandatory)] [scriptblock] $Repaint
     )
 
-    $slots = @(Get-Slots)
-    if ($Names) {
-        $slots = @($slots | Where-Object { $Names -contains $_.Name })
-    }
-    elseif ($Name) {
-        $safe  = Get-SafeName $Name
-        $slots = @($slots | Where-Object { $_.Name -eq $safe })
-    }
+    $slots = @(Get-WarmupSlotSet -Name $Name -Names $Names)
     if ($slots.Count -lt 1) { return $null }
 
     # Each row carries IsCachedFallback / FallbackReason so the verify-after-
@@ -7464,7 +7503,15 @@ function Invoke-WatchStartupWarm {
             Format-UsageFrame -Name $Name -Snapshot $snap -Footer $startupFooter -AutoThreshold $autoHeader
         }
     }
-    if ($null -eq $Session.Snapshot) { return }
+    # No slot matched, so the round-robin never ran. Drop both the live-client
+    # notice set above and New-WatchSession's seeded '[Warmup] Keeping all
+    # slots warm.': one warns about activations that will not happen, the
+    # other claims an activity there is nothing to perform it on. The frame
+    # below already says there are no slots.
+    if ($null -eq $Session.Snapshot) {
+        $Session.WarmLatch = $null
+        return
+    }
 
     # The pass suppresses nothing here, but its own advisories are written
     # through Write-Color, which would paint outside the frame's sync
