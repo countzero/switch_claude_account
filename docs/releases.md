@@ -53,6 +53,23 @@ name in it: every release up to v4.2.0 carried `windows_switch_claude_account` f
 the rename and reached the right page only through GitHub's redirect, while the changelog
 link one line above already used the new name.
 
+## Publishing
+
+```powershell
+git log -1 --format='%h %s' origin/main    # must be the release pull request's merge commit
+$tag = 'v4.3.0'
+$body = @'
+- [Changelog](https://github.com/countzero/switch_claude_account/blob/main/CHANGELOG.md#430---2026-09-21)
+- [Code Changes](https://github.com/countzero/switch_claude_account/compare/v4.2.0...v4.3.0)
+'@
+gh release create $tag --target (git rev-parse origin/main) --title $tag --notes $body
+```
+
+Type the body against the rules above; do not copy the previous release's and edit the
+numbers in it. That copy is exactly how v4.2.0 shipped `v4.1.0...v4.3.0`, one of the two
+versions having been updated and the other not, and how a repository name three renames
+stale kept being carried forward release after release.
+
 ## The asset attaches itself
 
 `.github/workflows/release-assets.yml` fires on `release: published`, checks out the tag
