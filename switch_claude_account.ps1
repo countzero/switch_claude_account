@@ -4829,6 +4829,12 @@ function Get-StatusColor {
         # 'no-oauth' / 'expired' / 'unauthorized' / 'error'), which are
         # already mapped above.
         '^priming$'      { return 'Warning' }
+        # 'skipped' is terminal, unlike the two above: the pass aborted
+        # before reaching this row and will not come back to it. Muted
+        # rather than Warning because nothing about the row needs
+        # attention -- the abort advisory carries the whole story, and
+        # painting these yellow would compete with it.
+        '^skipped$'      { return 'Muted' }
         default          { return 'Neutral' }
     }
 }
@@ -5098,6 +5104,9 @@ function Get-UsageStatusLabel {
         # limited' / 'limited 5h' / 'near limit').
         'warming-up'   { 'warming up' }
         'priming'      { 'priming' }
+        # Terminal, set on the rows an aborted pass never reached, so the
+        # final table does not leave them claiming to be in flight.
+        'skipped'      { 'skipped' }
         default        { [string]$Row.Status }
     }
 }
@@ -6639,8 +6648,9 @@ $Script:ActivatorTimeoutSec = 90
 # Builds the rendered snapshot in place: one row per slot (filtered by
 # -Names, else -Name, when set), each starting at Status='warming-up' with Data=$null,
 # transitioning through 'priming' (the claude -p call in flight) to its
-# real outcome. The end state is the first frame of the polling loop; the
-# caller wires it to the watch session's Snapshot and stamps its LastPoll.
+# real outcome, or to 'skipped' for the rows an abort below never reaches.
+# The end state is the first frame of the polling loop; the caller wires it
+# to the watch session's Snapshot and stamps its LastPoll.
 # Returns $null when no slots match.
 #
 # The original active slot is captured before the loop via Read-ScaState
@@ -6862,6 +6872,15 @@ function Invoke-WarmAllSlots {
                           elseif ($sync)  { "reconcile reported '$($sync.Reason)'" }
                           else            { 'the reconcile returned nothing' }
                 $snapshot.Advisory = "[Warmup] Stopped at '$($row.Name)': nothing captured the credentials Claude Code left active ($detail), and warming on would discard a token refresh. You are active on '$($row.Name)'; close Claude Code and run 'sca save $($row.Name)' to keep them."
+
+                # Give the rows this abort will never reach a terminal status.
+                # Left at their seeded 'warming-up' they read as in flight in a
+                # table the pass has already finished painting, and
+                # Invoke-KeepWarmStep charges a failed-warm backoff to every
+                # outcome that is not 'ok' -- including slots it never entered.
+                # An index loop, not a range: ($i + 1)..$last counts DOWN when
+                # the abort lands on the last row.
+                for ($j = $i + 1; $j -le $last; $j++) { $rows[$j].Status = 'skipped' }
                 break
             }
 
@@ -7037,6 +7056,15 @@ function Invoke-KeepWarmStep {
         foreach ($w in @($warmed.Results)) { if ($w.Name) { $outcome[$w.Name] = $w.Status } }
 
         foreach ($n in $cold) {
+            # 'skipped' is the one outcome that is not a verdict on the slot:
+            # the pass aborted before reaching it. Stamping it would hold it
+            # off for a cooldown it did not earn, and charging it a failure
+            # would double that cooldown again on the next abort, so a slot
+            # the pass never entered is left exactly as it was found. Nothing
+            # re-fires in a loop as a result: the reconcile above refuses the
+            # whole step for as long as the condition that aborted it holds.
+            if ($outcome[$n] -eq 'skipped') { continue }
+
             $WarmupTimes[$n] = $now
             if ($outcome[$n] -eq 'ok') { $WarmupFailures.Remove($n) }
             else { $WarmupFailures[$n] = 1 + [int]$WarmupFailures[$n] }

@@ -2972,6 +2972,7 @@ Describe 'switch_claude_account' {
             @{ Status = 'rate-limited'; Expected = 'rate-limited' }
             @{ Status = 'warming-up';   Expected = 'warming up' }
             @{ Status = 'priming';      Expected = 'priming' }
+            @{ Status = 'skipped';      Expected = 'skipped' }
         ) {
             Get-UsageStatusLabel -Row (New-StatusRow -Status $Status) | Should -Be $Expected
         }
@@ -3809,6 +3810,14 @@ Describe 'switch_claude_account' {
             Get-StatusColor -Label 'priming' -IsActive $false | Should -Be 'Warning'
             Get-StatusColor -Label 'priming' -IsActive $true  | Should -Be 'Warning'
         }
+
+        It 'Get-StatusColor maps "skipped" to Muted, not to the transients'' Warning' {
+            # The other two warm-pass labels are in flight and want the eye;
+            # 'skipped' is terminal and wants none, because the abort advisory
+            # beside the table is what the user has to read.
+            Get-StatusColor -Label 'skipped' -IsActive $false | Should -Be 'Muted'
+            Get-StatusColor -Label 'skipped' -IsActive $true  | Should -Be 'Muted'
+        }
     }
 
     Context 'Invoke-WarmAllSlots' {
@@ -4329,6 +4338,30 @@ Describe 'switch_claude_account' {
             $snap.Advisory    | Should -Match "Stopped at 'a'"
             $snap.Advisory    | Should -Match 'identity-unresolved'
             $snap.Advisory    | Should -Match "sca save a"
+
+            # Both unreached rows are finalized rather than left at their
+            # seeded 'warming-up', which the table renders as in flight and
+            # Invoke-KeepWarmStep charges as a failed warm.
+            (Get-RowStatus $snap 'b') | Should -Be 'skipped'
+            (Get-RowStatus $snap 'c') | Should -Be 'skipped'
+        }
+
+        It 'leaves the aborting row its own outcome when no row follows it' {
+            # The boundary the index loop exists for: ($i + 1)..$last counts
+            # DOWN once $i reaches $last, so a range would stamp 'skipped' over
+            # the status the aborting row just earned.
+            New-WarmupSlot -Name 'a' | Out-Null
+
+            Mock Invoke-Reconcile -MockWith {
+                New-ReconcileResult -Action 'noop' -Reason 'identity-unresolved' -Slot 'a' -Captured $false
+            }
+            Mock Invoke-SlotSwap -MockWith { }
+            Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'no-oauth'; Error = 'synthetic' } }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            $snap.Advisory            | Should -Match "Stopped at 'a'"
+            (Get-RowStatus $snap 'a') | Should -Be 'no-oauth'
         }
 
         It 'stops the pass when the mirror itself throws' {
@@ -4784,6 +4817,38 @@ Describe 'switch_claude_account' {
 
             $fails['a'] | Should -Be 1
             $fails['b'] | Should -Be 1
+        }
+
+        # The counterpart to the throw above. A throw says nothing about
+        # individual slots, so every one of them counts; an abort does, and
+        # the slots behind it were never tried.
+        It 'charges nothing to the slots an aborted pass never reached' {
+            Mock Invoke-WarmAllSlots {
+                [pscustomobject]@{
+                    Results  = @(
+                        [pscustomobject]@{ Name = 'a'; Status = 'error' },
+                        [pscustomobject]@{ Name = 'b'; Status = 'skipped' }
+                    )
+                    Advisory = "[Warmup] Stopped at 'a': nothing captured the credentials Claude Code left active."
+                }
+            }
+            $times = @{}; $fails = @{}
+            $snap  = New-KwSnapshot @(
+                (New-KwRow -Name 'a' -FiveResetsAt $null),
+                (New-KwRow -Name 'b' -FiveResetsAt $null)
+            )
+
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 `
+                                -CooldownMin 5 -WarmupFailures $fails -CurrentLatch 'x' | Out-Null
+
+            # 'a' was tried and did not reach 'ok', so it earns its failure.
+            $fails['a']             | Should -Be 1
+            $times.ContainsKey('a') | Should -BeTrue
+
+            # 'b' was not, so neither the cooldown stamp nor the doubling that
+            # a repeated abort would compound may touch it.
+            $fails.ContainsKey('b') | Should -BeFalse
+            $times.ContainsKey('b') | Should -BeFalse
         }
 
         It 'omitting -WarmupFailures keeps the flat-cooldown behaviour' {
