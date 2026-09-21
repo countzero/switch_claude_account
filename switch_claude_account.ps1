@@ -1720,6 +1720,12 @@ function New-ThemePalette {
         # why it stops at the edge of the watch frame.
         Background = $PSStyle.Background.FromRgb($Scheme.base00)
         Foreground = $PSStyle.Foreground.FromRgb($Scheme.base05)
+
+        # The same base00, kept raw because OSC 11 wants `rgb:RR/GG/BB` and
+        # the SGR above has already been formatted past recovery. Stored
+        # rather than parsed back out of `Background`; see
+        # Get-WatchBackgroundOsc for what reads it.
+        BackgroundRgb = $Scheme.base00
     }
 }
 
@@ -1835,6 +1841,40 @@ function Get-WatchChrome {
     if (-not $bg) { return '' }
 
     return $bg + $Script:Palette['Foreground']
+}
+
+# The active theme's background as an OSC 11 (set default background color)
+# sequence, or '' when the terminal should keep its own.
+#
+# Why this exists at all, given the chrome above already paints every cell:
+# a terminal renders on a character grid, and a window whose pixel height or
+# width is not a whole multiple of the cell size keeps the remainder as an
+# unpainted gutter along its right and bottom edges. SGR and back_color_erase
+# address cells, so neither the per-line ESC[K nor the trailing ESC[0J can
+# reach that strip; the terminal fills it from its own default background
+# instead, and the seam against the themed canvas is visible. OSC 11 moves
+# that default, which is the only lever an application has. Windows Terminal
+# declined to paint the gutter from the adjacent cells
+# (microsoft/terminal#19860, closed as not-planned), so this is not a
+# workaround for a bug due to be fixed upstream.
+#
+# Deriving the guard from Get-WatchChrome rather than restating its two
+# conditions is deliberate: the gutter and the canvas have to agree in every
+# case, and the only way to guarantee that is to give them one predicate. A
+# theme with no Background (default) and no-color mode both yield '' here for
+# free, which is correct -- neither should move the user's terminal.
+#
+# X11 `rgb:RR/GG/BB` is the form every implementation accepts. BEL rather
+# than ST terminates it to match the OSC 0 title writes elsewhere in this
+# file; both are legal and mixing them within one program buys nothing.
+function Get-WatchBackgroundOsc {
+    if (-not (Get-WatchChrome)) { return '' }
+
+    $rgb = $Script:Palette['BackgroundRgb']
+    if ($null -eq $rgb) { return '' }
+
+    return "`e]11;rgb:{0:x2}/{1:x2}/{2:x2}`a" -f
+        (($rgb -shr 16) -band 0xFF), (($rgb -shr 8) -band 0xFF), ($rgb -band 0xFF)
 }
 
 # Single chokepoint for ALL colored output. No production path may call
@@ -7225,14 +7265,22 @@ function Enter-WatchTerminal {
     # on a slow first poll is a visible flash of the wrong color. A one-shot
     # fill, not a per-frame clear, so it cannot reintroduce the flicker the
     # ESC[2J ban exists to prevent.
+    #
+    # The OSC 11 rides along in the same write because it covers the half of
+    # the canvas the fill cannot reach: the sub-cell gutter at the right and
+    # bottom edges. See Get-WatchBackgroundOsc. It goes out AFTER the alt
+    # buffer is entered so a theme never recolors the user's main screen, and
+    # its emission is recorded on the token because the reset is conditional.
     $chrome = Get-WatchChrome
-    if ($chrome) { Write-VTSequence ($chrome + "`e[H`e[0J") }
+    $bgOsc  = Get-WatchBackgroundOsc
+    if ($chrome) { Write-VTSequence ($bgOsc + $chrome + "`e[H`e[0J") }
 
     return [pscustomobject]@{
-        Cursor     = $origCursor
-        Encoding   = $origEncoding
-        Title      = $origTitle
-        EnteredAlt = $true
+        Cursor        = $origCursor
+        Encoding      = $origEncoding
+        Title         = $origTitle
+        EnteredAlt    = $true
+        BackgroundSet = [bool]$bgOsc
     }
 }
 
@@ -7253,6 +7301,19 @@ function Exit-WatchTerminal {
         $restoreTitle = if ($null -ne $State.Title) { [string]$State.Title } else { '' }
         $restoreTitle = [regex]::Replace($restoreTitle, '[\x00-\x1F\x7F]', '')
         Write-VTSequence ("`e]0;{0}`a" -f $restoreTitle)
+
+        # OSC 111 (reset default background) only where Enter-WatchTerminal
+        # actually set one. Unconditional would be a bug rather than a
+        # harmless no-op: under the default theme sca never touches the
+        # background, so resetting would discard an OSC 11 the USER set on
+        # their terminal before launching the watch.
+        #
+        # Before the alt-buffer leave, not after. While the alt screen is
+        # still up every cell carries the chrome SGR, so the reset shows for
+        # one frame in the gutter alone; doing it after ESC[?1049l would
+        # instead flash the theme background across the restored scrollback.
+        if ($State.BackgroundSet) { Write-VTSequence "`e]111`a" }
+
         Write-VTSequence "`e[?25h`e[?1049l"
     }
     if ($null -ne $State.Cursor) {

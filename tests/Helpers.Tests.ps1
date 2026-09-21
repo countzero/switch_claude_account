@@ -47,6 +47,7 @@ BeforeAll {
             'Write-WatchFrame'
             'Invoke-WatchStartupWarm'
             'Get-WatchChrome'
+            'Get-WatchBackgroundOsc'
         )
         $ast = [System.Management.Automation.Language.Parser]::ParseFile(
             $Path, [ref]$null, [ref]$null)
@@ -1587,6 +1588,108 @@ Describe 'switch_claude_account' {
             }
         }
 
+        It 'Enter-WatchTerminal sets the terminal background so the gutter matches the canvas' {
+            # A window whose pixel size is not a whole multiple of the cell
+            # size keeps the remainder as an unpainted strip at its right and
+            # bottom edges. SGR and back_color_erase address cells, so no
+            # amount of ESC[K reaches it; OSC 11 moves the terminal's own
+            # default instead. Ordered after the alt-buffer entry so a theme
+            # never recolors the user's main screen.
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                Invoke-WithEnteredWatchTerminal {
+                    Param ($term, $enterText)
+                    $enterText | Should -Match ([regex]::Escape("`e]11;rgb:26/32/38`a"))
+                    $enterText.IndexOf("`e]11;") | Should -BeGreaterThan $enterText.IndexOf("`e[?1049h")
+                    $term.BackgroundSet | Should -BeTrue
+                }
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'Enter-WatchTerminal records no background set when the theme asks for none' {
+            # What makes the OSC 111 on exit safe to skip: sca must not put
+            # back a background it never took.
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'default'
+                Invoke-WithEnteredWatchTerminal {
+                    Param ($term, $enterText)
+                    $enterText          | Should -Not -Match ([regex]::Escape("`e]11;"))
+                    $term.BackgroundSet | Should -BeFalse
+                }
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'Exit-WatchTerminal resets the background it set, before leaving the alt buffer' {
+            # Order is the contract. While the alt screen is still up every
+            # cell carries the chrome SGR, so the reset shows for one frame in
+            # the gutter alone; after ESC[?1049l it would instead flash the
+            # theme background across the restored scrollback.
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = 'my shell'
+                EnteredAlt = $true; BackgroundSet = $true
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -Be "`e]0;my shell`a`e]111`a`e[?25h`e[?1049l"
+        }
+
+        It 'Exit-WatchTerminal leaves a background it never set alone' {
+            # An unconditional OSC 111 would be a bug, not a harmless no-op:
+            # under the default theme it would discard an OSC 11 the USER set
+            # on their terminal before launching the watch.
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = 'my shell'
+                EnteredAlt = $true; BackgroundSet = $false
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -Be "`e]0;my shell`a`e[?25h`e[?1049l"
+        }
+
+        It 'Exit-WatchTerminal emits no background reset when the alt buffer was never entered' {
+            # Enter-WatchTerminal cannot have set one either: the OSC 11 goes
+            # out after the alt-buffer entry, so a token that never entered
+            # carries nothing to undo.
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = 'my shell'
+                EnteredAlt = $false; BackgroundSet = $true
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -BeNullOrEmpty
+        }
+
+        It 'Enter- and Exit-WatchTerminal balance the background across a full themed lifecycle' {
+            # The pairing that matters to the user: a watch that sets a
+            # background and dies without putting it back leaves the tab
+            # tinted until it is closed.
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                $out = Get-CapturedConsoleOut {
+                    $term = Enter-WatchTerminal
+                    try { } finally { Exit-WatchTerminal -State $term }
+                }
+                ([regex]::Matches($out, [regex]::Escape("`e]11;"))).Count  | Should -Be 1
+                ([regex]::Matches($out, [regex]::Escape("`e]111`a"))).Count | Should -Be 1
+                $out.IndexOf("`e]111`a") | Should -BeGreaterThan $out.IndexOf("`e]11;rgb")
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
         It 'Enter-WatchTerminal reports the alt buffer as entered so the restore fires' {
             # Exit-WatchTerminal skips the whole restore on a falsy
             # EnteredAlt, which would strand the user in the alt buffer.
@@ -2740,6 +2843,70 @@ Describe 'switch_claude_account' {
             ($with -replace $script:sgrRegex, '') | Should -Be ($bare -replace $script:sgrRegex, '')
         }
 
+        It 'carries BackgroundRgb wherever it carries Background, as a 24-bit value' {
+            # OSC 11 needs the raw base00 that the Background SGR was built
+            # from. Pinning them to the same themes keeps the gutter and the
+            # canvas from ever disagreeing about whether a theme paints.
+            foreach ($name in $Script:ThemePalettes.Keys) {
+                $t = $Script:ThemePalettes[$name]
+                $t.ContainsKey('BackgroundRgb') | Should -Be $t.ContainsKey('Background') -Because (
+                    "theme '$name' must expose base00 to OSC 11 exactly when it paints a canvas")
+                if ($t.ContainsKey('BackgroundRgb')) {
+                    $t['BackgroundRgb'] | Should -BeOfType [int]
+                    $t['BackgroundRgb'] | Should -BeGreaterOrEqual 0
+                    $t['BackgroundRgb'] | Should -BeLessOrEqual 0xFFFFFF
+                }
+            }
+        }
+
+        It 'builds the OSC 11 default-background set from base00 in X11 rgb form' {
+            # The gutter fix. Byte-exact rather than shape-matched: the
+            # channel order and the two-digit-per-channel form are the
+            # contract, and a transposed channel would still "look like" an
+            # OSC 11 to a regex while tinting the terminal the wrong color.
+            $PSStyle.OutputRendering = 'Ansi'
+            $Script:Palette = Resolve-ThemePalette -Name 'material'
+            Get-WatchBackgroundOsc | Should -Be "`e]11;rgb:26/32/38`a" # base00 0x263238
+        }
+
+        It 'terminates the OSC 11 with BEL, matching the title writes' {
+            $PSStyle.OutputRendering = 'Ansi'
+            $Script:Palette = Resolve-ThemePalette -Name 'claude'
+            $osc = Get-WatchBackgroundOsc
+            $osc.EndsWith([char]7) | Should -BeTrue -Because 'ST and BEL are both legal; this file uses BEL throughout'
+            $osc | Should -Be "`e]11;rgb:1f/1e/1d`a"
+        }
+
+        It 'emits no OSC 11 for a theme that declares no Background' {
+            # Silence here is what makes the OSC 111 on exit safe to skip:
+            # under the default theme sca never moves the user's background,
+            # so it has none of its own to put back.
+            $PSStyle.OutputRendering = 'Ansi'
+            $Script:Palette = Resolve-ThemePalette -Name 'default'
+            Get-WatchBackgroundOsc | Should -BeNullOrEmpty
+        }
+
+        It 'emits no OSC 11 under PlainText even for a themed palette' {
+            # Same load-bearing guard as the chrome, reached by deriving from
+            # it. No-color mode must not recolor the terminal either.
+            $PSStyle.OutputRendering = 'PlainText'
+            $Script:Palette = Resolve-ThemePalette -Name 'material'
+            Get-WatchBackgroundOsc | Should -BeNullOrEmpty
+        }
+
+        It 'gates the OSC 11 on exactly the chrome predicate, for every theme' {
+            # The two must agree in every case or the gutter and the canvas
+            # drift apart. Walks all themes under both rendering modes rather
+            # than spot-checking the two the cases above cover.
+            foreach ($mode in 'Ansi', 'PlainText') {
+                $PSStyle.OutputRendering = $mode
+                foreach ($name in $Script:ThemePalettes.Keys) {
+                    $Script:Palette = Resolve-ThemePalette -Name $name
+                    [bool](Get-WatchBackgroundOsc) | Should -Be ([bool](Get-WatchChrome)) -Because (
+                        "theme '$name' under $mode must paint the gutter exactly when it paints the canvas")
+                }
+            }
+        }
     }
 
     Context 'ConvertTo-ScaJsonString' {

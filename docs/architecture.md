@@ -209,6 +209,22 @@ a no-op, so a 1 Hz repaint carries no redundant bytes. `Enter-WatchTerminal` fil
 on entry to avoid a flash of the terminal background before the first frame; that fill
 uses `ESC[0J`, never `ESC[2J`, which the watch-family guard forbids.
 
+Chrome reaches cells, and a window is not a whole number of them: the pixel remainder
+along the right and bottom edges keeps the terminal's own background and seams against the
+canvas. `Get-WatchBackgroundOsc` moves that default with OSC 11 (hence the raw
+`BackgroundRgb` beside the formatted `Background` SGR) and `Exit-WatchTerminal` restores
+it with OSC 111. Windows Terminal declined to paint the gutter from the adjacent cells
+(microsoft/terminal#19860, closed as not-planned), so this is the only lever available,
+not a stopgap awaiting an upstream fix.
+
+Three properties of that pair are load-bearing. Its guard **derives** from
+`Get-WatchChrome` instead of restating the conditions, because gutter and canvas must
+agree in every case and one predicate is the only guarantee of that. The reset is
+**conditional** on `BackgroundSet`, recorded at entry: under `default` sca never moves the
+background, and resetting anyway would discard one the *user* set before launching. And it
+is written **before** `ESC[?1049l`, where it shows for one frame in the gutter alone;
+after the leave it would flash the theme background across the restored scrollback.
+
 Two caveats are deliberate. Erases filling with the current background is
 `back_color_erase`, implemented by Windows Terminal, conhost, iTerm2, kitty, Alacritty,
 VTE and WezTerm but not universal; where it is missing the written cells still carry the
