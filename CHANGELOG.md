@@ -3,6 +3,16 @@
 This changelog follows [Common Changelog](https://common-changelog.org) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.0] - 2026-09-21
+
+_Under a named `SCA_THEME` the watch now sets the terminal's own background color for as long as it runs, and resets it on exit._
+
+### Changed
+- Inset the watch frame of `sca monitor` and `sca usage -Watch` one row and two columns from the edge.
+
+### Fixed
+- Paint the unused pixel gutter at the window's right and bottom edges in the theme background.
+
 ## [4.2.0] - 2026-09-21
 
 ### Changed
@@ -317,6 +327,7 @@ _Upgrading migrates active-slot tracking from hardlinks to a state file on first
 - Add a README with installation, usage, workflow, Windows notes and testing sections.
 - Add `CLAUDE.md` with agent guidance for the repo structure, gotchas and script-shape conventions.
 
+[4.3.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.3.0
 [4.2.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.2.0
 [4.1.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.1.0
 [4.0.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.0.0
