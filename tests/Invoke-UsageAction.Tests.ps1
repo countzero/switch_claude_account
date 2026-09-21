@@ -4364,6 +4364,40 @@ Describe 'switch_claude_account' {
             (Get-RowStatus $snap 'a') | Should -Be 'no-oauth'
         }
 
+        It 'still skips the restore when the repaint throws past the abort' {
+            # The repaint is the one statement in the loop body outside a catch,
+            # and the watch startup pass hands it a real renderer that writes to
+            # the console. A throw there unwinds to the finally, which restores
+            # unless $uncaptured is already set -- and that restore is one more
+            # overwrite of the bytes nothing has captured. Decide first, repaint
+            # second.
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            $statePath = Join-Path $script:CredDirPath '.sca-state.json'
+            $stateBody = @{ schema = 1; active_slot = 'a'; last_sync_hash = 'deadbeef' } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $statePath -Value $stateBody -NoNewline -Encoding utf8NoBOM
+
+            Mock Invoke-Reconcile -MockWith {
+                New-ReconcileResult -Action 'noop' -Reason 'identity-unresolved' -Slot 'a' -Captured $false
+            }
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith { Param ($Slot); $script:swapNames += $Slot.Name }
+
+            # Throws on the repaint that carries the abort advisory, which is
+            # the one this fix moved the decision in front of. The trigger is
+            # the advisory itself rather than a call count, so the test also
+            # fails if the decision moves back behind the repaint: the advisory
+            # would not be there yet, nothing would throw, and Should -Throw
+            # would catch it.
+            { Invoke-WarmAllSlots -Name '' -Repaint { Param ($snap) if ($snap.Advisory) { throw 'synthetic renderer failure' } } } |
+                Should -Throw '*synthetic renderer failure*'
+
+            # The swap onto 'a' and nothing else: no restore ran behind the
+            # exception.
+            $script:swapNames | Should -Be @('a')
+        }
+
         It 'stops the pass when the mirror itself throws' {
             # Invoke-Reconcile's mirror branch writes through
             # Set-CredentialFileAtomic, which throws. That proves nothing about

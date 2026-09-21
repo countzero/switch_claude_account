@@ -6850,13 +6850,6 @@ function Invoke-WarmAllSlots {
                 $row.Error  = $_.Exception.Message
             }
 
-            # Recomputed per slot rather than once at the end so the flag is
-            # already accurate at each repaint, and on an early return.
-            # Format-UsageAdvisory partitions the rows itself and needs nothing
-            # from here.
-            $snapshot.HasRateLimited = (@($rows | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0)
-            & $Repaint $snapshot
-
             # claude refreshed the grant, nothing mirrored it into a slot, and
             # every write this pass has left -- the next iteration's swap and
             # the restore below -- would discard it, leaving that slot holding a
@@ -6866,6 +6859,14 @@ function Invoke-WarmAllSlots {
             # a field rather than an Action allowlist, per Invoke-Reconcile's
             # `Captured`; a $null $sync means the reconcile itself threw and
             # proved nothing either way, which is equally unsafe to write over.
+            #
+            # Decided BEFORE the repaint below, which is the one statement in
+            # this loop body outside a catch. A renderer that throws unwinds
+            # straight to the finally, and $uncaptured is what stops the finally
+            # restoring over these bytes -- so leaving the decision until after
+            # it would let a repaint failure destroy exactly what the abort
+            # exists to keep. The break stays after, so the frame still shows
+            # the row the pass stopped on.
             if ($activated -and (-not $sync -or -not $sync.Captured)) {
                 $uncaptured = $true
                 $detail = if ($syncError) { Format-StatusErrorTail -Message $syncError }
@@ -6881,8 +6882,16 @@ function Invoke-WarmAllSlots {
                 # An index loop, not a range: ($i + 1)..$last counts DOWN when
                 # the abort lands on the last row.
                 for ($j = $i + 1; $j -le $last; $j++) { $rows[$j].Status = 'skipped' }
-                break
             }
+
+            # Recomputed per slot rather than once at the end so the flag is
+            # already accurate at each repaint, and on an early return.
+            # Format-UsageAdvisory partitions the rows itself and needs nothing
+            # from here.
+            $snapshot.HasRateLimited = (@($rows | Where-Object { $_.Status -eq 'rate-limited' }).Count -gt 0)
+            & $Repaint $snapshot
+
+            if ($uncaptured) { break }
 
             if ($i -lt $last -and $Script:WarmupSpacingMs -gt 0) {
                 Start-Sleep -Milliseconds $Script:WarmupSpacingMs
