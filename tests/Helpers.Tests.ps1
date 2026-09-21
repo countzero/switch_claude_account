@@ -47,6 +47,7 @@ BeforeAll {
             'Write-WatchFrame'
             'Invoke-WatchStartupWarm'
             'Get-WatchChrome'
+            'Get-WatchBackgroundOsc'
         )
         $ast = [System.Management.Automation.Language.Parser]::ParseFile(
             $Path, [ref]$null, [ref]$null)
@@ -1587,6 +1588,108 @@ Describe 'switch_claude_account' {
             }
         }
 
+        It 'Enter-WatchTerminal sets the terminal background so the gutter matches the canvas' {
+            # A window whose pixel size is not a whole multiple of the cell
+            # size keeps the remainder as an unpainted strip at its right and
+            # bottom edges. SGR and back_color_erase address cells, so no
+            # amount of ESC[K reaches it; OSC 11 moves the terminal's own
+            # default instead. Ordered after the alt-buffer entry so a theme
+            # never recolors the user's main screen.
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                Invoke-WithEnteredWatchTerminal {
+                    Param ($term, $enterText)
+                    $enterText | Should -Match ([regex]::Escape("`e]11;rgb:26/32/38`a"))
+                    $enterText.IndexOf("`e]11;") | Should -BeGreaterThan $enterText.IndexOf("`e[?1049h")
+                    $term.BackgroundSet | Should -BeTrue
+                }
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'Enter-WatchTerminal records no background set when the theme asks for none' {
+            # What makes the OSC 111 on exit safe to skip: sca must not put
+            # back a background it never took.
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'default'
+                Invoke-WithEnteredWatchTerminal {
+                    Param ($term, $enterText)
+                    $enterText          | Should -Not -Match ([regex]::Escape("`e]11;"))
+                    $term.BackgroundSet | Should -BeFalse
+                }
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'Exit-WatchTerminal resets the background it set, before leaving the alt buffer' {
+            # Order is the contract. While the alt screen is still up every
+            # cell carries the chrome SGR, so the reset shows for one frame in
+            # the gutter alone; after ESC[?1049l it would instead flash the
+            # theme background across the restored scrollback.
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = 'my shell'
+                EnteredAlt = $true; BackgroundSet = $true
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -Be "`e]0;my shell`a`e]111`a`e[?25h`e[?1049l"
+        }
+
+        It 'Exit-WatchTerminal leaves a background it never set alone' {
+            # An unconditional OSC 111 would be a bug, not a harmless no-op:
+            # under the default theme it would discard an OSC 11 the USER set
+            # on their terminal before launching the watch.
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = 'my shell'
+                EnteredAlt = $true; BackgroundSet = $false
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -Be "`e]0;my shell`a`e[?25h`e[?1049l"
+        }
+
+        It 'Exit-WatchTerminal emits no background reset when the alt buffer was never entered' {
+            # Enter-WatchTerminal cannot have set one either: the OSC 11 goes
+            # out after the alt-buffer entry, so a token that never entered
+            # carries nothing to undo.
+            $state = [pscustomobject]@{
+                Cursor = $null; Encoding = $null; Title = 'my shell'
+                EnteredAlt = $false; BackgroundSet = $true
+            }
+            Get-CapturedConsoleOut { Exit-WatchTerminal -State $state } |
+                Should -BeNullOrEmpty
+        }
+
+        It 'Enter- and Exit-WatchTerminal balance the background across a full themed lifecycle' {
+            # The pairing that matters to the user: a watch that sets a
+            # background and dies without putting it back leaves the tab
+            # tinted until it is closed.
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                $out = Get-CapturedConsoleOut {
+                    $term = Enter-WatchTerminal
+                    try { } finally { Exit-WatchTerminal -State $term }
+                }
+                ([regex]::Matches($out, [regex]::Escape("`e]11;"))).Count  | Should -Be 1
+                ([regex]::Matches($out, [regex]::Escape("`e]111`a"))).Count | Should -Be 1
+                $out.IndexOf("`e]111`a") | Should -BeGreaterThan $out.IndexOf("`e]11;rgb")
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
         It 'Enter-WatchTerminal reports the alt buffer as entered so the restore fires' {
             # Exit-WatchTerminal skips the whole restore on a falsy
             # EnteredAlt, which would strand the user in the alt buffer.
@@ -2740,6 +2843,151 @@ Describe 'switch_claude_account' {
             ($with -replace $script:sgrRegex, '') | Should -Be ($bare -replace $script:sgrRegex, '')
         }
 
+        It 'carries BackgroundRgb wherever it carries Background, as a 24-bit value' {
+            # OSC 11 needs the raw base00 that the Background SGR was built
+            # from. Pinning them to the same themes keeps the gutter and the
+            # canvas from ever disagreeing about whether a theme paints.
+            foreach ($name in $Script:ThemePalettes.Keys) {
+                $t = $Script:ThemePalettes[$name]
+                $t.ContainsKey('BackgroundRgb') | Should -Be $t.ContainsKey('Background') -Because (
+                    "theme '$name' must expose base00 to OSC 11 exactly when it paints a canvas")
+                if ($t.ContainsKey('BackgroundRgb')) {
+                    $t['BackgroundRgb'] | Should -BeOfType [int]
+                    $t['BackgroundRgb'] | Should -BeGreaterOrEqual 0
+                    $t['BackgroundRgb'] | Should -BeLessOrEqual 0xFFFFFF
+                }
+            }
+        }
+
+        It 'builds the OSC 11 default-background set from base00 in X11 rgb form' {
+            # The gutter fix. Byte-exact rather than shape-matched: the
+            # channel order and the two-digit-per-channel form are the
+            # contract, and a transposed channel would still "look like" an
+            # OSC 11 to a regex while tinting the terminal the wrong color.
+            $PSStyle.OutputRendering = 'Ansi'
+            $Script:Palette = Resolve-ThemePalette -Name 'material'
+            Get-WatchBackgroundOsc | Should -Be "`e]11;rgb:26/32/38`a" # base00 0x263238
+        }
+
+        It 'terminates the OSC 11 with BEL, matching the title writes' {
+            $PSStyle.OutputRendering = 'Ansi'
+            $Script:Palette = Resolve-ThemePalette -Name 'claude'
+            $osc = Get-WatchBackgroundOsc
+            $osc.EndsWith([char]7) | Should -BeTrue -Because 'ST and BEL are both legal; this file uses BEL throughout'
+            $osc | Should -Be "`e]11;rgb:1f/1e/1d`a"
+        }
+
+        It 'emits no OSC 11 for a theme that declares no Background' {
+            # Silence here is what makes the OSC 111 on exit safe to skip:
+            # under the default theme sca never moves the user's background,
+            # so it has none of its own to put back.
+            $PSStyle.OutputRendering = 'Ansi'
+            $Script:Palette = Resolve-ThemePalette -Name 'default'
+            Get-WatchBackgroundOsc | Should -BeNullOrEmpty
+        }
+
+        It 'emits no OSC 11 under PlainText even for a themed palette' {
+            # Same load-bearing guard as the chrome, reached by deriving from
+            # it. No-color mode must not recolor the terminal either.
+            $PSStyle.OutputRendering = 'PlainText'
+            $Script:Palette = Resolve-ThemePalette -Name 'material'
+            Get-WatchBackgroundOsc | Should -BeNullOrEmpty
+        }
+
+        It 'gates the OSC 11 on exactly the chrome predicate, for every theme' {
+            # The two must agree in every case or the gutter and the canvas
+            # drift apart. Walks all themes under both rendering modes rather
+            # than spot-checking the two the cases above cover.
+            foreach ($mode in 'Ansi', 'PlainText') {
+                $PSStyle.OutputRendering = $mode
+                foreach ($name in $Script:ThemePalettes.Keys) {
+                    $Script:Palette = Resolve-ThemePalette -Name $name
+                    [bool](Get-WatchBackgroundOsc) | Should -Be ([bool](Get-WatchChrome)) -Because (
+                        "theme '$name' under $mode must paint the gutter exactly when it paints the canvas")
+                }
+            }
+        }
+    }
+
+    Context 'Watch frame inset' {
+        # The frame is lifted off the window edge by $Script:FramePad*, which
+        # Write-WatchFrame raises for one paint and drops again. Zero
+        # everywhere else, because scrollback output must stay flush left.
+        AfterEach {
+            $Script:FramePadColumns = 0
+            $Script:FramePadRows    = 0
+        }
+
+        It 'leaves the sequence byte-identical at a zero inset' {
+            # Every non-watch caller sees this. Pins that the inset is a
+            # no-op rather than a reformat when it is not asked for.
+            ConvertTo-WatchFrameSequence -FrameText "alpha`nbeta" -Chrome '' |
+                Should -Be "`e[Halpha`e[K`nbeta`e[K`e[0J"
+        }
+
+        It 'indents every line and opens with the blank inset rows' {
+            $Script:FramePadColumns = 2
+            $Script:FramePadRows    = 1
+            ConvertTo-WatchFrameSequence -FrameText "alpha`nbeta" -Chrome '' |
+                Should -Be "`e[H  `e[K`n  alpha`e[K`n  beta`e[K`e[0J"
+        }
+
+        It 'fills the inset with chrome, so the margin is canvas and not a hole' {
+            # The indent is written before the line, after the chrome set at
+            # ESC[H, so the spaces carry the theme background. A margin in
+            # the terminal's own color would read as a second seam.
+            $Script:FramePadColumns = 2
+            $Script:FramePadRows    = 1
+            $seq = ConvertTo-WatchFrameSequence -FrameText 'alpha' -Chrome '<C>'
+            $seq | Should -Match "^`e\[H<C>  "
+            $seq | Should -Match "`n  alpha<C>`e\[K"
+        }
+
+        It 'needs no right or bottom inset, those edges being reached by the erases' {
+            # ESC[K fills to end of line and ESC[0J to end of screen, both
+            # with chrome, so only the top and left are ever written.
+            $Script:FramePadColumns = 3
+            $Script:FramePadRows    = 2
+            $seq = ConvertTo-WatchFrameSequence -FrameText 'x' -Chrome ''
+            $seq | Should -Be "`e[H   `e[K`n   `e[K`n   x`e[K`e[0J"
+        }
+
+        It 'applies the inset without a theme, geometry being independent of color' {
+            $Script:FramePadColumns = 2
+            $Script:FramePadRows    = 0
+            ConvertTo-WatchFrameSequence -FrameText 'x' -Chrome '' |
+                Should -Be "`e[H  x`e[K`e[0J"
+        }
+
+        It 'raises the inset for the render and drops it again afterwards' {
+            # Both halves need it -- the layout while $RenderScript runs, the
+            # transform after -- so the window has to span the pair.
+            $script:seenColumns = -1
+            $script:seenRows    = -1
+            Get-CapturedConsoleOut {
+                Write-WatchFrame {
+                    $script:seenColumns = $Script:FramePadColumns
+                    $script:seenRows    = $Script:FramePadRows
+                    Write-Host 'row'
+                }
+            } | Out-Null
+            $script:seenColumns     | Should -Be 2
+            $script:seenRows        | Should -Be 1
+            $Script:FramePadColumns | Should -Be 0
+            $Script:FramePadRows    | Should -Be 0
+        }
+
+        It 'drops the inset even when the render script throws' {
+            # A leaked inset would indent the caller's scrollback for the
+            # rest of the process, long after the watch that set it died.
+            {
+                Get-CapturedConsoleOut {
+                    Write-WatchFrame { throw 'render exploded' }
+                }
+            } | Should -Throw
+            $Script:FramePadColumns | Should -Be 0
+            $Script:FramePadRows    | Should -Be 0
+        }
     }
 
     Context 'ConvertTo-ScaJsonString' {
@@ -3324,6 +3572,39 @@ Describe 'switch_claude_account' {
             $w = Get-ConsoleWidth
             $w | Should -BeOfType [int]
             $w | Should -BeGreaterOrEqual 0
+        }
+    }
+
+    Context 'Get-RenderWidth' {
+        # The width a renderer may lay out in: the console width less the
+        # frame inset on both sides. Right-aligned content is the reason it
+        # is separate from Get-ConsoleWidth -- laying out against the raw
+        # width and then indenting would push it past the right edge.
+        AfterEach { $Script:FramePadColumns = 0 }
+
+        It 'passes the console width through when no inset is in force' {
+            Mock Get-ConsoleWidth { 80 }
+            Get-RenderWidth | Should -Be 80
+        }
+
+        It 'subtracts the inset from both sides' {
+            Mock Get-ConsoleWidth { 80 }
+            $Script:FramePadColumns = 2
+            Get-RenderWidth | Should -Be 76
+        }
+
+        It 'keeps an unknown width unknown rather than insetting the sentinel' {
+            # 0 means "no width to lay out against". Subtracting from it would
+            # hand callers a negative they would read as a real width.
+            Mock Get-ConsoleWidth { 0 }
+            $Script:FramePadColumns = 2
+            Get-RenderWidth | Should -Be 0
+        }
+
+        It 'floors at zero when the inset exceeds the terminal' {
+            Mock Get-ConsoleWidth { 3 }
+            $Script:FramePadColumns = 5
+            Get-RenderWidth | Should -Be 0
         }
     }
 

@@ -251,7 +251,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '4.2.0'
+$Script:ScriptVersion = '4.3.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -1720,6 +1720,12 @@ function New-ThemePalette {
         # why it stops at the edge of the watch frame.
         Background = $PSStyle.Background.FromRgb($Scheme.base00)
         Foreground = $PSStyle.Foreground.FromRgb($Scheme.base05)
+
+        # The same base00, kept raw because OSC 11 wants `rgb:RR/GG/BB` and
+        # the SGR above has already been formatted past recovery. Stored
+        # rather than parsed back out of `Background`; see
+        # Get-WatchBackgroundOsc for what reads it.
+        BackgroundRgb = $Scheme.base00
     }
 }
 
@@ -1837,6 +1843,40 @@ function Get-WatchChrome {
     return $bg + $Script:Palette['Foreground']
 }
 
+# The active theme's background as an OSC 11 (set default background color)
+# sequence, or '' when the terminal should keep its own.
+#
+# Why this exists at all, given the chrome above already paints every cell:
+# a terminal renders on a character grid, and a window whose pixel height or
+# width is not a whole multiple of the cell size keeps the remainder as an
+# unpainted gutter along its right and bottom edges. SGR and back_color_erase
+# address cells, so neither the per-line ESC[K nor the trailing ESC[0J can
+# reach that strip; the terminal fills it from its own default background
+# instead, and the seam against the themed canvas is visible. OSC 11 moves
+# that default, which is the only lever an application has. Windows Terminal
+# declined to paint the gutter from the adjacent cells
+# (microsoft/terminal#19860, closed as not-planned), so this is not a
+# workaround for a bug due to be fixed upstream.
+#
+# Deriving the guard from Get-WatchChrome rather than restating its two
+# conditions is deliberate: the gutter and the canvas have to agree in every
+# case, and the only way to guarantee that is to give them one predicate. A
+# theme with no Background (default) and no-color mode both yield '' here for
+# free, which is correct -- neither should move the user's terminal.
+#
+# X11 `rgb:RR/GG/BB` is the form every implementation accepts. BEL rather
+# than ST terminates it to match the OSC 0 title writes elsewhere in this
+# file; both are legal and mixing them within one program buys nothing.
+function Get-WatchBackgroundOsc {
+    if (-not (Get-WatchChrome)) { return '' }
+
+    $rgb = $Script:Palette['BackgroundRgb']
+    if ($null -eq $rgb) { return '' }
+
+    return "`e]11;rgb:{0:x2}/{1:x2}/{2:x2}`a" -f
+        (($rgb -shr 16) -band 0xFF), (($rgb -shr 8) -band 0xFF), ($rgb -band 0xFF)
+}
+
 # Single chokepoint for ALL colored output. No production path may call
 # `Write-Host -ForegroundColor`.
 #
@@ -1919,6 +1959,42 @@ function Write-Color {
 # than an inline expression so tests can mock a width.
 function Get-ConsoleWidth {
     try { return [int][Console]::WindowWidth } catch { return 0 }
+}
+
+# Inset of the watch frame from the terminal edge, in columns and rows.
+#
+# Zero at load and zero everywhere except inside Write-WatchFrame, which
+# raises them for the duration of one paint and drops them again in a
+# finally. That is what keeps the inset out of the scrollback: `sca list`,
+# `sca save` and one-shot `sca usage` print line-oriented output into the
+# user's history, where a leading indent is noise and breaks copy-paste.
+#
+# Ambient rather than a parameter because the two things that need the value
+# sit at opposite ends of the render: ConvertTo-WatchFrameSequence, which
+# applies it, and Get-RenderWidth, which is consulted several frames deep
+# inside the renderer by layout code that has no business taking a
+# presentation argument. Threading it through would put an inset parameter on
+# Format-UsageFrame, Format-UsageTable and Write-UsageTableHeader, all three
+# of which are also reached from non-watch callers that must pass 0.
+$Script:FramePadColumns = 0
+$Script:FramePadRows    = 0
+
+# Columns a renderer may lay out in: the terminal width less the frame inset
+# on both sides, or 0 when the width is unknown.
+#
+# Split from Get-ConsoleWidth rather than folded into it because the two
+# answer different questions and only one of them is honest about the
+# terminal. Right-aligned content is the reason this exists: the -Auto header
+# indicator and the aggregate-bar clamp both position against the width and
+# reserve a 1-column margin, so laying them out against the raw width and
+# THEN indenting the frame would push them a full inset past the right edge
+# and wrap them. Unknown (0) propagates unchanged; those callers already
+# treat it as "do not lay out against a width".
+function Get-RenderWidth {
+    $width = Get-ConsoleWidth
+    if ($width -le 0) { return 0 }
+
+    return [Math]::Max(0, $width - (2 * $Script:FramePadColumns))
 }
 
 # Single chokepoint for ALL non-color VT control sequences in the watch
@@ -2017,6 +2093,14 @@ function Get-WatchFrameText {
 # erased tail keeps the terminal's, so the frame degrades to a ragged right
 # edge rather than breaking. Not probed, for the same reason truecolor is
 # not: the capability databases are absent or wrong on Windows.
+#
+# The frame inset ($Script:FramePad*, raised only for the duration of a
+# Write-WatchFrame paint) is applied here as blank leading rows and a space
+# prefix per line. Only the top and left need writing: the right edge is
+# already reached by each line's ESC[K and the bottom by the trailing
+# ESC[0J, both of which fill with chrome. The inset is independent of the
+# theme, so it applies with an empty -Chrome too; a pad of 0 makes both
+# operations identity, which is what every non-watch path sees.
 function ConvertTo-WatchFrameSequence {
     Param (
         [AllowEmptyString()] [AllowNull()] [string] $FrameText,
@@ -2026,7 +2110,10 @@ function ConvertTo-WatchFrameSequence {
     if ($Chrome) {
         $FrameText = $FrameText -replace "`e\[0m", "`e[0m$Chrome"
     }
-    $body = (($FrameText -split "`n") | ForEach-Object { $_ + $Chrome + "`e[K" }) -join "`n"
+    $FrameText = ("`n" * $Script:FramePadRows) + $FrameText
+    $indent    = ' ' * $Script:FramePadColumns
+
+    $body = (($FrameText -split "`n") | ForEach-Object { $indent + $_ + $Chrome + "`e[K" }) -join "`n"
     $sequence = "`e[H" + $Chrome + $body + $Chrome + "`e[0J"
 
     # A line ending in a colored run gets chrome twice: once re-asserted after
@@ -5193,7 +5280,7 @@ function Write-UsageTableHeader {
     if ($AutoThreshold -gt 0) {
         $glyph     = "$([char]0x25B6)"
         $text      = " switching slot at $AutoThreshold%"
-        $termWidth = Get-ConsoleWidth
+        $termWidth = Get-RenderWidth
         if ($termWidth -ge ($headerLeft.Length + 2 + $glyph.Length + $text.Length + 1)) {
             $padding = ' ' * ($termWidth - $headerLeft.Length - $glyph.Length - $text.Length - 1)
         } else {
@@ -5276,7 +5363,7 @@ function Format-UsageTable {
     # the other end. Unknown width (0) leaves the fit-to-table width alone.
     if ($IncludeAggregateBars) {
         $barLineWidth = $totalLineWidth
-        $termWidth    = Get-ConsoleWidth
+        $termWidth    = Get-RenderWidth
         if ($termWidth -gt 0 -and $barLineWidth -gt ($termWidth - 1)) {
             $barLineWidth = $termWidth - 1
         }
@@ -7225,14 +7312,22 @@ function Enter-WatchTerminal {
     # on a slow first poll is a visible flash of the wrong color. A one-shot
     # fill, not a per-frame clear, so it cannot reintroduce the flicker the
     # ESC[2J ban exists to prevent.
+    #
+    # The OSC 11 rides along in the same write because it covers the half of
+    # the canvas the fill cannot reach: the sub-cell gutter at the right and
+    # bottom edges. See Get-WatchBackgroundOsc. It goes out AFTER the alt
+    # buffer is entered so a theme never recolors the user's main screen, and
+    # its emission is recorded on the token because the reset is conditional.
     $chrome = Get-WatchChrome
-    if ($chrome) { Write-VTSequence ($chrome + "`e[H`e[0J") }
+    $bgOsc  = Get-WatchBackgroundOsc
+    if ($chrome) { Write-VTSequence ($bgOsc + $chrome + "`e[H`e[0J") }
 
     return [pscustomobject]@{
-        Cursor     = $origCursor
-        Encoding   = $origEncoding
-        Title      = $origTitle
-        EnteredAlt = $true
+        Cursor        = $origCursor
+        Encoding      = $origEncoding
+        Title         = $origTitle
+        EnteredAlt    = $true
+        BackgroundSet = [bool]$bgOsc
     }
 }
 
@@ -7253,6 +7348,19 @@ function Exit-WatchTerminal {
         $restoreTitle = if ($null -ne $State.Title) { [string]$State.Title } else { '' }
         $restoreTitle = [regex]::Replace($restoreTitle, '[\x00-\x1F\x7F]', '')
         Write-VTSequence ("`e]0;{0}`a" -f $restoreTitle)
+
+        # OSC 111 (reset default background) only where Enter-WatchTerminal
+        # actually set one. Unconditional would be a bug rather than a
+        # harmless no-op: under the default theme sca never touches the
+        # background, so resetting would discard an OSC 11 the USER set on
+        # their terminal before launching the watch.
+        #
+        # Before the alt-buffer leave, not after. While the alt screen is
+        # still up every cell carries the chrome SGR, so the reset shows for
+        # one frame in the gutter alone; doing it after ESC[?1049l would
+        # instead flash the theme background across the restored scrollback.
+        if ($State.BackgroundSet) { Write-VTSequence "`e]111`a" }
+
         Write-VTSequence "`e[?25h`e[?1049l"
     }
     if ($null -ne $State.Cursor) {
@@ -7449,11 +7557,30 @@ function Format-WatchFooter {
 # Callers repaint unconditionally on every tick, which is also what
 # self-heals a terminal resize within ~1 s: the per-line ESC[K and the
 # trailing ESC[0J reclaim any cells left by the old geometry.
+#
+# This is also the sole owner of the frame inset. Both halves of the render
+# need it -- the layout, through Get-RenderWidth, while $RenderScript runs,
+# and the transform, when it indents the result -- so it is raised around the
+# pair and dropped in a finally, leaving every non-watch renderer at 0. One
+# row and two columns: enough to lift the frame off the window edge (which is
+# the whole point, the alternate screen has no prompt or margin of its own to
+# do it), and small enough that the table still fits the 80-column terminal
+# its column widths are measured against. The table body's own two-space
+# indent is unaffected, so the header-to-row relationship is unchanged and
+# the block simply moves in.
 function Write-WatchFrame {
     Param ([Parameter(Mandatory)] [scriptblock] $RenderScript)
 
-    $frameText = Get-WatchFrameText $RenderScript
-    Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence -FrameText $frameText -Chrome (Get-WatchChrome)) + "`e[?2026l")
+    $Script:FramePadColumns = 2
+    $Script:FramePadRows    = 1
+    try {
+        $frameText = Get-WatchFrameText $RenderScript
+        Write-VTSequence ("`e[?2026h" + (ConvertTo-WatchFrameSequence -FrameText $frameText -Chrome (Get-WatchChrome)) + "`e[?2026l")
+    }
+    finally {
+        $Script:FramePadColumns = 0
+        $Script:FramePadRows    = 0
+    }
 }
 
 # The -Warmup startup pass, run once before the polling loop. Mutates

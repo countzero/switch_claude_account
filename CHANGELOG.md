@@ -3,9 +3,17 @@
 This changelog follows [Common Changelog](https://common-changelog.org) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [4.2.0] - 2026-09-21
+## [4.3.0] - 2026-09-21
 
-_Upgrading is replacing one file. `sca warmup` and `sca monitor -KeepWarm` now run beside an open Claude Code instead of refusing, the `Session` aggregate bar reports a different number wherever a slot has capped its week, and colors are unchanged unless you set the new `SCA_THEME`._
+_Under a named `SCA_THEME` the watch now sets the terminal's own background color for as long as it runs, and resets it on exit._
+
+### Changed
+- Inset the watch frame of `sca monitor` and `sca usage -Watch` one row and two columns from the edge.
+
+### Fixed
+- Paint the unused pixel gutter at the window's right and bottom edges in the theme background.
+
+## [4.2.0] - 2026-09-21
 
 ### Changed
 - Run the warm round-robin of `sca warmup` and `sca monitor -KeepWarm` beside a live Claude Code.
@@ -29,7 +37,7 @@ _Upgrading is replacing one file. `sca warmup` and `sca monitor -KeepWarm` now r
 
 ## [4.1.0] - 2026-09-19
 
-_Upgrading is replacing one file. A hot swap is only followed without a restart by Claude Code >= 2.1.274 or opencode-claude-auth >= 1.5.4, and `sca switch` can now refuse, and exit non-zero, where it previously always succeeded._
+_A hot swap is only followed without a restart by Claude Code >= 2.1.274 or opencode-claude-auth >= 1.5.4, and `sca switch` can now refuse, and exit non-zero, where it previously always succeeded._
 
 ### Changed
 - Collapse the token-refresh ladder to one attempt once another slot has drawn a `429` in the same run.
@@ -58,7 +66,7 @@ _Upgrading is replacing one file. A hot swap is only followed without a restart 
 
 ## [4.0.0] - 2026-09-13
 
-_Upgrading needs PowerShell 7.4. A session with `CLAUDE_CONFIG_DIR` set now reads that directory on every platform, so slots left behind in the default `~/.claude` stop being listed; one line names both directories when that happens._
+_Upgrading needs PowerShell 7.4, and a session with `CLAUDE_CONFIG_DIR` set now reads that directory on every platform, so slots left behind in the default `~/.claude` stop being listed; one line names both directories when that happens._
 
 ### Changed
 - **BREAKING**: Raise `#Requires -Version` from 7.2 to 7.4, the lowest LTS carrying `FileStreamOptions.UnixCreateMode`.
@@ -319,6 +327,7 @@ _Upgrading migrates active-slot tracking from hardlinks to a state file on first
 - Add a README with installation, usage, workflow, Windows notes and testing sections.
 - Add `CLAUDE.md` with agent guidance for the repo structure, gotchas and script-shape conventions.
 
+[4.3.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.3.0
 [4.2.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.2.0
 [4.1.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.1.0
 [4.0.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.0.0

@@ -104,10 +104,18 @@ Measured before it was dropped: where entries were long, the commits of that era
 carried 550-650 characters of body each; where commit bodies were sparse, the entries
 were already at 100.
 
-A version heading may carry one **italic line** beneath it, for anything that makes
-upgrading more than replacing the file: a new minimum version of something else, a
-command that can now refuse, a migration that runs on first read. It is the first
-thing a reader deciding whether to upgrade needs, and the one place a longer sentence
-earns its room.
+A version heading may carry one **italic line** beneath it: §2.3's notice, and per that
+section **one sentence**. It is for anything that makes upgrading more than replacing the
+file, which is to say a prerequisite, a manual step, or a change a reader would otherwise
+meet by surprise: a new minimum version of something else, a command that can now refuse,
+a migration that runs on first read, slots that stop being listed. It is the first thing a
+reader deciding whether to upgrade sees, and the one place a longer sentence earns its
+room.
+
+It states only that delta. Two things therefore stay out of it. The baseline install
+mechanics, because replacing the one file is what upgrading always is here and `README.md`
+→ *Download* already says so; a line repeating it on every release is the notice spending
+its position on nothing. And a summary of the entries below it, because the categories
+already sort those by impact and a reader who skips the notice must lose nothing.
 
 `CHANGELOG.md` is edited as a step of a release, not per pull request.
