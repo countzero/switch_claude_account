@@ -28,6 +28,14 @@
     text as the source of truth and colorising it is simpler than
     reverse-engineering inputs that round-trip through the real renderer.
 
+    The Session bar of 25% does not average the visible Session cells
+    either, but that one is exactly what the renderer would emit: 'legacy'
+    sits at the 100% Week cap, so Get-PoolMeanUtilization drops it from the
+    Session average altogether and the bar is (18+3+9+71)/4 over the four
+    reachable slots. Do not "correct" it to the 23% a five-row average
+    gives. The Week bar keeps all five rows, which is why only one of the
+    two bars changes when a slot hits its weekly cap.
+
     One deliberate divergence from the README's pre-image ASCII: the bar's
     empty portion is rendered with `▓` (medium shade block, U+2593) rather
     than spaces. That matches what `Format-AggregateBars` actually emits
@@ -52,20 +60,22 @@
     case 2:` branch in `freeze/ansi.go`). So we sidestep the hardcoded
     palette by emitting Campbell hexes directly via truecolor.
 
-    Color map (logical name -> Campbell hex -> where it shows):
-        DarkYellow -> #C19C00  headers, bar percent label
-        DarkGray   -> #767676  footer, Account label
-        Green      -> #16C60C  active rows, ok status, green bars
-        Yellow     -> #F9F1A5  yellow bars, near-limit rows
-        Red        -> #E74856  red bars, limited rows
-        Gray       -> #CCCCCC  inactive ok rows
+    Color map (role -> Campbell hex -> where it shows):
+        Heading -> #C19C00  headers, bar percent label
+        Muted   -> #767676  footer, Account label
+        Success -> #16C60C  active rows, ok status, green bars
+        Warning -> #F9F1A5  yellow bars, near-limit rows
+        Danger  -> #E74856  red bars, limited rows
+        Neutral -> #CCCCCC  inactive ok rows
 
-    Logical name = the value passed to `Write-Color` in
-    switch_claude_account.ps1 around line 858. The mapping there from
-    logical name to `$PSStyle` SGR (DarkYellow -> 33, Green -> 92, ...)
-    is a runtime artifact of how Windows Terminal renders those SGRs as
-    Campbell hexes; here we burn the hexes in directly so the SVGs are
-    independent of any terminal palette.
+    Role = the value passed to `Write-Color` in switch_claude_account.ps1;
+    `Write-Color`'s own docblock owns what each role means. These hexes
+    are what Windows Terminal renders the DEFAULT theme's SGR codes as
+    (Heading -> 33, Success -> 92, ...), burned in directly so the SVGs
+    are independent of any terminal palette.
+
+    This is not a `SCA_THEME` entry and must not drift into one: the SVGs
+    document the default theme, so they are rendered with SCA_THEME unset.
 
 .PARAMETER OutputDir
     Where to write the rendered SVGs. Default: <repo>/docs/images.
@@ -140,20 +150,20 @@ New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 # .DESCRIPTION above for rationale.
 $ESC = [char]27
 $RESET  = "$ESC[0m"
-$DKYEL  = "$ESC[38;2;193;156;0m"    # #C19C00  Campbell Yellow      (DarkYellow)
-$DKGRY  = "$ESC[38;2;118;118;118m"  # #767676  Campbell Brt Black   (DarkGray)
-$GREEN  = "$ESC[38;2;22;198;12m"    # #16C60C  Campbell Brt Green   (Green)
-$YELLO  = "$ESC[38;2;249;241;165m"  # #F9F1A5  Campbell Brt Yellow  (Yellow)
-$RED    = "$ESC[38;2;231;72;86m"    # #E74856  Campbell Brt Red     (Red)
-$GRAY   = "$ESC[38;2;204;204;204m"  # #CCCCCC  Campbell White       (Gray)
+$DKYEL  = "$ESC[38;2;193;156;0m"    # #C19C00  Campbell Yellow      (Heading)
+$DKGRY  = "$ESC[38;2;118;118;118m"  # #767676  Campbell Brt Black   (Muted)
+$GREEN  = "$ESC[38;2;22;198;12m"    # #16C60C  Campbell Brt Green   (Success)
+$YELLO  = "$ESC[38;2;249;241;165m"  # #F9F1A5  Campbell Brt Yellow  (Warning)
+$RED    = "$ESC[38;2;231;72;86m"    # #E74856  Campbell Brt Red     (Danger)
+$GRAY   = "$ESC[38;2;204;204;204m"  # #CCCCCC  Campbell White       (Neutral)
 
 # --- Block 1: usage -Watch (README ~lines 17-33) ---------------------------
-# Multi-slot watch frame with 5 rows; bars at 22% (green) / 62% (yellow);
-# trailing [Watch] footer in DarkGray.
+# Multi-slot watch frame with 5 rows; bars at 25% (green) / 62% (yellow);
+# trailing [Watch] footer in Muted.
 $watchLines = @(
     "$DKYEL[Usage] Plan usage$RESET",
     "",
-    "$GREEN  Session [█████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  22%$RESET",
+    "$GREEN  Session [██████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  25%$RESET",
     "",
     "$YELLO  Week    [███████████████████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  62%$RESET",
     "",
@@ -198,7 +208,7 @@ $verboseLines = @(
 # Same five-row watch frame as Block 1, plus the two auto-rotation artifacts:
 #
 #   1. Right-aligned header indicator '▶ switching slot at 95%'. Glyph
-#      in Gray (white-ish, high-contrast lozenge); text in DarkGray
+#      in Neutral (white-ish, high-contrast lozenge); text in Muted
 #      (matches footer ambient-metadata weight). See Format-UsageTable in
 #      switch_claude_account.ps1 around line 2779-2810 for the runtime's
 #      three-segment Write-Color composition we are imitating here.
@@ -228,32 +238,150 @@ $verboseLines = @(
 # auto-mode-on vs. auto-mode-off with no other deltas.
 $autoHeaderPad   = ' ' * 37
 $autoGlyph       = "$([char]0x25B6)"
-$watchAutoLines = @(
-    "$DKYEL[Usage] Plan usage$RESET$autoHeaderPad$GRAY$autoGlyph$RESET$DKGRY switching slot at 95%$RESET",
-    "",
-    "",
-    "$GREEN  Session [█████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  22%$RESET",
-    "",
-    "$YELLO  Week    [███████████████████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  62%$RESET",
-    "",
-    "    Slot         Account                Session        Week         Status",
-    "    -----------  ---------------------  -------------  -----------  ------",
-    "$GREEN  * work         alex@acme.io            18% (2h 11m)   42% (102h)  ok$RESET",
-    "$GRAY    personal     alex.dev@gmail.com       3% (4h 02m)    7% (146h)  ok$RESET",
-    "$GRAY    dev          alex@startup.dev         9% (3h 41m)   34% (118h)  ok$RESET",
-    "$YELLO    client-acme  ada.lovelace@arpa.net   71% (1h 04m)   92% (41h)   near limit$RESET",
-    "$RED    legacy       team@example.com        12% (3h 18m)  100% (12h)   limited 7d$RESET",
-    "",
-    "$DKGRY[Monitor] Rotated from `"legacy`" to `"work`" at 14:31:58$RESET",
-    "$DKGRY[Watch] Last poll at 14:32:07$RESET"
+
+# Role -> SGR for the palette the four README scenes are drawn in. Campbell is
+# Windows Terminal's default, so this is what the `default` theme resolves to
+# on a stock Windows install.
+$campbellPalette = @{
+    Heading = $DKYEL; Warning = $YELLO; Success = $GREEN
+    Danger  = $RED;   Muted   = $DKGRY; Neutral = $GRAY
+}
+
+# The hero scene as a function of its palette rather than one literal per
+# palette. It is rendered once in Campbell for monitor.svg and again for every
+# theme in the gallery, and two copies of eighteen hand-aligned columns would
+# drift apart on the first edit.
+function New-HeroLines {
+    Param ([Parameter(Mandatory)] [hashtable] $Palette)
+
+    $hd = $Palette.Heading; $wn = $Palette.Warning; $sc = $Palette.Success
+    $dg = $Palette.Danger;  $mt = $Palette.Muted;   $nt = $Palette.Neutral
+
+    return @(
+        "$hd[Usage] Plan usage$RESET$autoHeaderPad$nt$autoGlyph$RESET$mt switching slot at 95%$RESET",
+        "",
+        "",
+        "$sc  Session [██████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  25%$RESET",
+        "",
+        "$wn  Week    [███████████████████████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  62%$RESET",
+        "",
+        "    Slot         Account                Session        Week         Status",
+        "    -----------  ---------------------  -------------  -----------  ------",
+        "$sc  * work         alex@acme.io            18% (2h 11m)   42% (102h)  ok$RESET",
+        "$nt    personal     alex.dev@gmail.com       3% (4h 02m)    7% (146h)  ok$RESET",
+        "$nt    dev          alex@startup.dev         9% (3h 41m)   34% (118h)  ok$RESET",
+        "$wn    client-acme  ada.lovelace@arpa.net   71% (1h 04m)   92% (41h)   near limit$RESET",
+        "$dg    legacy       team@example.com        12% (3h 18m)  100% (12h)   limited 7d$RESET",
+        "",
+        "$mt[Monitor] Rotated from `"legacy`" to `"work`" at 14:31:58$RESET",
+        "$mt[Watch] Last poll at 14:32:07$RESET"
+    )
+}
+
+$watchAutoLines = New-HeroLines -Palette $campbellPalette
+
+# --- Block 5: theme gallery (README Theming) --------------------------------
+# Generated from the palette table the tool actually ships, not transcribed
+# here, so the gallery cannot drift from the themes on offer. Dot-sourcing is
+# inert: the guard at the foot of switch_claude_account.ps1 keeps Invoke-Main
+# from running, and its load path only resolves paths and builds tables --
+# nothing reads or writes a credential.
+#
+# The whole monitor scene is repeated per theme rather than a swatch strip:
+# the question a reader brings here is "what will this look like", and the
+# answer is the view they will actually sit in front of.
+#
+# The canvas is freeze's own --background, NOT an SGR painted behind each row.
+# Painting per row leaves the window's 30px padding showing the default
+# terminal black around the edges, so the panel reads as a themed rectangle
+# floating on somebody else's background. Handing the color to --background
+# fills the whole window face, and makes the per-row paint and the
+# pad-to-width that went with it unnecessary.
+#
+# `default` uses Campbell. It spells its roles as named ANSI and so owns no
+# background, taking whatever the terminal supplies; docs/themes.md says as
+# much, because no single image can be honest about a palette-relative theme.
+. (Join-Path $repoRoot 'switch_claude_account.ps1')
+
+function Get-GallerySgr {
+    Param ([int] $Rgb)
+
+    $r = ($Rgb -shr 16) -band 0xFF
+    $g = ($Rgb -shr 8)  -band 0xFF
+    $b =  $Rgb          -band 0xFF
+    return "$ESC[38;2;$r;$g;${b}m"
+}
+
+$galleryThemes = @(
+    [pscustomobject]@{
+        Name       = 'default'
+        Background = '#0C0C0C'
+        PanelFg    = ''
+        Palette    = $campbellPalette
+    }
 )
+foreach ($schemeName in ($Script:Base16Schemes.Keys | Sort-Object)) {
+    $scheme = $Script:Base16Schemes[$schemeName]
+    $galleryThemes += [pscustomobject]@{
+        Name       = $schemeName
+        Background = ('#{0:X6}' -f $scheme.base00)
+        PanelFg    = (Get-GallerySgr $scheme.base05)
+        Palette    = @{
+            Heading = (Get-GallerySgr $scheme.base0D)
+            Warning = (Get-GallerySgr $scheme.base0A)
+            Success = (Get-GallerySgr $scheme.base0B)
+            Danger  = (Get-GallerySgr $scheme.base08)
+            Muted   = (Get-GallerySgr $scheme.base03)
+            # Neutral carries no color of its own in a truecolor theme. Inside
+            # a themed frame it inherits that theme's Foreground, so base05 is
+            # what the runtime would actually show here.
+            Neutral = (Get-GallerySgr $scheme.base05)
+        }
+    }
+}
+
+# Give a scene the theme's body-text color.
+#
+# Only the foreground needs doing here; --background owns the canvas. The
+# re-assertion after every ESC[0m is what makes it work: Write-Color's scenes
+# end each colored run with a full reset, which would otherwise drop the
+# uncolored remainder of a line back to freeze's own #c4c4c4 rather than the
+# theme's base05.
+function ConvertTo-ThemedPanel {
+    Param (
+        # AllowEmptyString because the scene uses blank lines as spacing, and
+        # Mandatory alone rejects an array element that is ''.
+        [Parameter(Mandatory)] [AllowEmptyString()] [string[]] $Lines,
+        [string] $Fg
+    )
+
+    foreach ($line in $Lines) {
+        if (-not $Fg) { $line; continue }
+        $Fg + $line.Replace($RESET, $RESET + $Fg) + $RESET
+    }
+}
 
 $scenarios = @(
-    [pscustomobject]@{ Name = 'usage-watch';      Lines = $watchLines     },
-    [pscustomobject]@{ Name = 'usage-table';      Lines = $tableLines     },
-    [pscustomobject]@{ Name = 'usage-verbose';    Lines = $verboseLines   },
-    [pscustomobject]@{ Name = 'monitor';          Lines = $watchAutoLines }
+    [pscustomobject]@{ Name = 'usage-watch';   Lines = $watchLines     },
+    [pscustomobject]@{ Name = 'usage-table';   Lines = $tableLines     },
+    [pscustomobject]@{ Name = 'usage-verbose'; Lines = $verboseLines   },
+    [pscustomobject]@{ Name = 'monitor';       Lines = $watchAutoLines }
 )
+
+# One file per theme, not one tall strip. docs/themes.md gives each theme a
+# heading of its own so a reader can link straight to the one they want, and a
+# heading needs its own content underneath for that anchor to be worth
+# following. The theme name lives in the markdown heading, so the panel no
+# longer carries a label of its own.
+foreach ($gt in $galleryThemes) {
+    $scenarios += [pscustomobject]@{
+        Name       = "theme-$($gt.Name)"
+        Background = $gt.Background
+        Lines      = ConvertTo-ThemedPanel `
+            -Lines (New-HeroLines -Palette $gt.Palette) `
+            -Fg    $gt.PanelFg
+    }
+}
 
 # --- Render -----------------------------------------------------------------
 # freeze flags rationale:
@@ -290,9 +418,16 @@ $scenarios = @(
 #   --font.size 14       : default; readable in README at GitHub's render width
 #   --line-height 1.4    : avoids cramped vertical spacing
 # Font defaults to JetBrains Mono and is embedded as a base64 woff2 in the
-# SVG, so the rendered output is pixel-identical regardless of the
-# viewer's installed fonts. Adds ~300 KB per SVG, acceptable for README
-# assets.
+# SVG, so the rendered output is pixel-identical regardless of the viewer's
+# installed fonts. That costs ~365 KB of every file against ~1 KB of actual
+# drawing, and is paid once per image including each theme panel.
+#
+# Stripping it for a fallback chain was tried and reverted. freeze emits no
+# per-glyph positions and no textLength: the advance of every line comes from
+# the font, so a substituted face moves the text off the geometry freeze
+# computed from JetBrains Mono metrics. The visible symptom is the usage bars,
+# whose block glyphs (U+2588 / U+2593) stop filling their cell. Pixel fidelity
+# here is load-bearing, not a nicety.
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 foreach ($s in $scenarios) {
@@ -302,11 +437,15 @@ foreach ($s in $scenarios) {
 
     [System.IO.File]::WriteAllText($ansiPath, $body, $utf8NoBom)
 
+    # Campbell unless the scene names its own; a theme panel hands its base00
+    # here so the color reaches the padding too, not just the text rows.
+    $background = if ($s.Background) { $s.Background } else { '#0C0C0C' }
+
     Write-Host "Rendering $($s.Name) -> $svgPath" -ForegroundColor Cyan
     & $freezeExe `
         --language    ansi `
         --window `
-        --background  '#0C0C0C' `
+        --background  $background `
         --padding     30 `
         --margin      0 `
         --width       720 `

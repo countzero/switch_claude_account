@@ -46,6 +46,7 @@ BeforeAll {
             'Format-WatchFooter'
             'Write-WatchFrame'
             'Invoke-WatchStartupWarm'
+            'Get-WatchChrome'
         )
         $ast = [System.Management.Automation.Language.Parser]::ParseFile(
             $Path, [ref]$null, [ref]$null)
@@ -422,6 +423,101 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Invoke-Main action dispatch' {
+        # The switch at the end of Invoke-Main is the only place that maps an
+        # action name to a body, and a typo in one arm is invisible to every
+        # other test in the suite: they all call the Invoke-*Action functions
+        # directly. Each case here mocks the destination and asserts the
+        # routing, which is the whole contract of the arm.
+        #
+        # Same dynamic-scope pattern as the two contexts above: assign the
+        # script's Param() variables in the It body and let Invoke-Main read
+        # them.
+
+        It 'prints the help screen for the help action' {
+            $Action = 'help'
+            $out = (Invoke-Main 6>&1 | Out-String)
+            $out | Should -Match 'ACTIONS'
+        }
+
+        # The data key is ActionName, not Action: a -ForEach key collides with
+        # the script's own [ValidateSet] $Action parameter, which is in scope
+        # here because the BeforeEach dot-sourced the script. Under the
+        # collision Pester expands <Action> to empty and the assignment never
+        # reaches Invoke-Main, so all eight cases fail identically.
+        It 'routes <ActionName> to <Target>' -ForEach @(
+            @{ ActionName = 'install';   Target = 'Add-To-Profile' }
+            @{ ActionName = 'uninstall'; Target = 'Remove-From-Profile' }
+            @{ ActionName = 'save';      Target = 'Invoke-SaveAction' }
+            @{ ActionName = 'switch';    Target = 'Invoke-SwitchAction' }
+            @{ ActionName = 'list';      Target = 'Invoke-ListAction' }
+            @{ ActionName = 'remove';    Target = 'Invoke-RemoveAction' }
+            @{ ActionName = 'usage';     Target = 'Invoke-UsageAction' }
+            @{ ActionName = 'warmup';    Target = 'Invoke-WarmupAction' }
+        ) {
+            Mock -CommandName $Target -MockWith { }
+            $Action = $ActionName
+            Invoke-Main 6>$null
+            Should -Invoke -CommandName $Target -Times 1 -Exactly
+        }
+
+        It 'passes -Name through to the dispatched action' {
+            Mock Invoke-SaveAction { }
+            $Action = 'save'
+            $Name   = 'work'
+            Invoke-Main 6>$null
+            Should -Invoke Invoke-SaveAction -Times 1 -Exactly -ParameterFilter { $Name -eq 'work' }
+        }
+
+        It 'emits the config-directory advisory when there is one' {
+            Mock Get-ConfigDirAdvisory { '[Config] CLAUDE_CONFIG_DIR is set; using somewhere else.' }
+            Mock Invoke-ListAction { }
+            $Action = 'list'
+            $out = (Invoke-Main 6>&1 | Out-String)
+            $out | Should -Match '\[Config\] CLAUDE_CONFIG_DIR is set'
+        }
+
+        # -Json exists so a scripted caller gets nothing but the document, and
+        # the advisory is the one line emitted before the action body runs.
+        It 'suppresses the config-directory advisory under -Json' {
+            Mock Get-ConfigDirAdvisory { '[Config] CLAUDE_CONFIG_DIR is set; using somewhere else.' }
+            Mock Invoke-UsageAction { }
+            $Action = 'usage'
+            $Json   = $true
+            $out = (Invoke-Main 6>&1 | Out-String)
+            $out | Should -Not -Match '\[Config\]'
+        }
+
+        # Repair-CredentialFileModes is a no-op returning 0 on Windows, so the
+        # count is mocked rather than produced: the line under test is the
+        # report, and the repair itself is pinned in State-File.Tests.ps1.
+        It 'reports how many credential files the mode repair tightened' {
+            Mock Repair-CredentialFileModes { 2 }
+            Mock Invoke-ListAction { }
+            $Action = 'list'
+            $out = (Invoke-Main 6>&1 | Out-String)
+            $out | Should -Match '\[Security\] Tightened 2 credential file\(s\) to 0600'
+        }
+
+        It 'stays silent about the mode repair when it changed nothing' {
+            Mock Repair-CredentialFileModes { 0 }
+            Mock Invoke-ListAction { }
+            $Action = 'list'
+            $out = (Invoke-Main 6>&1 | Out-String)
+            $out | Should -Not -Match '\[Security\]'
+        }
+
+        # The dot-source guard at the foot of the file. Every other test in the
+        # suite dot-sources the script, which is exactly the case the guard
+        # suppresses, so nothing else proves `sca` runs anything at all when
+        # invoked as a script. -Version is the one action that reaches
+        # Invoke-Main and returns without touching disk or network.
+        It 'runs Invoke-Main when the script is invoked rather than dot-sourced' {
+            $out = (& $script:ScriptPath -Version 6>&1 | Out-String).Trim()
+            $out | Should -Match '^\d+\.\d+\.\d+$'
+        }
+    }
+
     Context 'Format-WatchTitle' {
         # Pure string-builder for the OSC 0 watch-mode terminal title.
         # The title carries the active slot's two utilization numbers +
@@ -714,14 +810,17 @@ Describe 'switch_claude_account' {
             # Regression contrast: without -Aggregate the same snapshot
             # renders the active row (10% | 10%, see "ignores non-active
             # rows" test above). With -Aggregate it averages all three:
-            # 5h mean = (100+10+100)/3 = 70, 7d mean = (100+10+100)/3 = 70.
+            # 5h mean = (100+10+100)/3 = 70, 7d mean = (95+10+95)/3 = 67.
+            # The peers sit at 95% on the week rather than 100% so every row
+            # stays in both denominators; what the weekly cap does to the
+            # Session average is pinned separately at the end of this block.
             $snap = New-FakeSnapshot -Rows @(
-                @{ Name = 'a'; FiveUtil = 100; SevenUtil = 100 }
+                @{ Name = 'a'; FiveUtil = 100; SevenUtil = 95 }
                 @{ Name = 'b'; FiveUtil = 10;  SevenUtil = 10; IsActive = $true }
-                @{ Name = 'c'; FiveUtil = 100; SevenUtil = 100 }
+                @{ Name = 'c'; FiveUtil = 100; SevenUtil = 95 }
             )
             Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
-                Should -Be '[~] 70% | 70% | Switch Claude Account'
+                Should -Be '[~] 70% | 67% | Switch Claude Account'
         }
 
         It '-Aggregate excludes HTTP-failure rows with no data from the mean' {
@@ -743,13 +842,15 @@ Describe 'switch_claude_account' {
             # carrying last-known percentages. Format-UsageTable prints those
             # numbers and Get-RowMaxUtilization rotates on them, so the pool
             # mean has to see them too or the bars contradict the table right
-            # beneath them. Mean = (40+100)/2 = 70.
+            # beneath them. 5h = (40+100)/2 = 70, 7d = (40+40)/2 = 40. Row 'b'
+            # is kept under the weekly cap on purpose so this pins the
+            # cached-row rule and not the exclusion tested below.
             $snap = New-FakeSnapshot -Rows @(
                 @{ Name = 'a'; FiveUtil = 40;  SevenUtil = 40; IsActive = $true }
-                @{ Name = 'b'; Status = 'error'; FiveUtil = 100; SevenUtil = 100 }
+                @{ Name = 'b'; Status = 'error'; FiveUtil = 100; SevenUtil = 40 }
             )
             Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
-                Should -Be '[~] 70% | 70% | Switch Claude Account'
+                Should -Be '[~] 70% | 40% | Switch Claude Account'
         }
 
         It '-Aggregate counts null buckets as 0 (denominator stays N)' {
@@ -813,7 +914,7 @@ Describe 'switch_claude_account' {
                 Should -Be '49% | 49% | Switch Claude Account'
         }
 
-        It '-Aggregate [!] wins over [~] when one bucket is at Red and the other at Yellow' {
+        It '-Aggregate [!] wins over [~] when one bucket is at Danger and the other at Warning' {
             $snap = New-FakeSnapshot -Rows @(@{ FiveUtil = 90; SevenUtil = 50; IsActive = $true })
             Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
                 Should -Be '[!] 90% | 50% | Switch Claude Account'
@@ -834,6 +935,21 @@ Describe 'switch_claude_account' {
             # prefix fires. Pins the threshold swap.
             Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
                 Should -Be '[~] 89% | 89% | Switch Claude Account'
+        }
+
+        It '-Aggregate drops a 7d-capped row from the Session number only' {
+            # 5h = 40/1 = 40: row 'a' is at the weekly cap, so it leaves the
+            # Session average and row 'b' carries it alone. 7d = (100+20)/2 =
+            # 60 still counts both, because dropping 'a' there would hide the
+            # weekly exhaustion. Shares Get-PoolMeanUtilization with the bar
+            # above the table so the two cannot drift; the math itself is
+            # pinned in Invoke-UsageAction.Tests.ps1.
+            $snap = New-FakeSnapshot -Rows @(
+                @{ Name = 'a'; FiveUtil =  0; SevenUtil = 100; IsActive = $true }
+                @{ Name = 'b'; FiveUtil = 40; SevenUtil =  20 }
+            )
+            Format-WatchTitle -Name '' -Snapshot $snap -Aggregate |
+                Should -Be '[~] 40% | 60% | Switch Claude Account'
         }
     }
 
@@ -1312,6 +1428,35 @@ Describe 'switch_claude_account' {
                 Should -Match ([regex]::Escape("`e[?25h"))
         }
 
+        # Both restores are belt-and-suspenders for .NET-side state: the VT
+        # sequences above are what the user's terminal actually obeys. Neither
+        # may therefore unwind the caller's finally, which is the last thing
+        # standing between a crashed watch and a terminal left in the alt
+        # buffer with no cursor.
+        It 'Exit-WatchTerminal never lets a cursor restore failure escape' {
+            # The API restore runs only where the capture succeeded, i.e. off
+            # an attached Windows console. Under a redirected test host the
+            # setter throws instead, which is exactly the case being pinned.
+            $state = [pscustomobject]@{
+                Cursor = $true; Encoding = $null; Title = $null; EnteredAlt = $false
+            }
+            { Exit-WatchTerminal -State $state } | Should -Not -Throw
+        }
+
+        It 'Exit-WatchTerminal never lets an encoding restore failure escape' {
+            $orig = [Console]::OutputEncoding
+            try {
+                # Truthy, so the guard lets it through, but not an Encoding, so
+                # the assignment throws on conversion.
+                $state = [pscustomobject]@{
+                    Cursor = $null; Encoding = [pscustomobject]@{ NotAnEncoding = $true }
+                    Title  = $null; EnteredAlt = $false
+                }
+                { Exit-WatchTerminal -State $state } | Should -Not -Throw
+            }
+            finally { [Console]::OutputEncoding = $orig }
+        }
+
         It 'Exit-WatchTerminal restores a captured console encoding and skips a null one' {
             $orig = [Console]::OutputEncoding
             try {
@@ -1399,6 +1544,46 @@ Describe 'switch_claude_account' {
             Invoke-WithEnteredWatchTerminal {
                 Param ($term, $enterText)
                 $enterText | Should -Be "`e[?1049h`e[?25l"
+            }
+        }
+
+        It 'Enter-WatchTerminal paints the canvas once when the theme asks for one' {
+            # Without this the alt buffer shows the terminal's own background
+            # until the first frame lands, which on a slow first poll is a
+            # visible flash of the wrong color. One-shot fill, not a clear:
+            # the ESC[2J ban that keeps the repaint flicker-free covers this
+            # function too, so the entry path must not smuggle one in.
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                Invoke-WithEnteredWatchTerminal {
+                    Param ($term, $enterText)
+                    $enterText | Should -Match "`e\[\?1049h`e\[\?25l"
+                    $enterText | Should -Match "`e\[48;2;38;50;56m"
+                    $enterText | Should -Match "`e\[0J"
+                    $enterText | Should -Not -Match "`e\[2J"
+                }
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'Enter-WatchTerminal writes nothing beyond the entry when no theme asks for a canvas' {
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'default'
+                Invoke-WithEnteredWatchTerminal {
+                    Param ($term, $enterText)
+                    $enterText | Should -Be "`e[?1049h`e[?25l"
+                }
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
             }
         }
 
@@ -1696,6 +1881,58 @@ Describe 'switch_claude_account' {
             Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
         }
 
+        # `sca warmup` prints and pauses; the watch paints into an alt-screen
+        # buffer and cannot, so the footer latch is its only channel.
+
+        It 'latches the live-client notice when Claude Code is running' {
+            Mock Test-ClaudeRunning -MockWith { $true }
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+
+            $s.WarmLatch | Should -Match 'Claude Code is running'
+            $s.WarmLatch | Should -Match 'bills whichever slot is mounted'
+        }
+
+        It 'keeps the seeded latch when no Claude Code is running' {
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+            $s.WarmLatch | Should -Be '[Warmup] Keeping all slots warm.'
+        }
+
+        # Both latch values are claims about a round-robin. Neither survives
+        # discovering there is none: the notice warns about activations that
+        # will not happen, and the seed claims an activity with nothing to
+        # perform it on. The frame already says there are no slots.
+        It 'drops the latch entirely when no slot matched' -ForEach @(
+            @{ Case = 'live client'; Running = $true }
+            @{ Case = 'no client';   Running = $false }
+        ) {
+            Mock Test-ClaudeRunning  -MockWith { $Running }
+            Mock Invoke-WarmAllSlots -MockWith { $null }
+
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+
+            $s.WarmLatch | Should -BeNullOrEmpty
+        }
+
+        It 'latches the advisory when the pass stopped early' {
+            # Invoke-WarmAllSlots stops rather than overwrite bytes nothing
+            # captured, which leaves the user on a slot they did not choose.
+            Mock Invoke-WarmAllSlots -MockWith {
+                [pscustomobject]@{
+                    Results        = @([pscustomobject]@{ Name = 'alpha' })
+                    NoSlots        = $false
+                    HasRateLimited = $false
+                    Advisory       = "[Warmup] Stopped at 'alpha': nothing captured the credentials Claude Code left active."
+                }
+            }
+            $s = New-WatchSession -Warmup
+            Invoke-WatchStartupWarm -Session $s -Interval 300 -Threshold 95
+
+            $s.WarmLatch | Should -Match "Stopped at 'alpha'"
+        }
+
         It 'stamps the last-poll time so the loop redraws instead of re-polling' {
             # The pass already produced a frame; leaving LastPoll at MinValue
             # would make the loop's first iteration fire a second full poll
@@ -1860,6 +2097,26 @@ Describe 'switch_claude_account' {
             ([regex]::Matches($out, [regex]::Escape("`e[?2026h"))).Count | Should -Be 3
         }
 
+        # -Warmup front-loads one billable pass over every slot before the
+        # loop starts, so which flag reaches that call is the difference
+        # between `sca usage -Watch` costing nothing and costing ~$0.004 a
+        # slot. Both directions are pinned for that reason.
+        It 'runs the startup warm pass before the loop under -Warmup' {
+            Mock Invoke-WatchStartupWarm -MockWith { }
+
+            Invoke-BoundedWatch -WatchArgs @{ Warmup = $true } | Out-Null
+
+            Should -Invoke Invoke-WatchStartupWarm -Times 1 -Exactly
+        }
+
+        It 'does not warm anything without -Warmup' {
+            Mock Invoke-WatchStartupWarm -MockWith { }
+
+            Invoke-BoundedWatch | Out-Null
+
+            Should -Invoke Invoke-WatchStartupWarm -Times 0 -Exactly
+        }
+
         It 'polls on the first tick and not again inside the interval' {
             # The redraw cadence is 1 s and the poll cadence is -Interval;
             # conflating them would hammer the unofficial endpoint once a
@@ -1951,7 +2208,7 @@ Describe 'switch_claude_account' {
             # Common.ps1 sets PlainText for the session. The captured
             # .Message carries raw SGR that [Console]::Out.Write would not
             # strip, so Get-WatchFrameText must drop it itself in PlainText.
-            $text = Get-WatchFrameText { Write-Color 'X' 'Red' }
+            $text = Get-WatchFrameText { Write-Color 'X' 'Danger' }
             $text | Should -Be "X`n"
             $text.Contains("`e[") | Should -BeFalse
         }
@@ -1960,7 +2217,7 @@ Describe 'switch_claude_account' {
             $prev = $PSStyle.OutputRendering
             try {
                 $PSStyle.OutputRendering = 'Ansi'
-                $text = Get-WatchFrameText { Write-Color 'X' 'Red' }
+                $text = Get-WatchFrameText { Write-Color 'X' 'Danger' }
                 $text.Contains("`e[") | Should -BeTrue -Because 'color frames keep their SGR for [Console]::Out.Write'
             } finally {
                 $PSStyle.OutputRendering = $prev
@@ -2098,13 +2355,394 @@ Describe 'switch_claude_account' {
         }
     }
 
-    Context 'ConvertTo-ScaJsonString' {
-        # Note: the function's `if ($null -eq $Value) { return 'null' }`
-        # branch is defensive-dead. PowerShell binds $null to a [string]
-        # parameter as '', so external callers cannot exercise it; the
-        # one internal caller in Set-OAuthAccountInClaudeJson short-
-        # circuits before calling. We do NOT test that branch.
+    Context 'Theming (SCA_THEME)' {
+        # The palette indirection: Write-Color takes a ROLE and looks its SGR
+        # up in $Script:Palette, which Invoke-Main binds from $env:SCA_THEME.
+        #
+        # Common.ps1 forces OutputRendering=PlainText, which strips SGR before
+        # a test can see it, so every rendering assertion here flips to 'Ansi'
+        # and restores in a finally. $Script:Palette is restored the same way:
+        # it is script-scope state on the dot-sourced file, so a test that
+        # leaves it on 'material' would recolor the rest of the file's run.
+        BeforeEach {
+            $script:themeSgrRegex = "`e\[[0-9;]*m"
+            if (Test-Path Env:\SCA_THEME) { Remove-Item Env:\SCA_THEME }
+            if (Test-Path Env:\NO_COLOR)  { Remove-Item Env:\NO_COLOR  }
+        }
 
+        It 'resolves an unset, empty or blank name to the default palette' {
+            $expected = $Script:ThemePalettes['default']
+            (Resolve-ThemePalette -Name $null)  | Should -Be $expected
+            (Resolve-ThemePalette -Name '')     | Should -Be $expected
+            (Resolve-ThemePalette -Name '   ')  | Should -Be $expected
+        }
+
+        It 'resolves a known name case-insensitively and tolerates surrounding blanks' {
+            $expected = $Script:ThemePalettes['material']
+            (Resolve-ThemePalette -Name 'material') | Should -Be $expected
+            (Resolve-ThemePalette -Name 'MATERIAL') | Should -Be $expected
+            (Resolve-ThemePalette -Name 'Material') | Should -Be $expected
+            (Resolve-ThemePalette -Name ' material ') | Should -Be $expected
+        }
+
+        It 'falls back to default on an unknown name instead of throwing' {
+            # A typo lives in a shell profile, so it must never break a run.
+            { Resolve-ThemePalette -Name 'no-such-theme' } | Should -Not -Throw
+            (Resolve-ThemePalette -Name 'no-such-theme') |
+                Should -Be $Script:ThemePalettes['default']
+        }
+
+        It 'names the available themes on the verbose stream when a name misses' {
+            # Driven by $VerbosePreference rather than a -Verbose argument:
+            # Resolve-ThemePalette is a simple function, so it has no common
+            # parameters. The preference is how `sca <action> -Verbose`
+            # actually reaches it, the script itself carrying CmdletBinding.
+            $saved = $VerbosePreference
+            try {
+                $VerbosePreference = 'Continue'
+                $v = Resolve-ThemePalette -Name 'no-such-theme' 4>&1 |
+                    Where-Object { $_ -is [System.Management.Automation.VerboseRecord] } |
+                    ForEach-Object { $_.Message }
+                $v | Should -Match 'no-such-theme'
+                $v | Should -Match 'default'
+                $v | Should -Match 'material'
+            }
+            finally { $VerbosePreference = $saved }
+        }
+
+        It 'omits Neutral from every truecolor theme so it inherits the terminal foreground' {
+            # Neutral marks a steady-state row with no verdict, so it has to
+            # stay readable on a light AND a dark background. Any fixed hex
+            # loses one of the two; absence falls through to uncolored.
+            foreach ($name in $Script:ThemePalettes.Keys) {
+                if ($name -eq 'default') { continue }
+                $Script:ThemePalettes[$name].ContainsKey('Neutral') |
+                    Should -BeFalse -Because "theme '$name' must leave Neutral to the terminal"
+            }
+        }
+
+        It 'renders every non-Neutral role in a theme, so no role silently loses its color' {
+            foreach ($name in $Script:ThemePalettes.Keys) {
+                foreach ($role in 'Heading','Warning','Success','Danger','Muted') {
+                    $Script:ThemePalettes[$name][$role] |
+                        Should -Not -BeNullOrEmpty -Because "theme '$name' must define '$role'"
+                }
+            }
+        }
+
+        It 'emits truecolor SGR under material and named SGR under default' {
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'default'
+                $out = Write-Color 'H' 'Heading' 6>&1 | Out-String
+                $out | Should -Match "`e\[33m" -Because 'default Heading is ANSI 33, resolved by the terminal palette'
+
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                $out = Write-Color 'H' 'Heading' 6>&1 | Out-String
+                $out | Should -Match "`e\[38;2;130;170;255m" -Because 'material Heading is base0D #82AAFF'
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'leaves Neutral uncolored under material but colored under default' {
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'default'
+                (Write-Color 'N' 'Neutral' 6>&1 | Out-String) | Should -Match "`e\["
+
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                (Write-Color 'N' 'Neutral' 6>&1 | Out-String) | Should -Not -Match "`e\["
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'still renders an unknown role uncolored under a theme' {
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                (Write-Color 'x' 'not-a-role' 6>&1 | Out-String) | Should -Not -Match "`e\["
+                # $null is the deliberate opt-out at Invoke-ListAction's
+                # inactive rows; a Hashtable throws on a $null index, so this
+                # guards the [String] coercion Write-Color leans on.
+                { Write-Color 'x' $null 6>$null } | Should -Not -Throw
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'PlainText strips a theme truecolor SGR exactly as it strips a named one' {
+            # This is what lets NO_COLOR outrank SCA_THEME for free: the
+            # StringDecorated regex matches ESC[38;2;R;G;Bm just as it matches
+            # ESC[33m, so no-color mode needs no theme-specific handling.
+            $saved = $Script:Palette
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                $PSStyle.OutputRendering = 'PlainText'
+                $out = Write-Color 'payload' 'Heading' 6>&1 | Out-String
+                $out | Should -Not -Match "`e\["
+                $out | Should -Match 'payload'
+            }
+            finally { $Script:Palette = $saved }
+        }
+
+        It 'Get-WatchFrameText strips a theme truecolor SGR under PlainText' {
+            # The watch path strips SGR by hand (Console.Out.Write does no
+            # filtering), so its regex needs the same truecolor guard.
+            $saved = $Script:Palette
+            try {
+                $Script:Palette = Resolve-ThemePalette -Name 'material'
+                $PSStyle.OutputRendering = 'PlainText'
+                $text = Get-WatchFrameText { Write-Color 'X' 'Heading' }
+                $text | Should -Not -Match "`e\["
+                $text | Should -Match 'X'
+            }
+            finally { $Script:Palette = $saved }
+        }
+
+        It 'keeps layout byte-identical across themes once SGR is stripped' {
+            # The regression this guards: truecolor sequences are ~3x longer
+            # than named ones. If any renderer measured a COLORED string to
+            # compute padding, switching theme would shift every column.
+            $saved = $Script:Palette
+            $PSStyle.OutputRendering = 'Ansi'
+            Mock Get-ConsoleWidth { 100 }
+            try {
+                $rendered = foreach ($name in 'default','material') {
+                    $Script:Palette = Resolve-ThemePalette -Name $name
+                    $raw = Write-UsageTableHeader -AutoThreshold 95 6>&1 | Out-String
+                    , ($raw -replace $script:themeSgrRegex, '')
+                }
+                $rendered[0] | Should -Be $rendered[1] -Because (
+                    'padding must be computed on plain text, never on a colored string')
+                # Guard against a vacuous pass: the colored forms must differ,
+                # otherwise the strip above could be hiding a no-op.
+                $rendered[0] | Should -Match 'switching slot at 95%'
+            }
+            finally {
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'binds the palette from $env:SCA_THEME during dispatch and restores it on exit' {
+            $saved = $Script:Palette
+            Mock Invoke-ListAction { $script:capturedPalette = $Script:Palette }
+            try {
+                $script:capturedPalette = $null
+                $env:SCA_THEME = 'material'
+                $Action = 'list'
+
+                Invoke-Main
+
+                $script:capturedPalette | Should -Be $Script:ThemePalettes['material']
+                $Script:Palette         | Should -Be $saved
+            }
+            finally {
+                Remove-Item Env:\SCA_THEME -ErrorAction SilentlyContinue
+                $Script:Palette = $saved
+            }
+        }
+
+        It 'lets NO_COLOR outrank SCA_THEME: a theme is which colors, not whether' {
+            $saved = $Script:Palette
+            Mock Invoke-ListAction {
+                $script:capturedRendering = $PSStyle.OutputRendering
+                $script:capturedPalette   = $Script:Palette
+            }
+            $PSStyle.OutputRendering = 'Host'
+            try {
+                $env:SCA_THEME = 'material'
+                $env:NO_COLOR  = '1'
+                $Action = 'list'
+
+                Invoke-Main
+
+                # The theme still resolves; PlainText is what suppresses it.
+                $script:capturedPalette   | Should -Be $Script:ThemePalettes['material']
+                $script:capturedRendering | Should -Be 'PlainText'
+            }
+            finally {
+                Remove-Item Env:\SCA_THEME -ErrorAction SilentlyContinue
+                Remove-Item Env:\NO_COLOR  -ErrorAction SilentlyContinue
+                $Script:Palette = $saved
+                $PSStyle.OutputRendering = 'PlainText'
+            }
+        }
+
+        It 'defines all seven base16 slots in every shipped scheme' {
+            foreach ($name in $Script:Base16Schemes.Keys) {
+                $s = $Script:Base16Schemes[$name]
+                foreach ($slot in 'base00','base03','base05','base08','base0A','base0B','base0D') {
+                    $s.ContainsKey($slot) | Should -BeTrue -Because "scheme '$name' must define $slot"
+                    $s[$slot] | Should -BeGreaterOrEqual 0
+                    $s[$slot] | Should -BeLessOrEqual 0xFFFFFF -Because "$name.$slot must be a 24-bit color"
+                }
+            }
+        }
+
+        It 'keeps Danger actually red and Success actually green in every scheme' {
+            # The rule that disqualified github. base16 slots carry SYNTAX
+            # meaning, which usually but not always lines up with the ANSI
+            # meaning a status table needs: github's port puts orange in
+            # base08 and pale blue in base0B, so Danger would have rendered
+            # orange and Success blue and a glance at the table would have
+            # misread which slots were healthy. Hue-checked rather than
+            # eyeballed, so a scheme added later cannot reintroduce it.
+            function Get-Hue ([int] $Rgb) {
+                $r = (($Rgb -shr 16) -band 0xFF) / 255
+                $g = (($Rgb -shr 8)  -band 0xFF) / 255
+                $b = ( $Rgb          -band 0xFF) / 255
+                $max = [Math]::Max($r, [Math]::Max($g, $b))
+                $min = [Math]::Min($r, [Math]::Min($g, $b))
+                $d   = $max - $min
+                if ($d -eq 0) { return 0 }
+                $h = if ($max -eq $r) { 60 * (((($g - $b) / $d) % 6)) }
+                     elseif ($max -eq $g) { 60 * ((($b - $r) / $d) + 2) }
+                     else { 60 * ((($r - $g) / $d) + 4) }
+                if ($h -lt 0) { $h += 360 }
+                return [int][Math]::Round($h)
+            }
+
+            foreach ($name in $Script:Base16Schemes.Keys) {
+                $s = $Script:Base16Schemes[$name]
+
+                # Red wraps zero, so the band is expressed as two arcs. Wide
+                # enough to admit monokai's magenta-leaning #F92672 (338) and
+                # the several schemes sitting just under 360.
+                $hRed = Get-Hue $s.base08
+                ($hRed -le 25 -or $hRed -ge 330) | Should -BeTrue -Because (
+                    "$name base08 is hue $hRed; Danger must read as red, not orange")
+
+                # Lower bound 55 admits gruvbox's olive #B8BB26 (61), which is
+                # that theme's actual green rather than a mis-slotted yellow.
+                $hGreen = Get-Hue $s.base0B
+                ($hGreen -ge 55 -and $hGreen -le 170) | Should -BeTrue -Because (
+                    "$name base0B is hue $hGreen; Success must read as green, not blue")
+            }
+        }
+
+        It 'builds one palette per scheme, plus the hand-written default' {
+            $expected = @($Script:Base16Schemes.Keys) + 'default'
+            ($Script:ThemePalettes.Keys | Sort-Object) |
+                Should -Be ($expected | Sort-Object)
+        }
+
+        It 'documents SCA_THEME and its available names in the help screen' {
+            $out = Show-Help 6>&1 | Out-String
+            $out | Should -Match 'SCA_THEME'
+            $out | Should -Match 'material'
+            $out | Should -Match 'NO_COLOR'
+        }
+    }
+
+    Context 'Watch chrome (themed alt-screen background)' {
+        # A theme may paint the alternate screen. The chrome is background +
+        # base foreground, applied ONLY inside the watch frame, never to the
+        # scrollback output of list / save / usage.
+        BeforeEach {
+            $script:savedPalette = $Script:Palette
+            $script:sgrRegex     = "`e\[[0-9;]*m"
+        }
+        AfterEach {
+            $Script:Palette          = $script:savedPalette
+            $PSStyle.OutputRendering = 'PlainText'
+        }
+
+        It 'pairs Background with Foreground in every theme, or omits both' {
+            # Painting a background without pinning a foreground leaves a
+            # light-terminal user reading dark default text on a dark canvas.
+            foreach ($name in $Script:ThemePalettes.Keys) {
+                $t = $Script:ThemePalettes[$name]
+                $t.ContainsKey('Background') | Should -Be $t.ContainsKey('Foreground') -Because (
+                    "theme '$name' must declare Background and Foreground together")
+            }
+        }
+
+        It 'yields no chrome for a theme that declares no Background' {
+            $PSStyle.OutputRendering = 'Ansi'
+            $Script:Palette = Resolve-ThemePalette -Name 'default'
+            Get-WatchChrome | Should -BeNullOrEmpty
+        }
+
+        It 'yields background and foreground for a theme that declares them' {
+            $PSStyle.OutputRendering = 'Ansi'
+            $Script:Palette = Resolve-ThemePalette -Name 'material'
+            $chrome = Get-WatchChrome
+            $chrome | Should -Match "`e\[48;2;38;50;56m"    # base00 background
+            $chrome | Should -Match "`e\[38;2;238;255;255m" # base05 foreground
+        }
+
+        It 'yields no chrome under PlainText even for a themed palette' {
+            # The load-bearing guard. Chrome reaches the terminal through
+            # Write-VTSequence -> [Console]::Out.Write, which bypasses the
+            # StringDecorated filter that gives every Write-Color path
+            # no-color mode for free. Drop this check and -NoColor / NO_COLOR
+            # would paint a background anyway.
+            $PSStyle.OutputRendering = 'PlainText'
+            $Script:Palette = Resolve-ThemePalette -Name 'material'
+            Get-WatchChrome | Should -BeNullOrEmpty
+        }
+
+        It 'builds the unthemed frame exactly as it did before chrome existed' {
+            # Regression pin for the default theme: an empty chrome must not
+            # perturb the sequence by so much as a byte.
+            $frame = "alpha`nbeta"
+            ConvertTo-WatchFrameSequence -FrameText $frame -Chrome '' |
+                Should -Be "`e[Halpha`e[K`nbeta`e[K`e[0J"
+        }
+
+        It 're-asserts chrome after every reset so a colored row cannot punch a hole in the canvas' {
+            # Write-Color ends each run with ESC[0m, which clears background
+            # as well as foreground. Unasserted, the canvas would break from
+            # that point to the end of every colored line.
+            $chrome = '<C>'
+            $frame  = "$($PSStyle.Foreground.BrightRed)hot$($PSStyle.Reset)tail"
+            $seq    = ConvertTo-WatchFrameSequence -FrameText $frame -Chrome $chrome
+            $seq | Should -Match "`e\[0m<C>tail"
+        }
+
+        It 'asserts chrome before every erase so the erases fill with the theme background' {
+            $chrome = '<C>'
+            $seq = ConvertTo-WatchFrameSequence -FrameText "one`ntwo" -Chrome $chrome
+            # Every ESC[K and the trailing ESC[0J must be preceded by chrome.
+            [regex]::Matches($seq, "`e\[K").Count | Should -Be 2
+            $seq | Should -Match "one<C>`e\[K"
+            $seq | Should -Match "two<C>`e\[K"
+            $seq | Should -Match "<C>`e\[0J$"
+            $seq | Should -Match "^`e\[H<C>"
+        }
+
+        It 'collapses repeated chrome so a 1 Hz repaint carries no redundant bytes' {
+            $chrome = '<C>'
+            $frame  = "$($PSStyle.Foreground.BrightRed)hot$($PSStyle.Reset)"
+            $seq    = ConvertTo-WatchFrameSequence -FrameText $frame -Chrome $chrome
+            $seq | Should -Not -Match '<C><C>'
+        }
+
+        It 'leaves frame layout byte-identical whether or not chrome is applied' {
+            # The same invariant the themed-foreground test pins, extended to
+            # the background: chrome is color, never geometry.
+            $frame = "$($PSStyle.Foreground.BrightRed)hot$($PSStyle.Reset) row`nplain row"
+            $with  = ConvertTo-WatchFrameSequence -FrameText $frame -Chrome (
+                $PSStyle.Background.FromRgb(0x263238) + $PSStyle.Foreground.FromRgb(0xEEFFFF))
+            $bare  = ConvertTo-WatchFrameSequence -FrameText $frame -Chrome ''
+            ($with -replace $script:sgrRegex, '') | Should -Be ($bare -replace $script:sgrRegex, '')
+        }
+
+    }
+
+    Context 'ConvertTo-ScaJsonString' {
         It 'escapes embedded double-quotes, backslashes, and control characters' {
             ConvertTo-ScaJsonString -Value 'a "b" \ c' | Should -Be '"a \"b\" \\ c"'
             ConvertTo-ScaJsonString -Value "line1`nline2`tend" | Should -Be '"line1\nline2\tend"'
@@ -2213,17 +2851,17 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Get-StatusColor (uncovered branches)' {
-        It 'returns DarkGray for the no-oauth label' {
-            (Get-StatusColor -Label 'no-oauth' -IsActive $false) | Should -Be 'DarkGray'
+        It 'returns Muted for the no-oauth label' {
+            (Get-StatusColor -Label 'no-oauth' -IsActive $false) | Should -Be 'Muted'
         }
 
-        It 'returns Yellow for the rate-limited label' {
-            (Get-StatusColor -Label 'rate-limited' -IsActive $false) | Should -Be 'Yellow'
+        It 'returns Warning for the rate-limited label' {
+            (Get-StatusColor -Label 'rate-limited' -IsActive $false) | Should -Be 'Warning'
         }
 
-        It 'returns Gray for unknown labels (default arm)' {
-            (Get-StatusColor -Label 'something-new' -IsActive $false) | Should -Be 'Gray'
-            (Get-StatusColor -Label ''             -IsActive $false) | Should -Be 'Gray'
+        It 'returns Neutral for unknown labels (default arm)' {
+            (Get-StatusColor -Label 'something-new' -IsActive $false) | Should -Be 'Neutral'
+            (Get-StatusColor -Label ''             -IsActive $false) | Should -Be 'Neutral'
         }
     }
 
@@ -2814,6 +3452,34 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'ConvertTo-UpdatedClaudeJson' {
+        # The transform reports "nothing to write" as $null, and its caller
+        # uses that to skip the write entirely. Skipping matters because every
+        # write is a read-modify-write race against Claude Code, which holds
+        # the lock and merges while sca does not: a no-op write is a chance to
+        # lose someone else's edit in exchange for nothing.
+
+        It 'returns null when every whitelisted field already holds the new value' {
+            # Spaced exactly as the substitution would emit it, so a
+            # byte-identical result really is a no-op rather than a reformat.
+            $raw = '{"numStartups":1,"oauthAccount":{"emailAddress": "a@b.com"}}'
+            $oa  = [pscustomobject]@{ emailAddress = 'a@b.com' }
+
+            ConvertTo-UpdatedClaudeJson -Raw $raw -OAuthAccount $oa | Should -BeNullOrEmpty
+        }
+
+        It 'returns the rewritten document when a field actually changes' {
+            $raw = '{"numStartups":1,"oauthAccount":{"emailAddress": "a@b.com"}}'
+            $oa  = [pscustomobject]@{ emailAddress = 'c@d.com' }
+
+            $updated = ConvertTo-UpdatedClaudeJson -Raw $raw -OAuthAccount $oa
+
+            $updated | Should -Match 'c@d\.com'
+            # Everything outside the block is carried through untouched.
+            $updated | Should -Match '"numStartups":1'
+        }
+    }
+
     # The contending writer is Claude Code, which holds ~/.claude.json.lock and
     # merges under it while sca does not, so only sca's side can lose a write.
     # Driven by mocking the transform and letting the mock move the file
@@ -3086,6 +3752,41 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'propagation to \.credentials\.json failed'
             $out | Should -Match 'propagation denied'
         }
+
+        # The mirror is blocked only by a PROVEN divergence. A file that cannot
+        # be hashed proves nothing, and treating it as divergence would strand
+        # the active slot's refreshed tokens in the slot file while
+        # .credentials.json kept serving the expired ones.
+        It 'still mirrors when the live credentials file cannot be hashed' {
+            $credDir = Join-Path $script:SandboxHome '.claude'
+            New-Item -ItemType Directory -Path $credDir -Force | Out-Null
+            $credFile = Join-Path $credDir '.credentials.json'
+
+            $slot = New-SlotPair -CredDir $credDir -Name 'active' -Email 'a@b.com' -Content (@{
+                claudeAiOauth = @{
+                    accessToken  = 'OLD'
+                    refreshToken = 'RT'
+                    expiresAt    = [DateTimeOffset]::UtcNow.AddHours(-1).ToUnixTimeMilliseconds()
+                }
+            } | ConvertTo-Json -Compress)
+            Copy-Item -LiteralPath $slot -Destination $credFile -Force
+            Update-ScaState -ActiveSlot 'active' -LastSyncHash 'A_HASH_THAT_DIFFERS' | Out-Null
+
+            Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://platform.claude.com/v1/oauth/token' } -MockWith {
+                return [pscustomobject]@{ access_token = 'NEW'; refresh_token = 'NEW-RT'; expires_in = 3600 }
+            }
+            # Only the live-file hash fails; the -Bytes form the mirror uses
+            # afterwards must still work.
+            Mock Get-SHA256Hex -ParameterFilter { $Path -eq $credFile } -MockWith {
+                throw [System.IO.IOException]::new('handle went away')
+            }
+
+            $out = Update-SlotTokens -SlotPath $slot 6>&1 | Out-String
+
+            $out | Should -Not -Match 'left alone rather than overwritten'
+            (Get-Content -LiteralPath $credFile -Raw | ConvertFrom-Json).claudeAiOauth.accessToken |
+                Should -Be 'NEW'
+        }
     }
 
     Context 'Update-SlotTokens (429 retry behavior)' {
@@ -3306,23 +4007,23 @@ Describe 'switch_claude_account' {
         # Common.ps1 forces OutputRendering=PlainText so the SGR codes
         # Write-Color emits are stripped by PowerShell's host filter
         # before we see them. We can still verify the function does not
-        # throw on each color name (covers the switch arms) and that
+        # throw on each role (covers the switch arms) and that
         # NoNewline is honored.
 
-        It 'emits without throwing for every named color (covers BrightCyan branch)' {
-            foreach ($c in 'Yellow','DarkYellow','Green','Red','Cyan','Gray','DarkGray') {
+        It 'emits without throwing for every documented role' {
+            foreach ($c in 'Heading','Warning','Success','Danger','Muted','Neutral') {
                 { Write-Color "test" $c 6>$null } | Should -Not -Throw
             }
         }
 
-        It 'tolerates an unknown color name via the default branch' {
-            { Write-Color "test" 'not-a-color' 6>$null } | Should -Not -Throw
+        It 'tolerates an unknown role via the default branch' {
+            { Write-Color "test" 'not-a-role' 6>$null } | Should -Not -Throw
         }
 
         It '-NoNewline switch is honored (single Write-Host call without a newline)' {
             # Capture stream 6 and verify the emitted line carries the
             # message text. PlainText stripping leaves the text intact.
-            $out = Write-Color 'sentinel-no-newline' 'Cyan' -NoNewline 6>&1 | Out-String
+            $out = Write-Color 'sentinel-no-newline' 'Neutral' -NoNewline 6>&1 | Out-String
             $out | Should -Match 'sentinel-no-newline'
         }
     }
@@ -3672,6 +4373,79 @@ Describe 'switch_claude_account' {
 
         It 'defaults to the script-scope directory, which the sandbox always resolves' {
             { Assert-CredentialDir } | Should -Not -Throw
+        }
+    }
+
+    Context 'Credential paths with no resolvable home' {
+        # Every derived path stays $null when neither CLAUDE_CONFIG_DIR nor the
+        # platform's home variable resolves, so `sca help` and `sca -Version`
+        # still run in a container or a systemd unit started without one.
+        # Join-Path's binder rejects a null base, so without the guards these
+        # assignments would abort at load with "Cannot bind argument to
+        # parameter 'Path'" before either command could name the variable to
+        # set.
+        #
+        # These bind at load, so the only way to drive them is to load the
+        # script again under a blanked environment, in-process. $HOME is
+        # ReadOnly rather than Constant, so -Force can blank it; it is also
+        # AllScope, which is why the restore is doubled below.
+
+        BeforeEach {
+            $script:SavedHomeVariable = $HOME
+            $script:SavedUserProfile  = $env:USERPROFILE
+            $script:SavedHomeEnv      = $env:HOME
+        }
+
+        AfterEach {
+            # Paired with each It's own finally. A failure between the blanking
+            # and the restore would otherwise point every later test in the run
+            # at a home directory that does not exist.
+            Set-Variable -Name HOME -Value $script:SavedHomeVariable -Force -Scope Global
+            $env:USERPROFILE = $script:SavedUserProfile
+            $env:HOME        = $script:SavedHomeEnv
+        }
+
+        It 'leaves every derived path null instead of throwing at load' {
+            try {
+                $env:USERPROFILE       = ''
+                $env:HOME              = ''
+                $env:CLAUDE_CONFIG_DIR = $null
+                Set-Variable -Name HOME -Value '' -Force -Scope Global
+
+                { . $script:ScriptPath } | Should -Not -Throw
+                . $script:ScriptPath
+
+                $CredDir        | Should -BeNullOrEmpty
+                $CredFile       | Should -BeNullOrEmpty
+                $StateFile      | Should -BeNullOrEmpty
+                $ClaudeJsonPath | Should -BeNullOrEmpty
+            }
+            finally {
+                Set-Variable -Name HOME -Value $script:SavedHomeVariable -Force -Scope Global
+                $env:USERPROFILE = $script:SavedUserProfile
+                $env:HOME        = $script:SavedHomeEnv
+            }
+        }
+
+        # The refusal that stands in for the load-time throw. Assert-CredentialDir
+        # defaults to the script-scope $CredDir, which the reload above made
+        # null, so this is the production call path rather than an argument.
+        It 'refuses the actions that need a directory, naming the variables to set' {
+            try {
+                $env:USERPROFILE       = ''
+                $env:HOME              = ''
+                $env:CLAUDE_CONFIG_DIR = $null
+                Set-Variable -Name HOME -Value '' -Force -Scope Global
+
+                . $script:ScriptPath
+
+                { Assert-CredentialDir } | Should -Throw -ExpectedMessage '*CLAUDE_CONFIG_DIR*'
+            }
+            finally {
+                Set-Variable -Name HOME -Value $script:SavedHomeVariable -Force -Scope Global
+                $env:USERPROFILE = $script:SavedUserProfile
+                $env:HOME        = $script:SavedHomeEnv
+            }
         }
     }
 

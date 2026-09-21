@@ -258,6 +258,132 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Invoke-SaveAction (rollback diagnostics)' {
+        # The snapshot and restore steps are best-effort by design: a stale
+        # file the user is explicitly overwriting must not be able to refuse
+        # the save, and one failed restore must not abort the others. What
+        # that costs is silence, so each failure prints a line naming the path
+        # it gave up on. These cases drive the four warnings.
+
+        # A slot file that cannot be read is snapshotted as non-restorable.
+        # The re-save carries a different email, so the write lands on a new
+        # path and the unreadable file is only ever a rollback source.
+        It 'warns and proceeds when a pre-existing slot file cannot be snapshotted' -Skip:(-not $IsWindows) {
+            $oldSlot = Join-Path $script:CredDirPath '.credentials.work(old@example.com).json'
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'old@example.com' -Content 'OLD' | Out-Null
+            Set-Content -LiteralPath $script:CredFilePath -Value 'NEW' -NoNewline
+
+            # FileShare::None is the only portable way to make ReadAllBytes
+            # fail on a file that exists and is enumerable. POSIX has no
+            # mandatory locking, hence the Unix twin below.
+            $stream = [System.IO.File]::Open($oldSlot, 'Open', 'Read', 'None')
+            try {
+                $out = (Invoke-SaveAction -Name 'work' 6>&1 | Out-String)
+            }
+            finally { $stream.Dispose() }
+
+            $out | Should -Match '\[Save\] WARNING: could not snapshot .*old@example\.com.*rollback for this path will be skipped'
+            Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.work(alice@example.com).json') | Should -BeTrue
+        }
+
+        It 'warns and proceeds when a pre-existing slot file cannot be snapshotted (unreadable mode)' -Skip:$IsWindows {
+            $oldSlot = Join-Path $script:CredDirPath '.credentials.work(old@example.com).json'
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'old@example.com' -Content 'OLD' | Out-Null
+            Set-Content -LiteralPath $script:CredFilePath -Value 'NEW' -NoNewline
+
+            # Mode 000 denies the snapshot read but not the unlink, which the
+            # parent directory's permissions govern, so the save that this
+            # drives to a warning then deletes the path as an obsolete sibling.
+            # The restore is for the case where it survives; the Windows twin
+            # needs no such guard because FileShare::None blocks the delete too.
+            [System.IO.File]::SetUnixFileMode($oldSlot, [System.IO.UnixFileMode]::None)
+            try {
+                $out = (Invoke-SaveAction -Name 'work' 6>&1 | Out-String)
+            }
+            finally {
+                if (Test-Path -LiteralPath $oldSlot) {
+                    [System.IO.File]::SetUnixFileMode($oldSlot, [System.IO.UnixFileMode]'UserRead, UserWrite')
+                }
+            }
+
+            $out | Should -Match '\[Save\] WARNING: could not snapshot .*old@example\.com.*rollback for this path will be skipped'
+            Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.work(alice@example.com).json') | Should -BeTrue
+        }
+
+        # The sidecar is snapshotted separately from its tokens file, so it
+        # has its own warning and its own way to fail.
+        It 'warns and proceeds when a pre-existing sidecar cannot be snapshotted' -Skip:(-not $IsWindows) {
+            $oldSidecar = Join-Path $script:CredDirPath '.credentials.work(old@example.com).account.json'
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'old@example.com' -Content 'OLD' | Out-Null
+            Set-Content -LiteralPath $script:CredFilePath -Value 'NEW' -NoNewline
+
+            $stream = [System.IO.File]::Open($oldSidecar, 'Open', 'Read', 'None')
+            try {
+                $out = (Invoke-SaveAction -Name 'work' 6>&1 | Out-String)
+            }
+            finally { $stream.Dispose() }
+
+            $out | Should -Match '\[Save\] WARNING: could not snapshot .*account\.json.*rollback for this path will be skipped'
+        }
+
+        It 'warns and proceeds when a pre-existing sidecar cannot be snapshotted (unreadable mode)' -Skip:$IsWindows {
+            $oldSidecar = Join-Path $script:CredDirPath '.credentials.work(old@example.com).account.json'
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'old@example.com' -Content 'OLD' | Out-Null
+            Set-Content -LiteralPath $script:CredFilePath -Value 'NEW' -NoNewline
+
+            [System.IO.File]::SetUnixFileMode($oldSidecar, [System.IO.UnixFileMode]::None)
+            try {
+                $out = (Invoke-SaveAction -Name 'work' 6>&1 | Out-String)
+            }
+            finally {
+                # Guarded for the reason given on the slot-file twin above.
+                if (Test-Path -LiteralPath $oldSidecar) {
+                    [System.IO.File]::SetUnixFileMode($oldSidecar, [System.IO.UnixFileMode]'UserRead, UserWrite')
+                }
+            }
+
+            $out | Should -Match '\[Save\] WARNING: could not snapshot .*account\.json.*rollback for this path will be skipped'
+        }
+
+        # One mock covers both restore warnings: the same throw that fails the
+        # forward write fails each restore behind it. The action still reports
+        # the original failure, because a rollback that could not run does not
+        # change what went wrong.
+        It 'warns per path when the rollback writes themselves fail' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'old@example.com' -Content 'OLD' | Out-Null
+            Set-Content -LiteralPath $script:CredFilePath -Value 'NEW' -NoNewline
+
+            Mock Set-CredentialFileAtomic -MockWith { throw [System.Exception]::new('device not ready') }
+
+            # Stream 6 goes to a file rather than the pipeline: the call throws,
+            # and a terminated pipeline yields nothing to Out-String.
+            $log = Join-Path $TestDrive 'save-rollback.log'
+            $thrown = $null
+            try { Invoke-SaveAction -Name 'work' 6> $log } catch { $thrown = $_ }
+            $out = Get-Content -LiteralPath $log -Raw
+
+            $thrown | Should -Not -BeNullOrEmpty
+            $thrown.Exception.Message | Should -BeLike '*Save failed for slot*previous slot state*'
+            $out | Should -Match '\[Save\] WARNING: could not restore .*work\(old@example\.com\)\.json'
+            $out | Should -Match '\[Save\] WARNING: could not restore .*work\(old@example\.com\)\.account\.json'
+        }
+
+        # Get-SlotProfile reports a status for every outcome but an Error only
+        # for some; the refusal has to name the status when that is all there
+        # is, rather than interpolating an empty string into the parentheses.
+        It 'names the profile status when the failed probe carried no error text' {
+            Remove-Item -LiteralPath $ClaudeJsonPath -Force -ErrorAction SilentlyContinue
+            Set-Content -LiteralPath $script:CredFilePath -Value '{"claudeAiOauth":{"accessToken":"sk-ant-oat-x"}}' -NoNewline
+
+            Mock Get-SlotProfile -MockWith {
+                [pscustomobject]@{ Status = 'expired'; Email = $null; AccountUuid = $null; Error = $null }
+            }
+
+            { Invoke-SaveAction -Name 'work' 6>$null } |
+                Should -Throw -ExpectedMessage '*/api/oauth/profile failed (expired)*'
+        }
+    }
+
     Context 'Invoke-SaveAction (state file)' {
         It 'updates state.active_slot to the saved slot' {
             Set-Content -LiteralPath $script:CredFilePath -Value 'SAL' -NoNewline

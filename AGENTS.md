@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file is the canonical agent-instructions source for this repository, read natively by OpenCode and loaded by Claude Code through the `CLAUDE.md` import shim. Single-file PowerShell tool: core logic lives in `switch_claude_account.ps1`; tests live in `tests/` and use Pester 5. It carries the always-on rules as one invariant per area; the contracts behind them are the documents under `docs/`, read on demand through *Reference* at the end.
+This file is the canonical agent-instructions source for this repository, read natively by both OpenCode and Claude Code (2.1.277+). Single-file PowerShell tool: core logic lives in `switch_claude_account.ps1`; tests live in `tests/` and use Pester 5. It carries the always-on rules as one invariant per area; the contracts behind them are the documents under `docs/`, read on demand through *Reference* at the end.
 
 ## Security Rules
 
@@ -40,23 +40,24 @@ The `usage` action and the identity-fallback path depend on constants extracted 
 
 ## Platform gotchas
 
-- **Hot-swapping a live client is supported.** `switch` and `monitor` run with Claude Code open; `save`, `warmup` and `monitor -KeepWarm` refuse. `Test-ClaudeRunning` owns the evidence and the exceptions.
+- **Hot-swapping a live client is supported.** Every action but `save` runs with Claude Code open, the warm round-robin included; `save` alone refuses. `Test-ClaudeRunning` owns the evidence and that one exception.
 - **POSIX has no mandatory locking**, so a share-mode test is `-Skip:(-not $IsWindows)` and pairs with a Unix test asserting the inode property instead.
 - **`Get-SafeName` is Windows-strict on every platform**, and every credential-file operation also passes `-LiteralPath` as defense in depth.
 - **Guard every `System.Console` call.** `[Console]::CursorVisible` is Windows-only to read and throws off an attached console to write; a failed capture stays `$null` so the restore is skipped rather than defaulted to a wrong value.
+- **`Write-Color` takes a role, never a color**, one of `Heading` / `Warning` / `Success` / `Danger` / `Muted` / `Neutral`; `$env:SCA_THEME` picks the palette they render through. A theme's background is alt-screen chrome, never a seventh role, and truecolor is never probed for.
 - The reasoning for each of these, and token expiry, are `docs/architecture.md` → *Platform behavior*.
 
 ## Testing
 
 ```powershell
-pwsh -NoProfile -File tests/Invoke-Tests.ps1
+pwsh -NoProfile -File tests/Invoke-Tests.ps1; "EXIT=$LASTEXITCODE"
 ```
 
-Coverage on `switch_claude_account.ps1` runs by default behind a **90% gate**; `-SkipCoverage` for the fastest local loop. One file per action at `tests/Invoke-<Action>Action.Tests.ps1`, every outer `Describe` named `'switch_claude_account'`, and `tests/Common.ps1` dot-sourced from each `BeforeEach` to sandbox both home variables, `CLAUDE_CONFIG_DIR` and `$PROFILE.CurrentUserAllHosts` into `$TestDrive`. The filter recipes, the direct-call pattern, the output-capture rule and the complexity diagnostic are `docs/testing.md`.
+The exit code is the verdict, so never narrow the run to find one: a filter that fits the output to a terminal drops the summary and costs a second full run. Coverage on `switch_claude_account.ps1` runs by default behind a **97% gate**, measured on one OS, so 100% is unreachable by construction and the residue is `docs/testing.md` → *The ceiling*; `-SkipCoverage` for the fastest local loop. One file per action at `tests/Invoke-<Action>Action.Tests.ps1`, every outer `Describe` named `'switch_claude_account'`, and `tests/Common.ps1` dot-sourced from each `BeforeEach` to sandbox both home variables, `CLAUDE_CONFIG_DIR` and `$PROFILE.CurrentUserAllHosts` into `$TestDrive`. The filter recipes, the direct-call pattern, the output-capture rule, reading the result and the complexity diagnostic are `docs/testing.md`.
 
 ## README image regeneration
 
-`pwsh -NoProfile -File tools/Render-ReadmeImages.ps1` re-renders the four SVGs in `docs/images/` via `charmbracelet/freeze`. Re-run when a README example number changes, or when a `Write-Color` / `Get-StatusColor` / `Get-AggregateBarColor` mapping changes. That script's header owns the palette, the truecolor rationale and the README `width` contract.
+`pwsh -NoProfile -File tools/Render-ReadmeImages.ps1` re-renders every SVG in `docs/images/` via `charmbracelet/freeze`: four README scenes plus one `theme-<name>.svg` per selectable theme, which is every entry in `$Script:Base16Schemes`, read by dot-sourcing the script, and `default` besides. Re-run when a README example number changes, when a `Write-Color` / `Get-StatusColor` / `Get-AggregateBarColor` mapping changes, or when a theme is added; a new theme's image appears on its own, but its heading and alt text in `docs/themes.md` are hand-maintained. A theme panel takes its canvas from freeze's `--background`, not an SGR behind each row, so the color reaches the window padding too. Every image embeds its font and must: freeze emits no per-glyph positions, so a substituted face moves the text off the geometry and the usage bars stop filling their cells. That script's header owns the palette, the font and truecolor rationale, and the README `width` contract.
 
 ## Default Change Workflow
 
@@ -68,7 +69,7 @@ Comments explain **why**, not **what**. Default to no comment; prefer a clearer 
 
 ## Scratch files
 
-Ad-hoc agent artifacts (screenshots, diffs, scratch scripts, traces) go under `.tmp/sessions/<session-id>/`. `.tmp/` is gitignored. Never write scratch files to `.claude/`, the repo root, or `tests/`.
+Every ad-hoc artifact of an agent session (screenshots, diffs, scratch scripts, traces: anything not meant to be committed) goes under `.tmp/sessions/<session-id>/` at the repo root, `<session-id>` per rule 3 in *Multi-Agent Working Tree Discipline*; `.tmp/` is gitignored. Nowhere else: not `.claude/`, not the repo root, not `tests/` or `tools/`, and not the operating-system temp directory under any name or helper (`$env:TEMP`, `os.tmpdir()`), which sits outside the workspace.
 
 ## Multi-Agent Working Tree Discipline
 
@@ -76,7 +77,7 @@ Multiple agents may share this directory; foreign uncommitted changes and untrac
 
 1. **Foreign changes off-limits.** Never run `git checkout --`, `restore --`, `reset --hard`, `clean`, `rm`, `mv`, or `git stash pop/apply` on a path another agent modified or an untracked file another agent created. "Commit and push" does NOT authorize destructive cleanup of foreign paths.
 2. **Preflight.** `git status --porcelain -u` at task start and again before `git commit`.
-3. **Session-scoped scratch.** Use `<session-id>` from your runtime's session metadata if exposed; otherwise mint `YYYYMMDD-HHMMSS-<random6>`.
+3. **Session-scoped scratch.** At task start take `SESSION_ID` from your session-start context (Claude Code) or the shell environment (OpenCode, where it is spent unread in a command and read once with `Write-Output $env:SESSION_ID` for a Write or Edit path; `.opencode/plugins/session-id-injector.js` has why it is not in the prompt), use it as `<session-id>` and write every scratch artifact into `.tmp/sessions/<session-id>/` under a readable name (`foreign-baseline.diff`). A resumed session gets the same id; unset, it collapses the path to `.tmp/sessions/`, so without one mint `YYYYMMDD-HHMMSS-<random6>` and lose resume support.
 4. **Stashes session-scoped.** Only with explicit pathspec and tagged message: `git stash push --message "session-<id>: <reason>" -- <files>`. Bare `git stash`, `-u`, `--all`, and pop/apply of foreign stashes are forbidden.
 5. **Edit and shell writes are mutually exclusive per file.** If a file was written outside the Edit tool, the cached content is stale. Re-Read before the next Edit. If Edit fails with "oldString not found", assume concurrent foreign write: surface to the user, do not guess.
 6. **Worktrees.** `.claude/worktrees/<branch-name>/` is gitignored. Cleanup with `git worktree remove <path>`; no `--force`.

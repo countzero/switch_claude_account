@@ -117,6 +117,55 @@ The binary also lowercases uuids on some of its own comparison paths, so two
 records of one account can differ in case alone. Compare them
 case-insensitively.
 
+### Token refresh is request-driven and cross-process locked
+
+Extracted from `claude.exe` **2.1.278** on 2026-09-20. This is the evidence
+behind the rule at `Test-ClaudeRunning` that a warm pass may spawn `claude -p`
+beside a live client, and behind the caveat at `Update-SlotTokens` that sca's
+own refresh is still a race.
+
+**No timer.** The refresh entry point is `Wxe({retryCount, force,
+entryAccessToken, credentials, storageV5, usesLoginOffFirstParty})`, wrapped as
+a boolean by `Ws(e)`. All of its call sites are request paths: 401 recovery,
+the bearer-attribution preflight (`Qvt`), the request-header build, and a poll
+authentication check. None of the binary's `setInterval` call sites reaches it;
+those drive remote-payload refresh, certificate rotation, MCP progress
+notifications, and a 30 s keychain re-check that only runs when **no** token
+was found. An idle client therefore never refreshes on its own, and the window
+in which it can collide with anything is the window in which it is serving a
+request.
+
+**Cross-process lock, with peer-adopt rather than a race.** The core is `eE`,
+and it guards the grant three times over:
+
+| Step                                    | Behavior                                                                                     |
+| --------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Pre-check                               | returns `not_needed` unless the access token is at or near expiry                            |
+| Re-read before locking                  | if `accessToken` changed since entry, returns `refreshed` and uses the peer's token           |
+| Lock acquire                            | `ELOCKED` retries 5 times at 1000 + random(1000) ms, then gives up as `lock_busy` / `lock_timeout` |
+| Re-read under the lock                  | same `accessToken` comparison again before the request goes out                              |
+| On refresh failure                      | re-reads once more; a moved token still returns `refreshed`                                  |
+
+So two Claude Code processes on one account cannot both rotate the refresh
+token: the loser adopts the winner's result. Anthropic instruments the path for
+exactly this, with `tengu_oauth_token_refresh_race_resolved` and
+`tengu_oauth_token_refresh_race_recovered`.
+
+sca is **not** a participant. `Update-SlotTokens` posts to the token endpoint
+without taking that lock, so an sca refresh can still rotate underneath a live
+client; only claude-versus-claude is serialized.
+
+Re-verify with the recipe above, then:
+
+```powershell
+$text | Select-String 'tengu_oauth_token_refresh_lock_acquiring'  # the lock exists
+$text | Select-String 'tengu_oauth_token_refresh_race_resolved'   # peer-adopt exists
+$text | Select-String 'grant_type:"refresh_token"'                # the refresh primitive
+```
+
+Staleness shows up as a missing marker: lose the lock markers and the warm pass
+needs its refusal back.
+
 ## Credential storage
 
 Extracted from `claude.exe` 2.1.274 with the recipe above.

@@ -72,7 +72,15 @@ Mock Invoke-RestMethod -ParameterFilter {
 # Default Test-ClaudeRunning mock: returns $false so save / switch don't
 # refuse to operate when no real claude.exe is in the test environment.
 # The few tests that exercise the running guard override this locally.
-Mock Test-ClaudeRunning -MockWith { $false }
+#
+# A mock cannot be lifted once set, and this one replaces the very function
+# whose body the Test-ClaudeRunning context needs to run. That context sets
+# $script:ScaKeepRealClaudeRunning before dot-sourcing this file and mocks
+# Get-Process instead; nothing else may, because every action that writes
+# would then consult the developer's real process list.
+if (-not $script:ScaKeepRealClaudeRunning) {
+    Mock Test-ClaudeRunning -MockWith { $false }
+}
 
 # Collapse production sleep tunables to zero so the suite does not
 # spend real seconds inside mocked 429 paths. The retry logic is still
@@ -80,9 +88,12 @@ Mock Test-ClaudeRunning -MockWith { $false }
 # because $Script:TokenRefreshRetryMax stays at its production value;
 # only the wall-clock wait between attempts goes to zero. Same trick
 # for $Script:WarmupSpacingMs so the warmup loop's per-slot 300 ms
-# pacing does not multiply across many-slot tests.
+# pacing does not multiply across many-slot tests, and for
+# $Script:WarmupLiveClientPauseSec, which would otherwise add 5 real
+# seconds to every test that lets Test-ClaudeRunning answer $true.
 $Script:TokenRefreshRetryDelayMs   = 0
 $Script:WarmupSpacingMs            = 0
+$Script:WarmupLiveClientPauseSec   = 0
 
 # --- Test fixtures --------------------------------------------------------
 

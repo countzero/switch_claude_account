@@ -5,7 +5,7 @@
 A zero-dependency PowerShell utility for Claude Code on Windows, Linux, and macOS that combines secure multi-account management with a live usage dashboard and automated limit-based rotation.
 
 <p align="center">
-  <img src="docs/images/monitor.svg" alt="sca monitor: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, a right-aligned '▶ switching slot at 95%' header indicator, and a '[Monitor] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
+  <img src="docs/images/monitor.svg" alt="sca monitor: pool-aggregate Session bar at 25% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, a right-aligned '▶ switching slot at 95%' header indicator, and a '[Monitor] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
 </p>
 
 ## Features
@@ -143,7 +143,7 @@ The output shows the 5-hour session limit (`Session` column, "Current session" i
 
 Decoding the output:
 
-- **Pool-aggregate bars**: sum utilization over `N × 100%` across every slot with numbers to show, whether read live or served from the cache after a failed read, so the bars never contradict the rows beneath them. Bar color: green &lt;50%, yellow ≥50%, red ≥90%.
+- **Pool-aggregate bars**: sum utilization over `N × 100%` across every slot with numbers to show, whether read live or served from the cache after a failed read. The `Session` bar reports the capacity you can still reach, so a slot at the 100% `Week` cap leaves it entirely, denominator included: that account serves nothing until its week resets, and its idle `Session` cell describes capacity nobody can spend. The `Week` bar keeps the same slot at its real 100%, because dropping it there would hide the exhaustion. Worth knowing: the `Session` bar therefore improves as slots fall out of the pool, and reads 100% once every slot still in that pool has spent its own session window. A week that has capped every slot reaches the same 100% by a second route: an empty pool is reported as spent rather than left blank. Bar color: green &lt;50%, yellow ≥50%, red ≥90%.
 - **Active marker (`*`)**: sourced from `~/.claude/.sca-state.json`; appears at the start of the row and inherits the row's color.
 - **`Account` column**: the OAuth email captured at save time. Shows `—` when the email equals the slot name (deduped filename), the actual email otherwise.
 - **`Session` / `Week` cells**: `<pct>% <delta>`. The delta is `(2h 11m)` under 24h with minute precision, `(102h)` at 24h+ with integer hours, or `—` when there is no data. A bucket whose window has already rolled also shows `—`: the percentage it carried describes a window the account has left, so it is dropped rather than shown as stale.
@@ -181,10 +181,10 @@ sca usage -Watch -NoColor         # strip ANSI color
 
 The terminal-tab title is updated on every poll so a backgrounded watch is glanceable from the taskbar / Alt-Tab:
 
-    22% | 62% | Switch Claude Account
+    18% | 42% | Switch Claude Account
 
 <p align="center">
-  <img src="docs/images/usage-watch.svg" alt="sca usage -Watch: pool-aggregate Session bar at 22% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer" width="720">
+  <img src="docs/images/usage-watch.svg" alt="sca usage -Watch: pool-aggregate Session bar at 25% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, and a [Watch] Last poll footer" width="720">
 </p>
 
 > [!NOTE]
@@ -202,7 +202,7 @@ sca monitor -KeepWarm                 # auto-rotate AND keep every slot warm for
 
 `sca monitor -KeepWarm` does more than the one-shot pass: at each poll it re-opens any slot whose 5h window has since closed, so a long session keeps every slot warm instead of letting them all expire ~5h after startup. (A 5h window can only be reopened *after* it closes, so a just-expired slot is re-warmed within one poll, not before.) A per-slot cooldown keeps a slot whose warm keeps failing from being retried every poll.
 
-Both `sca warmup` and `sca monitor -KeepWarm` refuse to operate while Claude Code is running, because both make *every* slot active in turn and a live session would be dragged across all of them ([details](#which-actions-still-need-claude-code-closed)). Both also require the `claude` CLI to be installed and logged in. A slot whose token refresh is temporarily rate-limited is reported and skipped, not retried. `-KeepWarm` is the typical companion to `monitor`: rotation needs every peer slot reporting real data to make good decisions, which keeping them warm guarantees.
+Both `sca warmup` and `sca monitor -KeepWarm` run with Claude Code open, and `sca warmup` says so when it finds it: the pass makes *every* slot active in turn, so a live session follows it across each account before landing back where it started, and a prompt sent meanwhile bills whichever slot is mounted ([details](#which-actions-still-need-claude-code-closed)). Both also require the `claude` CLI to be installed and logged in. A slot whose token refresh is temporarily rate-limited is reported and skipped, not retried. `-KeepWarm` is the typical companion to `monitor`: rotation needs every peer slot reporting real data to make good decisions, which keeping them warm guarantees.
 
 ### Auto-rotate on usage limit
 
@@ -221,7 +221,7 @@ Peer slots are walked in alphabetical wrap order (same direction as `sca switch`
 </p>
 
 > [!NOTE]
-> **Works with a live client, either one.** Rotation lands in `.credentials.json` and `~/.claude.json`, and both clients follow it without a restart: Claude Code from 2.1.274 on, and OpenCode via [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4**. Leave the app open while `sca monitor` runs. Adding `-KeepWarm` is the exception and still needs Claude Code closed, see [which actions](#which-actions-still-need-claude-code-closed).
+> **Works with a live client, either one.** Rotation lands in `.credentials.json` and `~/.claude.json`, and both clients follow it without a restart: Claude Code from 2.1.274 on, and OpenCode via [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4**. Leave the app open while `sca monitor` runs, with or without `-KeepWarm`; see [which actions](#which-actions-still-need-claude-code-closed) for the only one that still needs it closed.
 
 ### Install / uninstall alias
 
@@ -279,12 +279,12 @@ Code and run 'sca save work' to capture them by hand.
 | `switch`, `usage`, `list`, `remove` | fine | `switch` writes one destination and Claude Code follows it |
 | `monitor` | fine | rotation is one destination at a time, same as `switch` |
 | `save` | **refuses** | it pairs tokens from `.credentials.json` with an identity from `~/.claude.json`, and a `/login` updates those two separately. Catching that window writes a sidecar naming the wrong account, and nothing later corrects it |
-| `warmup`, `monitor -KeepWarm` | **refuses** | both make *every* slot active in turn, so a live session would be dragged across every account and bill whichever one was mounted when you hit enter |
+| `warmup`, `monitor -KeepWarm` | fine, with a warning | both make *every* slot active in turn and a live session follows, so a prompt sent mid-pass bills whichever slot is mounted. No login is at risk: Claude Code serializes token refreshes across its own processes and adopts a peer's result rather than racing it, so the `claude -p` a warm pass spawns cannot rotate the token out from under your session |
 
 Slot-file updates done by `sca usage`'s token refresh use `MoveFileEx` with retry, so those survive an open Claude Code on `.credentials.json` itself.
 
 > [!IMPORTANT]
-> **The guard does not catch every install shape.** Claude Code installed from npm (`@anthropic-ai/claude-code`) runs as a `node` process rather than one named `claude`, so `sca` has to recognize it from the process command line instead. That works on Linux. It does **not** work on Windows, where reading command lines costs ~53 s and a guard on every write cannot spend that, nor on macOS, where PowerShell does not expose process command lines at all. On those two platforms, close Claude Code yourself before `sca save` and `sca warmup` rather than relying on the refusal. Claude Code from the native installer is detected on all three.
+> **The guard does not catch every install shape.** Claude Code installed from npm (`@anthropic-ai/claude-code`) runs as a `node` process rather than one named `claude`, so `sca` has to recognize it from the process command line instead. That works on Linux. It does **not** work on Windows, where reading command lines costs ~53 s and a guard on every write cannot spend that, nor on macOS, where PowerShell does not expose process command lines at all. On those two platforms, close Claude Code yourself before `sca save` rather than relying on the refusal. Claude Code from the native installer is detected on all three.
 
 ## Platform Notes
 
@@ -317,6 +317,29 @@ These rules are Windows-strict on every platform by design, so a slot name yield
 - `foo(bar)` → `foo_bar_`
 - `foo.` → `foo`
 - `CON` → error (reserved device name)
+
+### Theming
+By default `sca` colors its output with the standard ANSI colors, which means your terminal decides what they actually look like: the output already matches whatever color scheme you have set, on a light background as well as a dark one.
+
+If you would rather pin an exact palette, set `SCA_THEME` to one of `claude`, `dracula`, `everforest`, `flexoki`, `gruvbox`, `kanagawa`, `material`, `monokai`, `nord` or `onedark`:
+
+```powershell
+$env:SCA_THEME = 'material'      # PowerShell; add to $PROFILE to make it stick
+```
+
+```bash
+export SCA_THEME=material        # bash / zsh
+```
+
+**[docs/themes.md](docs/themes.md) shows every theme**, each rendered as the whole `sca monitor` view so what you see is what you get, with its own heading to link to: [claude](docs/themes.md#claude), [dracula](docs/themes.md#dracula), [everforest](docs/themes.md#everforest), [flexoki](docs/themes.md#flexoki), [gruvbox](docs/themes.md#gruvbox), [kanagawa](docs/themes.md#kanagawa), [material](docs/themes.md#material), [monokai](docs/themes.md#monokai), [nord](docs/themes.md#nord), [onedark](docs/themes.md#onedark).
+
+Nine are the [base16](https://github.com/tinted-theming/schemes) scheme of the same name, so a palette you know from your editor reads the same here; `claude` is an original one keyed to the interface this tool manages logins for.
+
+To turn color off entirely, use `-NoColor` or the standard [`NO_COLOR`](https://no-color.org) variable. Both outrank `SCA_THEME`, since a theme says *which* colors to use, not *whether* to use any:
+
+```bash
+export NO_COLOR=1
+```
 
 ### Profile encoding
 `sca install` and `sca uninstall` preserve your PowerShell profile's existing encoding (UTF-8 with or without BOM, UTF-16 LE/BE). ANSI-encoded profiles are treated as UTF-8 no-BOM (indistinguishable without a BOM).

@@ -32,30 +32,129 @@ Describe 'switch_claude_account' {
             [pscustomobject]@{ Name = 'claude'; Source = 'claude'; CommandType = 'Application' }
         }
 
-        # Stub the orchestration's side effects so no real claude spawns and
-        # no real HTTP fires; each slot resolves to a healthy 'ok' row.
-        Mock Invoke-SlotSwap      -MockWith { }
-        Mock Invoke-Reconcile     -MockWith { New-ReconcileResult }
-        Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'ok' } }
-        Mock Get-SlotUsage        -MockWith {
-            [pscustomobject]@{
-                Status = 'ok'
-                Data   = [pscustomobject]@{
-                    five_hour = [pscustomobject]@{ utilization = 3.0; resets_at = $null }
-                    seven_day = [pscustomobject]@{ utilization = 9.0; resets_at = $null }
-                }
-                Error            = $null
-                IsCachedFallback = $false
-            }
-        }
     }
 
     Context 'Invoke-WarmupAction' {
-        It 'refuses when Claude Code is running' {
+        BeforeEach {
+            # Stub the orchestration's side effects so no real claude spawns and
+            # no real HTTP fires; each slot resolves to a healthy 'ok' row.
+            # Scoped to this context rather than the file, because the
+            # activator-internals context below needs the real
+            # Invoke-SlotActivator and a mock cannot be lifted once set.
+            Mock Invoke-SlotSwap      -MockWith { }
+            Mock Invoke-Reconcile     -MockWith { New-ReconcileResult }
+            Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'ok' } }
+            Mock Get-SlotUsage        -MockWith {
+                [pscustomobject]@{
+                    Status = 'ok'
+                    Data   = [pscustomobject]@{
+                        five_hour = [pscustomobject]@{ utilization = 3.0; resets_at = $null }
+                        seven_day = [pscustomobject]@{ utilization = 9.0; resets_at = $null }
+                    }
+                    Error            = $null
+                    IsCachedFallback = $false
+                }
+            }
+        }
+
+        # No longer a refusal: claude serializes refreshes across its own
+        # processes, so the pass cannot cost a credential. It names the one cost
+        # that remains, a prompt sent mid-pass billing the mounted slot.
+        It 'warns but proceeds when Claude Code is running' {
             Mock Test-ClaudeRunning -MockWith { $true }
             New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null
 
-            { Invoke-WarmupAction -Name '' 6>$null } | Should -Throw -ExpectedMessage '*Claude Code is running*'
+            $out = Invoke-WarmupAction -Name '' 6>&1 | Out-String
+
+            $out | Should -Match 'Claude Code is running'
+            $out | Should -Match 'bills whichever slot is mounted'
+            Should -Invoke Invoke-SlotActivator -Times 1 -Exactly
+        }
+
+        # The warning alone is not a decision: the first billable `claude -p`
+        # follows it by milliseconds, so a user reads it with the round-robin
+        # already under way. The pause is what makes the Ctrl-C it implies
+        # reachable. Common.ps1 zeroes the constant for the rest of the suite.
+        It 'pauses before the first activation when Claude Code is running' {
+            Mock Test-ClaudeRunning -MockWith { $true }
+            Mock Start-Sleep -MockWith { }
+            $Script:WarmupLiveClientPauseSec = 5
+            New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null
+
+            $out = Invoke-WarmupAction -Name '' 6>&1 | Out-String
+
+            $out | Should -Match 'Ctrl-C to abort'
+            Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 5 }
+        }
+
+        It 'does not pause when no Claude Code is running' {
+            Mock Start-Sleep -MockWith { }
+            $Script:WarmupLiveClientPauseSec = 5
+            New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null
+
+            Invoke-WarmupAction -Name '' 6>$null
+
+            Should -Invoke Start-Sleep -Times 0 -Exactly
+        }
+
+        # The notice describes what the round-robin will cost and the pause
+        # offers five seconds to call it off. Neither has anything to say when
+        # the pass is about to report that no slot matched: there is no cost
+        # coming and nothing to abort.
+        It 'says nothing about a live client when <Case>' -ForEach @(
+            @{ Case = 'no slots are saved';   Slot = $null; Filter = '' }
+            @{ Case = '-Name matches nothing'; Slot = 'a';   Filter = 'no-such-slot' }
+        ) {
+            Mock Test-ClaudeRunning -MockWith { $true }
+            Mock Start-Sleep -MockWith { }
+            $Script:WarmupLiveClientPauseSec = 5
+            if ($Slot) {
+                New-SlotPair -CredDir $script:CredDirPath -Name $Slot -Email "$Slot@test.local" -Content '{}' | Out-Null
+            }
+
+            $out = Invoke-WarmupAction -Name $Filter 6>&1 | Out-String
+
+            $out | Should -Not -Match 'Claude Code is running'
+            $out | Should -Not -Match 'Ctrl-C to abort'
+            $out | Should -Match 'No slots'
+            Should -Invoke Start-Sleep -Times 0 -Exactly
+        }
+
+        # Get-SafeName advises when it changes the name. Resolving it once and
+        # reusing the result is what keeps that advisory from being printed by
+        # the preflight, by the pass, and by the no-slots message in turn.
+        It 'advises about a sanitized name exactly once' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null
+
+            $out = Invoke-WarmupAction -Name 'my missing' 6>&1 | Out-String
+
+            ([regex]::Matches($out, "Sanitized to: 'my_missing'")).Count | Should -Be 1
+        }
+
+        # The pass stops rather than overwrite bytes nothing captured, which
+        # leaves the user on a slot they did not choose. That is the one thing
+        # they have to read, so it precedes the table.
+        It 'prints the pass advisory ahead of the usage table' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null
+            Mock Invoke-WarmAllSlots -MockWith {
+                [pscustomobject]@{
+                    Results        = @(
+                        [pscustomobject]@{
+                            Name = 'a'; Email = 'a@test.local'; IsActive = $true
+                            Status = 'ok'; Data = $null; Error = $null
+                            IsCachedFallback = $false; HttpStatus = $null; FallbackReason = $null
+                        }
+                    )
+                    NoSlots        = $false
+                    HasRateLimited = $false
+                    Advisory       = "[Warmup] Stopped at 'a': nothing captured the credentials Claude Code left active."
+                }
+            }
+
+            $out = Invoke-WarmupAction -Name '' 6>&1 | Out-String
+
+            $out | Should -Match "Stopped at 'a'"
+            $out.IndexOf('Stopped at') | Should -BeLessThan $out.IndexOf('Plan usage')
         }
 
         It 'refuses when the claude CLI is not on PATH' {
@@ -105,6 +204,86 @@ Describe 'switch_claude_account' {
             Invoke-WarmupAction -Name 'a' 6>$null
 
             Should -Invoke Invoke-SlotActivator -Times 1 -Exactly
+        }
+
+        # "No slots saved" and "no slot by that name" are different problems
+        # with different fixes, and the advisory is the only place the
+        # difference is visible. The name is echoed through Get-SafeName so
+        # what is quoted back is the name actually looked for.
+        It 'names the filter when -Name matches nothing' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null
+
+            $out = Invoke-WarmupAction -Name 'my missing' 6>&1 | Out-String
+
+            $out | Should -Match "No slots matching 'my_missing' to activate"
+            Should -Invoke Invoke-SlotActivator -Times 0 -Exactly
+        }
+
+        # The pass spaces successive activations so a multi-slot warm does not
+        # arrive at the endpoint as a burst. Spacing is collapsed to 0 for the
+        # suite, so the only way to see the pacing is to put it back.
+        It 'pauses between slots but not after the last one' {
+            New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' -Content '{}' | Out-Null
+            New-SlotPair -CredDir $script:CredDirPath -Name 'b' -Email 'b@test.local' -Content '{}' | Out-Null
+            New-SlotPair -CredDir $script:CredDirPath -Name 'c' -Email 'c@test.local' -Content '{}' | Out-Null
+
+            $Script:WarmupSpacingMs = 1
+            Mock Start-Sleep -MockWith { }
+
+            Invoke-WarmupAction -Name '' 6>$null
+
+            # Three slots, two gaps.
+            Should -Invoke Start-Sleep -Times 2 -Exactly
+        }
+    }
+
+    Context 'Invoke-SlotActivator / Invoke-ClaudeActivatorProcess internals' {
+        # No Invoke-SlotActivator stub here: these cases are about that
+        # function's own classification and the child-process wrapper beneath
+        # it. Nothing spawns a real claude, because the wrapper is either
+        # mocked or driven through a mocked Start-Process.
+
+        # Kill can lose the race with a process that exits just after
+        # WaitForExit gave up. The answer is still "timed out": the caller
+        # needs a verdict about the activation, not about the cleanup.
+        It 'still reports a timeout when killing the hung process fails' {
+            Mock Start-Process -MockWith {
+                $p = [pscustomobject]@{ ExitCode = 0 }
+                $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { Param ($ms) return $false }
+                $p | Add-Member -MemberType ScriptMethod -Name Kill -Value {
+                    Param ($entireTree)
+                    throw [System.InvalidOperationException]::new('process has already exited')
+                }
+                return $p
+            }
+
+            $r = Invoke-ClaudeActivatorProcess -ClaudeArgs @('-p', 'Hi') -TimeoutSec 1
+
+            $r.TimedOut | Should -BeTrue
+            $r.ExitCode | Should -BeNullOrEmpty
+            $r.Stdout   | Should -Be ''
+        }
+
+        # claude's JSON envelope does not always carry a sentence. subtype is
+        # the last field with any signal in it, and without this arm such a
+        # failure rendered as the bare exit code.
+        It 'falls back to the JSON subtype when there is no result or error text' {
+            $slot = New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' `
+                -Content '{"claudeAiOauth":{"accessToken":"AT","refreshToken":"RT","expiresAt":9999999999999}}'
+
+            Mock Invoke-ClaudeActivatorProcess -MockWith {
+                [pscustomobject]@{
+                    TimedOut = $false
+                    ExitCode = 1
+                    Stdout   = '{"type":"result","is_error":true,"subtype":"error_during_execution"}'
+                    Stderr   = ''
+                }
+            }
+
+            $r = Invoke-SlotActivator -SlotPath $slot 6>$null
+
+            $r.Status | Should -Not -Be 'ok'
+            $r.Error  | Should -Match 'error_during_execution'
         }
     }
 

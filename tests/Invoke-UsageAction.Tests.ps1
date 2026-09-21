@@ -1137,6 +1137,19 @@ Describe 'switch_claude_account' {
             ($out.IndexOf('alpha')) | Should -BeLessThan ($out.IndexOf('HELLO-FROM-FOOTER'))
         }
 
+        # The no-slots frame is still a frame. In the watch loop it is the
+        # whole screen, so dropping the footer there would take the
+        # [Monitor] / [Watch] state lines with it and leave a user who has
+        # not saved a slot yet looking at one static sentence.
+        It 'Format-UsageFrame keeps the footer on the no-slots frame' {
+            $snap = [pscustomobject]@{ Results = @(); NoSlots = $true }
+
+            $out = Format-UsageFrame -Snapshot $snap -Footer 'HELLO-FROM-FOOTER' 6>&1 | Out-String
+
+            $out | Should -Match 'No slots saved yet'
+            $out | Should -Match 'HELLO-FROM-FOOTER'
+        }
+
         It 'Format-UsageTable renders bucket percentages for a rate-limited row that carries cached data' {
             # A rate-limited row served from the (possibly stale) cache
             # fallback carries last-known Data; its numbers must show so the
@@ -1410,6 +1423,21 @@ Describe 'switch_claude_account' {
             $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+100%\s*$'
         }
 
+        It 'drops a 7d-capped row from the Session bar but keeps it on the Week bar' {
+            # Keeps the rendered bars wired to Get-PoolMeanUtilization's
+            # exclusion, unit-tested on its own below. Row 'a' is at the
+            # weekly cap, so Session = 20/100 = 20% over row 'b' alone while
+            # Week = (100 + 0)/200 = 50% still counts both. One fixture, both
+            # directions of the rule.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil  0 -SevenUtil 100)
+                (New-OkRow -Name 'b' -FiveUtil 20 -SevenUtil 0)
+            )
+            $out = Format-AggregateBars -Results $rows -TotalLineWidth 70 6>&1 | Out-String
+            $out | Should -Match '(?m)^\s+Session\s*\[.*\]\s+20%\s*$'
+            $out | Should -Match '(?m)^\s+Week\s*\[.*\]\s+50%\s*$'
+        }
+
         It 'each rendered bar line equals TotalLineWidth (fits to table edge)' {
             $rows = @( (New-OkRow -Name 'a' -FiveUtil 50 -SevenUtil 50) )
             $w    = 70
@@ -1606,6 +1634,88 @@ Describe 'switch_claude_account' {
             )
             Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 90
         }
+
+        # A slot at the weekly hard cap serves no prompt until the week
+        # resets, so it leaves the Session average entirely, denominator
+        # included: the number reports reachable capacity, and that slot's
+        # idle 5h reading describes capacity nobody can spend. These six pin
+        # the exclusion, its boundary, the all-capped floor, and the two
+        # directions the rule does NOT run in.
+
+        It 'drops a 7d-capped row from the Session average' {
+            # 5h = 20/1 = 20. Not 10 (which would keep row 'a' in the
+            # denominator at its idle 0%) and not 60 (which would score it
+            # 100 and answer a question about nominal rather than reachable
+            # capacity). The three candidate rules are distinguishable here.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil  0 -SevenUtil 100)
+                (New-OkRow -Name 'b' -FiveUtil 20 -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 20
+        }
+
+        It 'drops a 7d-capped row that carries no five_hour bucket at all' {
+            # The missing-bucket path: once the week is capped it makes no
+            # difference whether the 5h bucket reads 0 or is absent, because
+            # the row is gone from the average either way.
+            $rows = @(
+                (New-OkRow -Name 'a' -SevenUtil 100)
+                (New-OkRow -Name 'b' -FiveUtil 20 -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 20
+        }
+
+        It 'returns 100 when the week has capped every measurable row' {
+            # Nothing is reachable, so the pool is spent. Must not be $null:
+            # that blanks the bar and the title at the moment they matter
+            # most, and it is the one case where this average is allowed to
+            # disagree with the direction of travel described above.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 0 -SevenUtil 100)
+                (New-OkRow -Name 'b' -FiveUtil 0 -SevenUtil 100)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'five_hour' | Should -Be 100
+        }
+
+        It 'keeps a 7d-capped row in the Week average at its own number' {
+            # 7d = (100 + 20)/2 = 60, NOT 20. Excluding it here would hide
+            # weekly exhaustion, which is the signal the Week bar exists for
+            # and the reason the exclusion is confined to the Session bar.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 0 -SevenUtil 100)
+                (New-OkRow -Name 'b' -FiveUtil 0 -SevenUtil  20)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'seven_day' | Should -Be 60
+        }
+
+        It 'leaves the Week average alone for a 5h-capped row (the rule is one-way)' {
+            # 7d = (20 + 0)/2 = 10. A capped 5h window costs the week at most
+            # 5h of 168, so row 'a' keeps its 80% of weekly headroom and its
+            # place in the denominator. Inverse-axis check: a symmetric rule
+            # would drop or score it and fail here.
+            $rows = @(
+                (New-OkRow -Name 'a' -FiveUtil 100 -SevenUtil 20)
+                (New-OkRow -Name 'b' -FiveUtil 0   -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $rows -BucketKey 'seven_day' | Should -Be 10
+        }
+
+        It 'excludes at UtilLimitPct (100) exactly, not one point below' {
+            # 99% of a week still leaves reachable session capacity, so the
+            # exclusion must not creep down into the 'near limit' tier.
+            # near: (0 + 40)/2 = 20, both rows counted.
+            # at:   40/1 = 40, row 'a' gone.
+            $near = @(
+                (New-OkRow -Name 'a' -FiveUtil  0 -SevenUtil 99)
+                (New-OkRow -Name 'b' -FiveUtil 40 -SevenUtil 0)
+            )
+            $at = @(
+                (New-OkRow -Name 'a' -FiveUtil  0 -SevenUtil 100)
+                (New-OkRow -Name 'b' -FiveUtil 40 -SevenUtil 0)
+            )
+            Get-PoolMeanUtilization -Results $near -BucketKey 'five_hour' | Should -Be 20
+            Get-PoolMeanUtilization -Results $at   -BucketKey 'five_hour' | Should -Be 40
+        }
     }
 
     Context 'Get-AggregateBarColor' {
@@ -1613,19 +1723,19 @@ Describe 'switch_claude_account' {
         # Runs the threshold boundaries explicitly so a future tweak of
         # $Script:AggregateRedPct / $Script:AggregateYellowPct shows up
         # here as a failing test rather than a silent visual change.
-        It 'returns Green below AggregateYellowPct (50%)' {
-            Get-AggregateBarColor -UsedPct  0 | Should -Be 'Green'
-            Get-AggregateBarColor -UsedPct 49 | Should -Be 'Green'
+        It 'returns Success below AggregateYellowPct (50%)' {
+            Get-AggregateBarColor -UsedPct  0 | Should -Be 'Success'
+            Get-AggregateBarColor -UsedPct 49 | Should -Be 'Success'
         }
 
-        It 'returns Yellow between AggregateYellowPct (50%) and AggregateRedPct-1 (89%)' {
-            Get-AggregateBarColor -UsedPct 50 | Should -Be 'Yellow'
-            Get-AggregateBarColor -UsedPct 89 | Should -Be 'Yellow'
+        It 'returns Warning between AggregateYellowPct (50%) and AggregateRedPct-1 (89%)' {
+            Get-AggregateBarColor -UsedPct 50 | Should -Be 'Warning'
+            Get-AggregateBarColor -UsedPct 89 | Should -Be 'Warning'
         }
 
-        It 'returns Red at and above AggregateRedPct (90%)' {
-            Get-AggregateBarColor -UsedPct  90 | Should -Be 'Red'
-            Get-AggregateBarColor -UsedPct 100 | Should -Be 'Red'
+        It 'returns Danger at and above AggregateRedPct (90%)' {
+            Get-AggregateBarColor -UsedPct  90 | Should -Be 'Danger'
+            Get-AggregateBarColor -UsedPct 100 | Should -Be 'Danger'
         }
     }
 
@@ -2584,6 +2694,28 @@ Describe 'switch_claude_account' {
             $Script:SlotUsageCache[$script:boSlot].ContainsKey('RateLimitedUntil') | Should -BeFalse
         }
 
+        # The backoff suppresses HTTP for RateLimitBackoffSec, but the entry it
+        # serves instead can be arbitrarily older than that. Past the age
+        # ceiling the suppression still applies, because the point is not to
+        # re-trip a hot limiter, but the numbers stop being shown: a row that
+        # renders em-dashes must not also claim to be showing last known usage.
+        It 'stops serving cached numbers past the age ceiling but still suppresses HTTP' {
+            $script:staleCount = 0
+            Mock Invoke-RestMethod -MockWith { $script:staleCount++; throw 'HTTP must not be called during backoff' }
+            $Script:SlotUsageCache[$script:boSlot] = @{
+                Data             = [pscustomobject]@{ five_hour = [pscustomobject]@{ utilization = 7.0 } }
+                Timestamp        = [DateTime]::UtcNow.AddMinutes(-($Script:UsageCacheMaxAgeMin + 1))
+                RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
+            }
+
+            $r = Get-SlotUsage -SlotPath $script:boSlot
+
+            $r.Status           | Should -Be 'rate-limited'
+            $r.Data             | Should -BeNullOrEmpty
+            $r.IsCachedFallback | Should -BeFalse
+            $script:staleCount  | Should -Be 0
+        }
+
         It 'Clear-SlotRateLimitBackoff drops the stamp but keeps cached Data' {
             $Script:SlotUsageCache[$script:boSlot] = @{
                 Data = 'D'; Timestamp = [DateTime]::UtcNow; RateLimitedUntil = [DateTime]::UtcNow.AddSeconds(120)
@@ -2840,6 +2972,7 @@ Describe 'switch_claude_account' {
             @{ Status = 'rate-limited'; Expected = 'rate-limited' }
             @{ Status = 'warming-up';   Expected = 'warming up' }
             @{ Status = 'priming';      Expected = 'priming' }
+            @{ Status = 'skipped';      Expected = 'skipped' }
         ) {
             Get-UsageStatusLabel -Row (New-StatusRow -Status $Status) | Should -Be $Expected
         }
@@ -2906,6 +3039,19 @@ Describe 'switch_claude_account' {
             })
             $cells.Five  | Should -Match '12'
             $cells.Seven | Should -Match '—'
+        }
+
+        # Every row Get-UsageSnapshot builds carries an Email property, even
+        # when its value is null. A row assembled anywhere else may not, and
+        # reading a missing property would hand Format-AccountCell whatever
+        # PowerShell returns for one rather than the absence of an address.
+        It 'treats a row with no Email property as having no address' {
+            $cells = ConvertTo-UsageTableRow -Row ([pscustomobject]@{
+                Name = 'a'; IsActive = $false; Status = 'ok'; Data = $null
+            })
+
+            # Same cell an explicit $null Email produces: the em-dash.
+            $cells.Account | Should -Be '—'
         }
     }
 
@@ -3654,15 +3800,23 @@ Describe 'switch_claude_account' {
             ([regex]::Matches($out, '\bpriming\b')).Count | Should -Be 1
         }
 
-        It 'Get-StatusColor maps "warming up" to Yellow' {
-            Get-StatusColor -Label 'warming up' -IsActive $false | Should -Be 'Yellow'
-            Get-StatusColor -Label 'warming up' -IsActive $true  | Should -Be 'Yellow'
+        It 'Get-StatusColor maps "warming up" to Warning' {
+            Get-StatusColor -Label 'warming up' -IsActive $false | Should -Be 'Warning'
+            Get-StatusColor -Label 'warming up' -IsActive $true  | Should -Be 'Warning'
         }
 
-        It 'Get-StatusColor maps "priming" to Yellow' {
-            # 'priming' is transient like 'warming up' -> Yellow.
-            Get-StatusColor -Label 'priming' -IsActive $false | Should -Be 'Yellow'
-            Get-StatusColor -Label 'priming' -IsActive $true  | Should -Be 'Yellow'
+        It 'Get-StatusColor maps "priming" to Warning' {
+            # 'priming' is transient like 'warming up' -> Warning.
+            Get-StatusColor -Label 'priming' -IsActive $false | Should -Be 'Warning'
+            Get-StatusColor -Label 'priming' -IsActive $true  | Should -Be 'Warning'
+        }
+
+        It 'Get-StatusColor maps "skipped" to Muted, not to the transients'' Warning' {
+            # The other two warm-pass labels are in flight and want the eye;
+            # 'skipped' is terminal and wants none, because the abort advisory
+            # beside the table is what the user has to read.
+            Get-StatusColor -Label 'skipped' -IsActive $false | Should -Be 'Muted'
+            Get-StatusColor -Label 'skipped' -IsActive $true  | Should -Be 'Muted'
         }
     }
 
@@ -3915,15 +4069,46 @@ Describe 'switch_claude_account' {
             Get-SlotAuthVerdict -SlotPath $slotPath | Should -BeNullOrEmpty
         }
 
-        It 'activator no-oauth: row ends Status="no-oauth", no mirror or usage read' {
+        It 'activator no-oauth: row ends Status="no-oauth", no usage read' {
             New-WarmupSlot -Name 'apikey' | Out-Null
             Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'no-oauth' } }
 
             $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
 
             (Get-RowStatus $snap 'apikey') | Should -Be 'no-oauth'
-            Should -Invoke Invoke-Reconcile -Times 0 -Exactly
             Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Uri -eq $Script:UsageEndpoint }
+        }
+
+        # The next iteration's swap overwrites .credentials.json, so anything
+        # claude left there has one chance to be captured. A failed activation
+        # is not a quiet one: claude can refresh the grant and only then be
+        # turned away (hitting the 5h limit is the common case), and skipping
+        # the mirror there destroyed that refresh.
+        It 'mirrors after a FAILED activation too, so a refresh claude landed is not lost' {
+            New-WarmupSlot -Name 'limited3' | Out-Null
+            Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'rate-limited' } }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            Should -Invoke Invoke-Reconcile -Times 1 -Exactly
+        }
+
+        # A verdict asserts claude PROVED the grant dead. That holds only if
+        # claude wrote nothing: a reconcile that saw the bytes move means a
+        # refresh went through, so the grant is alive and the refusal was about
+        # something else. Recording one then strands a working slot behind a
+        # verdict that outlives the run.
+        It 'does NOT record a verdict when the credentials moved during the activation' {
+            New-WarmupSlot -Name 'raced' | Out-Null
+            Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'unauthorized'; Error = 'forbidden' } }
+            Mock Invoke-Reconcile -MockWith { New-ReconcileResult -Action 'mirror' -Reason 'mirrored' -Slot 'raced' }
+
+            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+
+            $state = Read-ScaState
+            if ($state -and $state.auth_verdicts) {
+                $state.auth_verdicts.ContainsKey('raced') | Should -BeFalse
+            }
         }
 
         It 'Invoke-SlotActivator throws: row ends Status="error" with the exception message' {
@@ -4070,15 +4255,13 @@ Describe 'switch_claude_account' {
                     throw [System.Exception]::new('synthetic restore failure on a')
                 }
             }
-            Mock Write-Color -MockWith { }
-
-            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
 
             # Call order: a (round-robin), b (round-robin), c (throws),
             # a (restore, throws).
-            $script:swapNames | Should -Be @('a', 'b', 'c', 'a')
-            Should -Invoke Write-Color -Times 1 -Exactly -ParameterFilter { $Message -match "active on 'b'" }
-            Should -Invoke Write-Color -Times 0 -Exactly -ParameterFilter { $Message -match "active on 'c'" }
+            $script:swapNames  | Should -Be @('a', 'b', 'c', 'a')
+            $snap.Advisory     | Should -Match "active on 'b'"
+            $snap.Advisory     | Should -Not -Match "active on 'c'"
         }
 
         It 'restore-failure advisory names the last primed slot when every round-robin swap succeeded' {
@@ -4101,12 +4284,187 @@ Describe 'switch_claude_account' {
                     throw [System.Exception]::new('synthetic restore failure on a')
                 }
             }
-            Mock Write-Color -MockWith { }
-
-            Invoke-WarmAllSlots -Name '' -Repaint { } | Out-Null
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
 
             $script:swapNames | Should -Be @('a', 'b', 'c', 'a')
-            Should -Invoke Write-Color -Times 1 -Exactly -ParameterFilter { $Message -match "active on 'c'" }
+            $snap.Advisory    | Should -Match "active on 'c'"
+        }
+
+        # The three ways the mirror that the round-robin depends on can fail to
+        # happen. Each ends with a slot holding a refresh token the server has
+        # already rotated unless the pass stops, which is the one loss here no
+        # later pass repairs. See Invoke-Reconcile's `Captured`.
+
+        It 'mirrors the slot even when the activator throws after claude -p ran' {
+            # The activator can throw AFTER `claude -p` has run and refreshed
+            # (reading its output files, reaching for its exit code). The
+            # reconcile has to run anyway, or the next swap discards that
+            # refresh; a sequential call would have been skipped by the catch.
+            New-WarmupSlot -Name 'a' | Out-Null
+
+            Mock Invoke-SlotActivator -MockWith {
+                throw [System.Exception]::new('synthetic post-spawn activator failure')
+            }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            Should -Invoke Invoke-Reconcile -Times 1 -Exactly
+            (Get-RowStatus $snap 'a')                          | Should -Be 'error'
+            ($snap.Results | Where-Object Name -eq 'a').Error  | Should -Match 'synthetic post-spawn'
+            # The mirror vouched for the bytes, so the pass is not an abort.
+            $snap.Advisory | Should -BeNullOrEmpty
+        }
+
+        It 'stops the pass and skips the restore when the mirror reports Captured = $false' {
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            New-WarmupSlot -Name 'c' | Out-Null
+            $statePath = Join-Path $script:CredDirPath '.sca-state.json'
+            $stateBody = @{ schema = 1; active_slot = 'a'; last_sync_hash = 'deadbeef' } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $statePath -Value $stateBody -NoNewline -Encoding utf8NoBOM
+
+            Mock Invoke-Reconcile -MockWith {
+                New-ReconcileResult -Action 'noop' -Reason 'identity-unresolved' -Slot 'a' -Captured $false
+            }
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith { Param ($Slot); $script:swapNames += $Slot.Name }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            # One swap only: 'b' is never reached and the restore to 'a' is
+            # skipped, because both would overwrite the uncaptured bytes.
+            $script:swapNames | Should -Be @('a')
+            $snap.Advisory    | Should -Match "Stopped at 'a'"
+            $snap.Advisory    | Should -Match 'identity-unresolved'
+            $snap.Advisory    | Should -Match "sca save a"
+
+            # Both unreached rows are finalized rather than left at their
+            # seeded 'warming-up', which the table renders as in flight and
+            # Invoke-KeepWarmStep charges as a failed warm.
+            (Get-RowStatus $snap 'b') | Should -Be 'skipped'
+            (Get-RowStatus $snap 'c') | Should -Be 'skipped'
+        }
+
+        It 'leaves the aborting row its own outcome when no row follows it' {
+            # The boundary the index loop exists for: ($i + 1)..$last counts
+            # DOWN once $i reaches $last, so a range would stamp 'skipped' over
+            # the status the aborting row just earned.
+            New-WarmupSlot -Name 'a' | Out-Null
+
+            Mock Invoke-Reconcile -MockWith {
+                New-ReconcileResult -Action 'noop' -Reason 'identity-unresolved' -Slot 'a' -Captured $false
+            }
+            Mock Invoke-SlotSwap -MockWith { }
+            Mock Invoke-SlotActivator -MockWith { [pscustomobject]@{ Status = 'no-oauth'; Error = 'synthetic' } }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            $snap.Advisory            | Should -Match "Stopped at 'a'"
+            (Get-RowStatus $snap 'a') | Should -Be 'no-oauth'
+        }
+
+        It 'still skips the restore when the repaint throws past the abort' {
+            # The repaint is the one statement in the loop body outside a catch,
+            # and the watch startup pass hands it a real renderer that writes to
+            # the console. A throw there unwinds to the finally, which restores
+            # unless $uncaptured is already set -- and that restore is one more
+            # overwrite of the bytes nothing has captured. Decide first, repaint
+            # second.
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            $statePath = Join-Path $script:CredDirPath '.sca-state.json'
+            $stateBody = @{ schema = 1; active_slot = 'a'; last_sync_hash = 'deadbeef' } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $statePath -Value $stateBody -NoNewline -Encoding utf8NoBOM
+
+            Mock Invoke-Reconcile -MockWith {
+                New-ReconcileResult -Action 'noop' -Reason 'identity-unresolved' -Slot 'a' -Captured $false
+            }
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith { Param ($Slot); $script:swapNames += $Slot.Name }
+
+            # Throws on the repaint that carries the abort advisory, which is
+            # the one this fix moved the decision in front of. The trigger is
+            # the advisory itself rather than a call count, so the test also
+            # fails if the decision moves back behind the repaint: the advisory
+            # would not be there yet, nothing would throw, and Should -Throw
+            # would catch it.
+            { Invoke-WarmAllSlots -Name '' -Repaint { Param ($snap) if ($snap.Advisory) { throw 'synthetic renderer failure' } } } |
+                Should -Throw '*synthetic renderer failure*'
+
+            # The swap onto 'a' and nothing else: no restore ran behind the
+            # exception.
+            $script:swapNames | Should -Be @('a')
+        }
+
+        It 'stops the pass when the mirror itself throws' {
+            # Invoke-Reconcile's mirror branch writes through
+            # Set-CredentialFileAtomic, which throws. That proves nothing about
+            # the bytes either way, so it is as unsafe to write over as an
+            # explicit Captured = $false.
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+            $statePath = Join-Path $script:CredDirPath '.sca-state.json'
+            $stateBody = @{ schema = 1; active_slot = 'a'; last_sync_hash = 'deadbeef' } | ConvertTo-Json -Compress
+            Set-Content -LiteralPath $statePath -Value $stateBody -NoNewline -Encoding utf8NoBOM
+
+            Mock Invoke-Reconcile -MockWith {
+                throw [System.Exception]::new('synthetic atomic write failure')
+            }
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith { Param ($Slot); $script:swapNames += $Slot.Name }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            $script:swapNames | Should -Be @('a')
+            $snap.Advisory    | Should -Match "Stopped at 'a'"
+            $snap.Advisory    | Should -Match 'synthetic atomic write failure'
+        }
+
+        It 'treats a reconcile that returned nothing as proof of nothing' {
+            # `Mock Invoke-Reconcile { }` returns $null, which Common.ps1 warns
+            # reads as Captured = $false to every caller. Production always
+            # returns an object, so this guards the harness shape rather than a
+            # reachable path: a stub must not be able to wave the pass through.
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+
+            Mock Invoke-Reconcile -MockWith { }
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith { Param ($Slot); $script:swapNames += $Slot.Name }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            $script:swapNames | Should -Be @('a')
+            $snap.Advisory    | Should -Match 'the reconcile returned nothing'
+        }
+
+        It 'a swap failure fails its own slot only, because an atomic rename leaves the file captured' {
+            # The counterpart to the three aborts above: Invoke-SlotSwap writes
+            # through an atomic rename, so a throw leaves .credentials.json
+            # exactly as the previous slot's mirror captured it. Nothing is at
+            # risk, so the pass must NOT stop.
+            New-WarmupSlot -Name 'a' | Out-Null
+            New-WarmupSlot -Name 'b' | Out-Null
+
+            $script:swapNames = @()
+            Mock Invoke-SlotSwap -MockWith {
+                Param ($Slot)
+                $script:swapNames += $Slot.Name
+                if ($Slot.Name -eq 'a') { throw [System.Exception]::new('synthetic swap failure on a') }
+            }
+
+            $snap = Invoke-WarmAllSlots -Name '' -Repaint { }
+
+            $script:swapNames        | Should -Be @('a', 'b')
+            (Get-RowStatus $snap 'a') | Should -Be 'error'
+            (Get-RowStatus $snap 'b') | Should -Be 'ok'
+            $snap.Advisory           | Should -BeNullOrEmpty
+            # The failed swap never activated, so it must not have mirrored.
+            Should -Invoke Invoke-Reconcile -Times 1 -Exactly
         }
     }
 
@@ -4359,14 +4717,19 @@ Describe 'switch_claude_account' {
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
         }
 
-        It 'refuses (without warming) when Claude Code is running' {
+        # The round-robin no longer refuses a live client. Claude Code
+        # serializes refreshes across its own processes, so the `claude -p` a
+        # warm pass spawns cannot race the live session's grant; what is left
+        # is a prompt sent mid-pass billing the mounted slot. See
+        # Test-ClaudeRunning.
+        It 'warms even when Claude Code is running' {
             Mock Test-ClaudeRunning { $true }
             $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
 
             $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x'
 
-            $out | Should -Be '[Warmup] Re-warm refused! Claude Code is running.'
-            Should -Invoke Invoke-WarmAllSlots -Times 0 -Exactly
+            $out | Should -Match 'Re-warmed'
+            Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
         }
 
         # The round-robin overwrites .credentials.json once per slot, and this
@@ -4490,6 +4853,38 @@ Describe 'switch_claude_account' {
             $fails['b'] | Should -Be 1
         }
 
+        # The counterpart to the throw above. A throw says nothing about
+        # individual slots, so every one of them counts; an abort does, and
+        # the slots behind it were never tried.
+        It 'charges nothing to the slots an aborted pass never reached' {
+            Mock Invoke-WarmAllSlots {
+                [pscustomobject]@{
+                    Results  = @(
+                        [pscustomobject]@{ Name = 'a'; Status = 'error' },
+                        [pscustomobject]@{ Name = 'b'; Status = 'skipped' }
+                    )
+                    Advisory = "[Warmup] Stopped at 'a': nothing captured the credentials Claude Code left active."
+                }
+            }
+            $times = @{}; $fails = @{}
+            $snap  = New-KwSnapshot @(
+                (New-KwRow -Name 'a' -FiveResetsAt $null),
+                (New-KwRow -Name 'b' -FiveResetsAt $null)
+            )
+
+            Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes $times -Threshold 95 `
+                                -CooldownMin 5 -WarmupFailures $fails -CurrentLatch 'x' | Out-Null
+
+            # 'a' was tried and did not reach 'ok', so it earns its failure.
+            $fails['a']             | Should -Be 1
+            $times.ContainsKey('a') | Should -BeTrue
+
+            # 'b' was not, so neither the cooldown stamp nor the doubling that
+            # a repeated abort would compound may touch it.
+            $fails.ContainsKey('b') | Should -BeFalse
+            $times.ContainsKey('b') | Should -BeFalse
+        }
+
         It 'omitting -WarmupFailures keeps the flat-cooldown behaviour' {
             # Backward compatibility for one-shot callers and existing tests.
             $times = @{ 'a' = [DateTime]::Now.AddMinutes(-6) }
@@ -4499,6 +4894,41 @@ Describe 'switch_claude_account' {
                                 -CooldownMin 5 -CurrentLatch 'x' | Out-Null
 
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
+        }
+
+        # The watch suppresses Invoke-WarmAllSlots' information stream, so the
+        # footer latch is the only channel these two facts have.
+
+        It 'latches the live-client notice alongside the re-warm line' {
+            # `sca warmup` pauses to say this; a watch cannot, and its round-
+            # robin repeats for the life of the session, so the latch carries
+            # it. Re-tested per re-warm because a client opened mid-watch is
+            # dragged across every account by the very next pass.
+            Mock Test-ClaudeRunning { $true }
+            $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x'
+
+            $lines = $out -split "`n"
+            $lines[0] | Should -Match 'Claude Code is running'
+            $lines[0] | Should -Match 'bills whichever slot is mounted'
+            # The slot roll-call survives the prepend.
+            $lines[1] | Should -Match "^\[Warmup\] Re-warmed 'a' at"
+        }
+
+        It 'latches the pass advisory over the re-warm line' {
+            Mock Invoke-WarmAllSlots {
+                [pscustomobject]@{
+                    Results  = @([pscustomobject]@{ Name = 'a'; Status = 'error' })
+                    Advisory = "[Warmup] Stopped at 'a': nothing captured the credentials Claude Code left active."
+                }
+            }
+            $snap = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
+
+            $out = Invoke-KeepWarmStep -Snapshot $snap -WarmupTimes @{} -Threshold 95 -CurrentLatch 'x'
+
+            $out | Should -Match "Stopped at 'a'"
+            $out | Should -Not -Match 'Re-warmed'
         }
     }
 

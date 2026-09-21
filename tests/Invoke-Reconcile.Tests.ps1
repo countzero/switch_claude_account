@@ -456,6 +456,128 @@ Describe 'switch_claude_account' {
             $hash = Get-SHA256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes('AAA'))
             Find-SlotByHash -Hash $hash | Should -BeNullOrEmpty
         }
+
+        # An unreadable candidate must not fail the scan: reconcile calls this
+        # on every credentials-touching action, and one bad file would take the
+        # whole action down. What it costs is a detection, so the skip is
+        # traced.
+        It 'skips every slot it cannot hash instead of failing the scan' {
+            New-SlotPair -CredDir $script:CD -Name 'work'     -Email 'alice@example.com' -Content 'AAA' | Out-Null
+            New-SlotPair -CredDir $script:CD -Name 'personal' -Email 'bob@example.com'   -Content 'BBB' | Out-Null
+
+            # Every candidate fails, so the result does not depend on the order
+            # Get-Slots returns them in: the loop has to survive both and trace
+            # both. The filter tests for a non-empty $Path rather than a
+            # non-null one, because an unbound [String] parameter arrives here
+            # as '' and would capture the -Bytes call that builds the needle.
+            Mock Get-SHA256Hex -ParameterFilter { -not [string]::IsNullOrEmpty($Path) } -MockWith {
+                throw [System.IO.IOException]::new('file is locked')
+            }
+
+            $hash = Get-SHA256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes('BBB'))
+            $records = @(Find-SlotByHash -Hash $hash -Verbose 4>&1)
+
+            # 4>&1 merges the verbose records into the output stream; a match
+            # would arrive here as a slot object, and there must be none.
+            @($records | Where-Object { $_ -isnot [System.Management.Automation.VerboseRecord] }) |
+                Should -BeNullOrEmpty
+            @($records | Where-Object { $_ -is [System.Management.Automation.VerboseRecord] }).Count |
+                Should -Be 2
+        }
+    }
+
+    # ----- the account probe ----------------------------------------------
+
+    Context 'Test-CredentialAccountMatch (no uuid to compare)' {
+        # accountUuid is the only field this compares. Without one on the
+        # sidecar there is nothing to be right or wrong about, so the answer is
+        # 'unknown' and no request is made: a slot saved before sidecars
+        # carried uuids must not cost a profile round trip on every reconcile.
+
+        It 'answers unknown without probing when the sidecar is absent' {
+            $slot = New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content $script:CredsBody
+            Mock Get-SlotProfile -MockWith { throw 'must not be called' }
+
+            $r = Test-CredentialAccountMatch -CredentialPath $slot -Sidecar $null
+
+            $r.Status | Should -Be 'unknown'
+            $r.Reason | Should -Be 'sidecar-has-no-uuid'
+            Should -Invoke Get-SlotProfile -Times 0
+        }
+
+        It 'answers unknown without probing when the sidecar carries no uuid' {
+            $slot = New-SlotPair -CredDir $script:CD -Name 'work' -Email 'alice@example.com' -Content $script:CredsBody
+            Mock Get-SlotProfile -MockWith { throw 'must not be called' }
+
+            $sidecar = [pscustomobject]@{
+                oauthAccount = [pscustomobject]@{ accountUuid = ''; emailAddress = 'alice@example.com' }
+            }
+            $r = Test-CredentialAccountMatch -CredentialPath $slot -Sidecar $sidecar
+
+            $r.Status | Should -Be 'unknown'
+            $r.Reason | Should -Be 'sidecar-has-no-uuid'
+            Should -Invoke Get-SlotProfile -Times 0
+        }
+    }
+
+    Context 'Confirm-TrackedSlotIdentity (degraded inputs)' {
+        # Get-Slots populates Sidecar on every slot it returns, so a slot
+        # object without one reaches here only from a caller that built it by
+        # hand. The fallbacks exist so that caller still gets an answer rather
+        # than an empty-equals-empty comparison, which is the one outcome that
+        # would mirror one account's tokens over another's.
+        It 'falls back to the slot Email and a null account when there is no sidecar' {
+            $slot = [pscustomobject]@{
+                Name    = 'work'
+                Email   = 'alice@example.com'
+                Path    = Join-Path $script:CD '.credentials.work(alice@example.com).json'
+                Sidecar = $null
+            }
+            $incoming = [pscustomobject]@{
+                accountUuid = 'uuid-bob'; emailAddress = 'bob@example.com'
+            }
+
+            $r = Confirm-TrackedSlotIdentity -Slot $slot -IncomingEmail 'bob@example.com' `
+                    -IncomingAccount $incoming -IncomingSource 'claude_json' `
+                    -CredentialPath (Join-Path $script:CD '.credentials.json') -Hash 'HASH'
+
+            $r.Verdict   | Should -Be 'differs'
+            $r.SlotEmail | Should -Be 'alice@example.com'
+        }
+
+        # The probe answered about the file as it stood when it read it. If the
+        # bytes moved under us since, the caller's hash describes a login that
+        # is already gone, and 'moved' is what says so. An unhashable file is
+        # the same situation: we cannot show the bytes are still the ones asked
+        # about.
+        It 'reports moved when the credentials file can no longer be hashed' {
+            $credPath = Join-Path $script:CD '.credentials.json'
+            Set-Content -LiteralPath $credPath -Value $script:CredsBody -NoNewline
+
+            $account = [pscustomobject]@{
+                accountUuid = 'uuid-alice'; emailAddress = 'alice@example.com'
+            }
+            $slot = [pscustomobject]@{
+                Name    = 'work'
+                Email   = 'alice@example.com'
+                Path    = Join-Path $script:CD '.credentials.work(alice@example.com).json'
+                Sidecar = [pscustomobject]@{ oauthAccount = $account }
+            }
+
+            Mock Test-CredentialAccountMatch -MockWith {
+                [pscustomobject]@{ Status = 'mismatch'; Email = 'carol@example.com'; AccountUuid = 'uuid-carol' }
+            }
+            Mock Get-SHA256Hex -ParameterFilter { $Path -eq $credPath } -MockWith {
+                throw [System.IO.IOException]::new('vanished mid-probe')
+            }
+
+            $r = Confirm-TrackedSlotIdentity -Slot $slot -IncomingEmail 'alice@example.com' `
+                    -IncomingAccount $account -IncomingSource 'claude_json' `
+                    -CredentialPath $credPath -Hash 'WHATEVER'
+
+            $r.Verdict   | Should -Be 'moved'
+            $r.SlotEmail | Should -Be 'alice@example.com'
+        }
     }
 
     # ----- the /login window ---------------------------------------------

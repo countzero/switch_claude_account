@@ -428,6 +428,28 @@ Describe 'switch_claude_account' {
             $d.SuggestionBucket | Should -Be 'Session'
         }
 
+        # A pool that is out of room but has no future reset to name: every
+        # window has already rolled, or the endpoint returned none. The
+        # suggestion fields have to come back empty rather than carry a
+        # formatted default, because Invoke-AutoRotationStep switches on
+        # SuggestionResetsAt to choose between the "cooling down for <delta>"
+        # line and the generic one.
+        It 'no-eligible reports no reset time when nothing has a future one' {
+            $past = [DateTimeOffset]::UtcNow.AddMinutes(-30).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+
+            $rows = @(
+                (New-Row -Name 'a' -IsActive $true -FiveUtil 100.0 -FiveResetsAt $past -SevenUtil 100.0),
+                (New-Row -Name 'b' -FiveUtil 100.0 -SevenUtil 100.0)
+            )
+            $d = Get-AutoRotationDecision -Snapshot (New-Snapshot $rows) -Threshold 100
+
+            $d.Action             | Should -Be 'no-eligible'
+            $d.FromName           | Should -Be 'a'
+            $d.SuggestionName     | Should -BeNullOrEmpty
+            $d.SuggestionBucket   | Should -BeNullOrEmpty
+            $d.SuggestionResetsAt | Should -BeNullOrEmpty
+        }
+
         It 'threshold uses max(5h, 7d): 5h=10, 7d=99, threshold=95 -> rotate' {
             $rows = @(
                 (New-Row -Name 'a' -IsActive $true -FiveUtil 10.0 -SevenUtil 99.0),
