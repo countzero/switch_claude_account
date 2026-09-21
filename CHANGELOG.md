@@ -3,14 +3,21 @@
 This changelog follows [Common Changelog](https://common-changelog.org) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [4.2.0] - 2026-09-20
+## [4.2.0] - 2026-09-21
 
-_Upgrading is replacing one file. `sca warmup` and `sca monitor -KeepWarm` now run beside an open Claude Code instead of refusing, and the `Session` aggregate bar reports a different number wherever a slot has capped its week._
+_Upgrading is replacing one file. `sca warmup` and `sca monitor -KeepWarm` now run beside an open Claude Code instead of refusing, the `Session` aggregate bar reports a different number wherever a slot has capped its week, and colors are unchanged unless you set the new `SCA_THEME`._
 
 ### Changed
 - Run the warm round-robin of `sca warmup` and `sca monitor -KeepWarm` beside a live Claude Code.
 - Average the `Session` aggregate bar over reachable slots only, dropping any slot whose week has capped.
 - Pause `sca warmup` for five seconds before the first billable activation when Claude Code is running.
+
+### Added
+- Add `SCA_THEME`, which pins output to an exact palette instead of the terminal's own ANSI colors.
+- Add ten themes: the base16 schemes `dracula`, `everforest`, `flexoki`, `gruvbox`, `kanagawa`, `material`, `monokai`, `nord` and `onedark`, plus an original `claude`.
+- Paint the watch's alternate screen in the active theme's background, erases and window padding included.
+- Add `docs/themes.md`, showing every theme as a full `sca monitor` view under a heading of its own.
+- List the available theme names in `sca help` under a new `ENVIRONMENT` section.
 
 ### Fixed
 - Mirror the active credentials after every activation, including one whose `claude -p` then threw.
