@@ -45,8 +45,6 @@ A zero-dependency PowerShell utility for Claude Code on Windows, Linux, and macO
 
 The Linux and macOS commands are community packages, from Canonical and Homebrew rather than Microsoft, and the snap needs [snapd](https://snapcraft.io/docs/installing-snapd) present. For Microsoft's own builds, including the signed macOS `.pkg`, see their [Linux](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-linux) and [macOS](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-macos) instructions. All of them clear the 7.4 floor.
 
-The test suite runs on all three on every push.
-
 ### Download
 
 [Download latest switch_claude_account.ps1](https://github.com/countzero/switch_claude_account/releases/latest/download/switch_claude_account.ps1) and place it anywhere on disk, or fetch it from `pwsh`:
