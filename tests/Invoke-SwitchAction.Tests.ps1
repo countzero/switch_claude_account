@@ -70,8 +70,8 @@ Describe 'switch_claude_account' {
         }
 
         # Switching under a live Claude Code is supported as of 2.1.274, which
-        # re-reads .credentials.json on its next token-refresh check. Refusing
-        # here would block the feature the guard used to protect.
+        # re-reads .credentials.json on its next token-refresh check, so a
+        # refusal here would block the supported case.
         It 'switches while Claude Code is running' {
             Mock Test-ClaudeRunning -MockWith { $true }
             New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'work@test.local' -Content 'X' | Out-Null
@@ -182,10 +182,10 @@ Describe 'switch_claude_account' {
             Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be 'BC'
         }
 
-        # The new switch output renders the filename-encoded email
-        # alongside the slot name so the user sees which account they
-        # just activated. The format is `'<slot>' (<email>)` for labeled
-        # slots, plain `'<slot>'` for unlabeled / dedup slots.
+        # The switch output renders the filename-encoded email alongside the
+        # slot name so the user sees which account they just activated:
+        # `'<slot>' (<email>)` for a labeled slot, plain `'<slot>'` for an
+        # unlabeled or dedup one.
         It "renders email in success message when target slot is labeled" {
             New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'alice@example.com' -Content 'X' | Out-Null
 
@@ -201,8 +201,8 @@ Describe 'switch_claude_account' {
 
             # `(?m)...$` anchors the slot identity to end-of-line so an
             # accidental `(email)` suffix or a stale trailing period would
-            # both fail this assertion. The success line is now a yellow
-            # header without a trailing dot.
+            # both fail this assertion: the success line is a yellow header
+            # without a trailing dot.
             $out | Should -Match "(?m)Switched to 'work'\s*$"
             $out | Should -Not -Match '\([^)]*@[^)]*\)'
         }
@@ -335,9 +335,9 @@ Describe 'switch_claude_account' {
         }
 
         It 'preserves non-whitelisted top-level fields in ~/.claude.json byte-equal' {
-            # Add some unrelated fields to ~/.claude.json. Switch must
-            # leave them untouched so we don't accidentally clobber
-            # Claude Code's project history / mcp configs / etc.
+            # Add some unrelated fields to ~/.claude.json. Switch must leave
+            # them untouched rather than clobber Claude Code's project
+            # history, mcp configs and the rest.
             Set-SandboxClaudeJson -Email 'old@example.com' -ExtraTopLevel @{
                 projects        = @{ 'D:\foo' = @{ allowed = $true; lastUsedDate = '2026-01-01' } }
                 mcpServers      = @{ memory = @{ command = 'mcp-memory' } }
@@ -354,8 +354,8 @@ Describe 'switch_claude_account' {
             $afterObj.projects.'D:\foo'.allowed     | Should -BeTrue
             $afterObj.mcpServers.memory.command     | Should -Be 'mcp-memory'
 
-            # The sentinel value still appears verbatim in the raw file:
-            # we did not re-serialize it.
+            # The sentinel value still appears verbatim in the raw file, so
+            # nothing re-serialized it.
             $afterRaw = Get-Content -LiteralPath $ClaudeJsonPath -Raw
             $afterRaw | Should -Match 'sentinel-value-xyz'
         }
@@ -376,7 +376,7 @@ Describe 'switch_claude_account' {
             $afterObj.oauthAccount.subscriptionCreatedAt | Should -Be $beforeSubscriptionCreated
         }
 
-        # Regression guard for the fix that blocks real → null overwrites:
+        # Regression guard against a real → null overwrite:
         # /api/oauth/profile-fallback sidecars carry only emailAddress; the
         # other four whitelisted fields default to $null. Switching to such
         # a slot must NOT overwrite Claude Code's populated ~/.claude.json
@@ -449,9 +449,9 @@ Describe 'switch_claude_account' {
             $obj.oauthAccount.organizationName | Should -Be 'Fresh Org'
         }
 
-        # Failure path: ~/.claude.json missing or malformed shouldn't
-        # cascade into a broken switch; the credentials swap already
-        # happened, we just emit a yellow advisory.
+        # Failure path: ~/.claude.json missing or malformed must not
+        # cascade into a broken switch. The credentials swap already
+        # happened, so the cost is a yellow advisory.
         It 'tolerates ~/.claude.json missing (yellow advisory; tokens still swap)' {
             Remove-Item -LiteralPath $ClaudeJsonPath -Force -ErrorAction SilentlyContinue
             New-SlotPair -CredDir $script:CredDirPath -Name 'slot' -Content 'X' | Out-Null
@@ -496,10 +496,10 @@ Describe 'switch_claude_account' {
             Get-Content -LiteralPath $script:CredFilePath -Raw | Should -Be 'NEW'
         }
 
-        # Reconcile runs first, before the slot lookup. Verifies that a
-        # pending Claude Code refresh on the outgoing active slot is
-        # captured into its saved-slot file BEFORE we overwrite
-        # .credentials.json with the destination slot.
+        # Reconcile runs first, before the slot lookup, so a pending Claude
+        # Code refresh on the outgoing active slot is captured into its
+        # saved-slot file BEFORE .credentials.json is overwritten with the
+        # destination slot.
         It 'reconciles before switching: outgoing slot bytes match the active file' {
             # Same account as the BeforeEach's ~/.claude.json, uuid included, so
             # reconcile mirrors rather than reading a cross-account swap.
@@ -594,11 +594,9 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Invoke-SlotSwap' {
-        # Direct tests for the swap helper extracted from
-        # Invoke-SwitchAction; the watch loop's -Auto path calls
-        # Invoke-SlotSwap directly without going through
-        # Invoke-SwitchAction's reconcile + name resolution, so the
-        # helper's invariants need their own coverage.
+        # The watch loop's -Auto path calls Invoke-SlotSwap directly, without
+        # going through Invoke-SwitchAction's reconcile and name resolution,
+        # so the helper's invariants need their own coverage.
         BeforeEach {
             $script:CredDirPath  = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null

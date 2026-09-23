@@ -5,7 +5,7 @@
 # one-shot `sca warmup [name]` action that activates each saved slot via the
 # real Claude Code CLI (`claude -p`) and prints the usage table. The per-slot
 # swap/activate/restore round-robin itself is covered by the Invoke-WarmAllSlots
-# context in Invoke-UsageAction.Tests.ps1; here we cover the action-level
+# context in Invoke-UsageAction.Tests.ps1; this file covers the action-level
 # guards, the no-slots path, and that it renders the table. Per-test sandbox
 # setup lives in tests/Common.ps1.
 
@@ -57,8 +57,8 @@ Describe 'switch_claude_account' {
             }
         }
 
-        # No longer a refusal: claude serializes refreshes across its own
-        # processes, so the pass cannot cost a credential. It names the one cost
+        # Not a refusal: claude serializes refreshes across its own processes,
+        # so the pass cannot cost a credential. The warning names the one cost
         # that remains, a prompt sent mid-pass billing the mounted slot.
         It 'warns but proceeds when Claude Code is running' {
             Mock Test-ClaudeRunning -MockWith { $true }
@@ -193,7 +193,6 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'Activating'
             $out | Should -Match '\ba\b'
             $out | Should -Match '\bb\b'
-            # One activation per slot.
             Should -Invoke Invoke-SlotActivator -Times 2 -Exactly
         }
 
@@ -265,8 +264,8 @@ Describe 'switch_claude_account' {
         }
 
         # claude's JSON envelope does not always carry a sentence. subtype is
-        # the last field with any signal in it, and without this arm such a
-        # failure rendered as the bare exit code.
+        # the last field with any signal in it; without this arm such a failure
+        # renders as the bare exit code.
         It 'falls back to the JSON subtype when there is no result or error text' {
             $slot = New-SlotPair -CredDir $script:CredDirPath -Name 'a' -Email 'a@test.local' `
                 -Content '{"claudeAiOauth":{"accessToken":"AT","refreshToken":"RT","expiresAt":9999999999999}}'

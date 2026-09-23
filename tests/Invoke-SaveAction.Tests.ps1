@@ -3,7 +3,7 @@
 
 # Pester 5 tests for Invoke-SaveAction in switch_claude_account.ps1.
 #
-# Post-v2.1.0 contract:
+# Contract:
 #   * Identity comes primarily from ~/.claude.json's oauthAccount block
 #     (same source Claude Code uses for /status, drift-proof).
 #   * /api/oauth/profile is a fallback when ~/.claude.json has no
@@ -89,7 +89,6 @@ Describe 'switch_claude_account' {
             Set-Content -LiteralPath $script:CredFilePath -Value '{"t":1}' -NoNewline
 
             { Invoke-SaveAction -Name 'work' 6>$null } | Should -Throw -ExpectedMessage '*Claude Code is running*'
-            # No slot or sidecar created.
             @(Get-ChildItem -LiteralPath $script:CredDirPath -Filter '.credentials.work*.json' -Force).Count | Should -Be 0
         }
 
@@ -150,7 +149,6 @@ Describe 'switch_claude_account' {
 
             { Invoke-SaveAction -Name 'work' 6>$null } | Should -Throw -ExpectedMessage '*Cannot resolve account identity*'
 
-            # No slot or sidecar created.
             @(Get-ChildItem -LiteralPath $script:CredDirPath -Filter '.credentials.work*.json' -Force).Count | Should -Be 0
         }
 
@@ -160,15 +158,14 @@ Describe 'switch_claude_account' {
 
             Invoke-SaveAction -Name 'alice@example.com' 6>$null
 
-            # Slot name == email -> no parenthesized suffix.
             Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.alice@example.com.json') | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.alice@example.com.account.json') | Should -BeTrue
             @(Get-ChildItem -LiteralPath $script:CredDirPath -Filter '.credentials.alice@example.com(*).json' -Force).Count | Should -Be 0
         }
 
         # When re-saving a slot whose account has changed, the old labeled
-        # file AND its sidecar must be removed so we don't accumulate one
-        # file per historical account under the same name.
+        # file AND its sidecar must be removed, or the same name accumulates
+        # one file per account it has ever held.
         It 'removes a pre-existing labeled file + sidecar when re-saving with a different email' {
             $oldSlotPath    = Join-Path $script:CredDirPath '.credentials.work(old@example.com).json'
             $oldSidecarPath = Join-Path $script:CredDirPath '.credentials.work(old@example.com).account.json'
@@ -181,10 +178,8 @@ Describe 'switch_claude_account' {
 
             Invoke-SaveAction -Name 'work' 6>$null
 
-            # Stale files removed.
             Test-Path -LiteralPath $oldSlotPath    | Should -BeFalse
             Test-Path -LiteralPath $oldSidecarPath | Should -BeFalse
-            # New labeled pair present.
             Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.work(alice@example.com).json')         | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.work(alice@example.com).account.json') | Should -BeTrue
         }
@@ -193,8 +188,8 @@ Describe 'switch_claude_account' {
             Set-Content -LiteralPath $script:CredFilePath -Value '{"t":1}' -NoNewline
 
             # Force Write-Sidecar to throw by replacing it with a stub.
-            # The save must clean up its tokens file so we don't leave
-            # an invisible (sidecar-less) slot behind.
+            # The save must clean up its tokens file rather than leave an
+            # invisible (sidecar-less) slot behind.
             Mock Write-Sidecar -MockWith { throw [System.Exception]::new('disk full') }
 
             { Invoke-SaveAction -Name 'work' 6>$null } | Should -Throw -ExpectedMessage '*Save failed for slot*previous slot state*'
@@ -220,13 +215,11 @@ Describe 'switch_claude_account' {
 
             { Invoke-SaveAction -Name 'work' 6>$null } | Should -Throw -ExpectedMessage '*Save failed for slot*previous slot state*'
 
-            # Old pair restored byte-equal.
             Test-Path -LiteralPath $oldSlotPath    | Should -BeTrue
             Test-Path -LiteralPath $oldSidecarPath | Should -BeTrue
             [System.IO.File]::ReadAllBytes($oldSlotPath)    | Should -Be $oldSlotBytes
             [System.IO.File]::ReadAllBytes($oldSidecarPath) | Should -Be $oldSidecarBytes
 
-            # New-email pair absent.
             Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.work(alice@example.com).json')         | Should -BeFalse
             Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.work(alice@example.com).account.json') | Should -BeFalse
         }
@@ -234,8 +227,9 @@ Describe 'switch_claude_account' {
         # Re-saving an existing slot for the SAME account (the typical
         # token-refresh capture case): finalSlotPath coincides with the
         # snapshot path, so the atomic Replace overwrites the old bytes
-        # in place. On sidecar failure we must restore those bytes from
-        # the in-memory snapshot, not just delete the new tokens file.
+        # in place. On sidecar failure the restore has to put those bytes back
+        # from the in-memory snapshot; deleting the new tokens file is not
+        # enough.
         It 'restores the pre-existing pair byte-equal when sidecar write fails (same-email re-save)' {
             $slotPath    = Join-Path $script:CredDirPath '.credentials.work(alice@example.com).json'
             $sidecarPath = Join-Path $script:CredDirPath '.credentials.work(alice@example.com).account.json'
@@ -249,8 +243,8 @@ Describe 'switch_claude_account' {
 
             { Invoke-SaveAction -Name 'work' 6>$null } | Should -Throw -ExpectedMessage '*Save failed for slot*previous slot state*'
 
-            # Tokens at the path reverted to OLD bytes (atomic Replace
-            # already overwrote them; restore put them back).
+            # The atomic Replace already overwrote these bytes; the restore
+            # is what puts them back.
             Test-Path -LiteralPath $slotPath    | Should -BeTrue
             Test-Path -LiteralPath $sidecarPath | Should -BeTrue
             [System.IO.File]::ReadAllBytes($slotPath)    | Should -Be $oldSlotBytes
@@ -263,7 +257,7 @@ Describe 'switch_claude_account' {
         # file the user is explicitly overwriting must not be able to refuse
         # the save, and one failed restore must not abort the others. What
         # that costs is silence, so each failure prints a line naming the path
-        # it gave up on. These cases drive the four warnings.
+        # it gave up on. These cases drive those warnings.
 
         # A slot file that cannot be read is snapshotted as non-restorable.
         # The re-save carries a different email, so the write lands on a new

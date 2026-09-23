@@ -4,14 +4,12 @@
 # Pester 5 tests for the state-file primitives in switch_claude_account.ps1:
 # Set-CredentialFileAtomic, Read-ScaState, Write-ScaState, Update-ScaState.
 #
-# These four functions are the foundation the rest of the redesign sits on
-# (atomic writes that survive an open Claude Code; state-file tracking that
-# replaces the hardlink-based active-slot identification). They are tested
-# in isolation here so a regression in the foundation surfaces with a small,
-# targeted failure rather than indirectly via Invoke-* action tests.
+# These four carry atomic writes that survive an open Claude Code and the
+# state-file tracking of the active slot. They are tested in isolation here
+# so a regression in them surfaces with a small, targeted failure rather
+# than indirectly via Invoke-* action tests.
 #
-# Per-test sandbox setup lives in tests/Common.ps1; see that file for the
-# scoping rationale.
+# Per-test sandbox setup lives in tests/Common.ps1.
 
 BeforeAll {
     $script:OriginalUserProfile = $env:USERPROFILE
@@ -26,8 +24,7 @@ Describe 'switch_claude_account' {
         . (Join-Path $PSScriptRoot 'Common.ps1')
 
         # Every test in this file works inside the sandboxed .claude
-        # directory, so create it once per test rather than repeating the
-        # Join-Path / New-Item dance in every It block.
+        # directory, so it is created once per test here.
         $script:SandboxCredDir = Join-Path $script:SandboxHome '.claude'
         New-Item -ItemType Directory -Path $script:SandboxCredDir -Force | Out-Null
     }
@@ -58,12 +55,11 @@ Describe 'switch_claude_account' {
             $leftovers.Count | Should -Be 0
         }
 
-        # The whole reason the script switched to atomic-rename writes:
-        # Claude Code keeps .credentials.json open with FILE_SHARE_DELETE
-        # while running, and only [System.IO.File]::Replace / ::Move
-        # succeed against an open-but-share-delete handle. A regression
-        # here would silently re-introduce the "close Claude Code first"
-        # constraint we promised to remove.
+        # The reason for the atomic-rename write: Claude Code keeps
+        # .credentials.json open with FILE_SHARE_DELETE while running, and
+        # only [System.IO.File]::Replace / ::Move succeed against an
+        # open-but-share-delete handle. A regression here silently
+        # re-introduces the "close Claude Code first" constraint.
         It 'succeeds while destination is open with FileShare::ReadWrite|Delete' {
             $dest = Join-Path $script:SandboxCredDir 'open.txt'
             Set-Content -LiteralPath $dest -Value 'OLD' -NoNewline
@@ -82,9 +78,9 @@ Describe 'switch_claude_account' {
 
         # Regression guard for the inverse: if a reader holds the file
         # without granting FileShare::Delete, the atomic write must fail
-        # cleanly rather than silently corrupting state. This shouldn't
-        # happen in practice (Claude Code grants share-delete) but it
-        # documents the contract we depend on.
+        # cleanly rather than silently corrupting state. Claude Code grants
+        # share-delete, so this is the contract rather than a case seen in
+        # practice.
         #
         # Windows-only by nature, not by convenience: FileShare is enforced by
         # the Win32 kernel. POSIX has no mandatory locking, so on Linux the
@@ -108,10 +104,10 @@ Describe 'switch_claude_account' {
             Get-Content -LiteralPath $dest -Raw | Should -Be 'OLD'
         }
 
-        # The Unix half of the atomic-write contract. On Windows the test
-        # above proves share-modes are honoured; here we prove the property
-        # that actually matters on Linux, which the share-mode test cannot
-        # express: rename(2) swaps the directory entry, so a reader holding
+        # The Unix half of the atomic-write contract. The test above proves
+        # share modes are honored on Windows; this proves the property that
+        # matters on Linux, which the share-mode test cannot express:
+        # rename(2) swaps the directory entry, so a reader holding
         # the old descriptor keeps seeing the old inode's bytes while the
         # path resolves to the new content. Without -Skip this would pass
         # vacuously on Windows (where the exclusive open blocks the write),
@@ -145,7 +141,7 @@ Describe 'switch_claude_account' {
         It 'writes credential-shaped files as 0600 on Unix' -Skip:$IsWindows {
             $dest = Join-Path $script:SandboxCredDir 'mode.json'
 
-            # Pre-create world-readable so we prove the write tightens it
+            # Pre-create world-readable, so this proves the write tightens it
             # rather than merely inheriting an already-strict destination.
             Set-Content -LiteralPath $dest -Value 'OLD' -NoNewline
             [System.IO.File]::SetUnixFileMode($dest, 'UserRead, UserWrite, GroupRead, OtherRead')
@@ -191,7 +187,7 @@ Describe 'switch_claude_account' {
 
         # CreateNew on both platforms. The caller passes a fresh GUID-suffixed
         # path, so an existing file means something else planted it; refusing
-        # beats writing a credential into a file we do not own.
+        # beats writing a credential into a file sca does not own.
         It 'refuses an existing path rather than truncating it' {
             $dest = Join-Path $script:SandboxCredDir 'planted.bin'
             Set-Content -LiteralPath $dest -Value 'PLANTED' -NoNewline
@@ -202,9 +198,9 @@ Describe 'switch_claude_account' {
             Get-Content -LiteralPath $dest -Raw | Should -Be 'PLANTED'
         }
 
-        # The property the chmod-after-write shape could not provide: the mode
-        # is carried by open(2), so the bytes are never readable by anyone but
-        # the owner, not even for the duration of the write.
+        # The mode is carried by open(2) rather than a chmod after the write,
+        # so the bytes are never readable by anyone but the owner, not even
+        # for the duration of the write.
         It 'creates the file 0600 regardless of the process umask' -Skip:$IsWindows {
             $dest = Join-Path $script:SandboxCredDir 'private-mode.bin'
             Write-PrivateFileBytes -Path $dest -Bytes ([byte[]](78,69,87))
@@ -226,8 +222,6 @@ Describe 'switch_claude_account' {
             { Set-CredentialFileAtomic -Path $dest -Bytes ([byte[]](78,69,87)) } |
                 Should -Throw
 
-            # The destination is untouched and no temp litter was created or
-            # removed on our behalf.
             Get-Content -LiteralPath $dest -Raw | Should -Be 'ORIGINAL'
         }
 
@@ -303,7 +297,7 @@ Describe 'switch_claude_account' {
 
         # sca writes this file's oauthAccount block, but the file is Claude
         # Code's and lives outside the credentials directory. Choosing the mode
-        # of a file we create and re-permissioning one another tool owns are
+        # of a file sca creates and re-permissioning one another tool owns are
         # different acts; New-CredentialDirectory draws the same line for a
         # directory that already exists.
         It 'excludes ~/.claude.json' {
@@ -386,8 +380,7 @@ Describe 'switch_claude_account' {
         # Claude Code owns that file and rewrites it through its own atomic
         # rename, so repairing it would re-fire and re-announce after every
         # session rather than once. sca still writes its own bytes there at
-        # 0600; choosing the mode of a write is not the same act as
-        # re-permissioning another tool's file.
+        # 0600, the same line Get-CredentialFilePaths draws.
         It 'leaves ~/.claude.json alone' -Skip:$IsWindows {
             $claudeJson = Join-Path $script:SandboxHome '.claude.json'
             $loose      = [System.IO.UnixFileMode]'UserRead, UserWrite, GroupRead, OtherRead'
@@ -511,11 +504,10 @@ Describe 'switch_claude_account' {
             Read-ScaState | Should -BeNullOrEmpty
         }
 
-        # Auto-migration: this is what makes the redesign upgrade-safe for
-        # users coming from the hardlink-based version. With no state file
-        # but a .credentials.json that hashes to a known slot, we should
-        # bootstrap the state on first read and persist it so subsequent
-        # reads are O(1).
+        # Auto-migration is what makes a version that wrote no state file
+        # upgrade-safe. With no state file but a .credentials.json that
+        # hashes to a known slot, bootstrap the state on first read and
+        # persist it so subsequent reads are O(1).
         It 'auto-migrates when state file missing and .credentials.json hash matches a slot' {
             Set-Content -LiteralPath (Join-Path $script:SandboxCredDir '.credentials.json')      -Value 'PAYLOAD' -NoNewline
             Set-Content -LiteralPath (Join-Path $script:SandboxCredDir '.credentials.work.json') -Value 'PAYLOAD' -NoNewline
@@ -540,10 +532,9 @@ Describe 'switch_claude_account' {
             Set-Content -LiteralPath (Join-Path $script:SandboxCredDir '.credentials.work.json') -Value 'OTHER'   -NoNewline
 
             Read-ScaState | Should -BeNullOrEmpty
-            # Crucially: the migration must NOT write a state file when there
-            # is no match (otherwise we'd persist an active_slot=$null state
-            # and lose the chance for a later auto-save to do the right
-            # thing on first sca usage / sca switch invocation).
+            # The migration must NOT write a state file when there is no
+            # match: a persisted active_slot=$null state would cost a later
+            # auto-save its chance on the first `sca usage` / `sca switch`.
             Test-Path -LiteralPath $StateFile | Should -BeFalse
         }
 
@@ -565,7 +556,7 @@ Describe 'switch_claude_account' {
             Read-ScaState | Should -BeNullOrEmpty
         }
 
-        # Persisting the migration is an optimisation: it makes the next read
+        # Persisting the migration is an optimization: it makes the next read
         # O(1). The read itself already has the answer, so a failed write must
         # cost the caller nothing, and the migration simply runs again next
         # time.
@@ -652,10 +643,9 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Legacy state-file tolerance (v2.3.0 - v2.4.0-draft compatibility)' {
-        # State files written by 2.3.0 - 2.4.0-draft carry a
-        # `last_warmup_at` field. v2.4.0 drops the cooldown machinery
-        # but must still parse those files cleanly and silently drop
-        # the field on the next state-mutating write.
+        # Such a state file carries a `last_warmup_at` field from the
+        # cooldown machinery. It must still parse cleanly, and the field
+        # drops silently on the next state-mutating write.
 
         It 'Read tolerates a legacy state file carrying last_warmup_at and parses the rest' {
             $legacyJson = '{"schema":1,"active_slot":"work","last_sync_hash":"h-legacy","last_warmup_at":{"slot-1":1700000000000}}'

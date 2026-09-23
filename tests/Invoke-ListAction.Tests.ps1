@@ -70,9 +70,9 @@ Describe 'switch_claude_account' {
             $out | Should -Not -Match '(?m)^\s*\*?\s+\.credentials(\s|$)'
         }
 
-        # Post-v2.1.0: slots without sidecars are hidden entirely.
-        # Re-running `sca save <name>` while that slot is active
-        # recaptures the sidecar and makes it visible again.
+        # A slot without a sidecar is hidden entirely. Re-running
+        # `sca save <name>` while that slot is active recaptures the
+        # sidecar and makes it visible again.
         It 'hides slot files that have no sidecar' {
             New-SlotPair -CredDir $script:CredDirPath -Name 'modern' -Content 'M' | Out-Null
             Set-Content -LiteralPath (Join-Path $script:CredDirPath '.credentials.legacy.json') -Value 'L' -NoNewline
@@ -81,16 +81,13 @@ Describe 'switch_claude_account' {
 
             $out | Should -Match '(?m)^\s+modern\s'
             $out | Should -Not -Match '(?m)^\s+legacy\s'
-            # Legacy slot file remains on disk (not deleted by `list`),
-            # but is invisible in the table. User can `sca remove legacy`
-            # to clean up explicitly.
+            # `list` hides the file rather than deleting it; cleaning up
+            # stays an explicit `sca remove legacy`.
             Test-Path -LiteralPath (Join-Path $script:CredDirPath '.credentials.legacy.json') | Should -BeTrue
         }
 
-        # Email column rendering: parallels the Invoke-UsageAction email
-        # rendering tests below. The list table now carries the email
-        # inline in an Account column instead of the old `└─ <email>`
-        # continuation line.
+        # The list table carries the email inline in an Account column,
+        # never on a `└─ <email>` continuation line.
         It 'renders the email in the Account column when slot is labeled' {
             New-SlotPair -CredDir $script:CredDirPath -Name 'work' -Email 'ada.lovelace@arpa.net' -Content 'X' | Out-Null
 
@@ -139,12 +136,9 @@ Describe 'switch_claude_account' {
             $script:CredFilePath = Join-Path $script:CredDirPath '.credentials.json'
         }
 
-        # The hardlink-broken / ActiveLocked / "not hardlinked to any
-        # slot" advisories are gone with the rest of the hardlink
-        # mechanism. List is now a pure offline render: NO advisories
-        # under any state. The pending-state cases the old advisories
-        # warned about are now handled silently by reconcile next time
-        # the user runs `sca usage` or `sca switch`.
+        # List is a pure offline render: no advisory under any state.
+        # A pending state is handled silently by reconcile the next
+        # time the user runs `sca usage` or `sca switch`.
 
         It 'no advisory output ever, regardless of .credentials.json state' {
             New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Content 'A' | Out-Null

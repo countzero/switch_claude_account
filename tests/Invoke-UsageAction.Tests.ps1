@@ -97,9 +97,8 @@ Describe 'switch_claude_account' {
         It 'happy path: real /api/oauth/usage shape (buckets at root, utilization, ISO resets_at) renders table' {
             # Saved slot + .credentials.json byte-equal: reconcile sees a
             # hash match, no-ops, and the table renders the saved slot
-            # directly. The synth <active> row that previous versions
-            # appended on broken-hardlink state is gone; the active slot
-            # file IS the active credentials post-reconcile.
+            # directly. Post-reconcile the active slot file IS the active
+            # credentials, so no synthetic <active> row is appended.
             $slotPath = New-Slot -Name 'work'
             Copy-Item -LiteralPath $slotPath -Destination $script:CredFilePath -Force
 
@@ -136,7 +135,6 @@ Describe 'switch_claude_account' {
             $out | Should -Match '(?m)\s+ok\s*$'
             # Unofficial-endpoint footer must not leak into output.
             $out | Should -Not -Match 'unofficial endpoint'
-            # No synth row, no hardlink-broken warning (both gone).
             $out | Should -Not -Match '<active>'
             $out | Should -Not -Match 'not hardlinked'
             # And no row other than 'work' (one saved slot -> exactly one data row).
@@ -166,9 +164,9 @@ Describe 'switch_claude_account' {
             $out = Invoke-UsageAction 6>&1 | Out-String
 
             # 0% five_hour with null reset: cell is just ' 0%' (no 'in ...'
-            # suffix). With columns merged, the em-dash reset sentinel is
-            # no longer emitted when utilization is known; a cold bucket
-            # is naturally represented by its raw percent without a tail.
+            # suffix). With columns merged, a known utilization suppresses
+            # the em-dash reset sentinel, so a cold bucket reads as its raw
+            # percent without a tail.
             $out | Should -Match '\b0%'
             # The 5h cell has no paren tail; the 7d cell does (103h).
             $out | Should -Not -Match '0%\s+\('
@@ -271,13 +269,11 @@ Describe 'switch_claude_account' {
 
         # --- refresh-endpoint 429 handling ---
         #
-        # Regression for the bug originally reported via screenshot: a 429
-        # from /v1/oauth/token surfaced as `expired: Response status code
-        # does not indicate success: 429 (Too Many Requests).`; long
-        # enough to wrap the table row, and mislabeled relative to the
-        # 'rate-limited' handling that already existed for the usage
-        # endpoint. After the fix the same 429 routes through Test-Is429
-        # and renders cleanly, with cache fallback when available.
+        # A 429 from /v1/oauth/token routes through Test-Is429 and renders as
+        # 'rate-limited', with cache fallback when available. Untested, it
+        # surfaces as `expired: Response status code does not indicate
+        # success: 429 (Too Many Requests).`: long enough to wrap the table
+        # row, and mislabeled against the usage endpoint's own 429 handling.
 
         It 'refresh 429 with no cache: status is rate-limited (not expired); no long error tail' {
             $slotPath = New-Slot -Name 'slot-1' -ExpiresAt $script:PastMs
@@ -346,7 +342,7 @@ Describe 'switch_claude_account' {
             # Cache-fallback advisory fires, naming the slot and noting the
             # last-known data is being shown.
             $out | Should -Match 'currently rate-limited or at a plan limit; showing last known usage'
-            # Old advisory wording must not leak through.
+            # Neither generic rate-limit wording may fire in its place.
             $out | Should -Not -Match '/api/oauth/usage rate limited'
             $out | Should -Not -Match 'showing cached data'
         }
@@ -462,8 +458,7 @@ Describe 'switch_claude_account' {
         # error / no-oauth) with plan-usability derived from the
         # utilization fields. A slot at 100% of its 5h window is rate-
         # limited and cannot serve prompts until the window resets;
-        # rendering that as 'ok' would mislead the user (the bug these
-        # tests guard against).
+        # rendering that as 'ok' would mislead the user.
         It 'plan status is "limited 5h" when five_hour utilization is at 100%' {
             New-Slot -Name 'capped' | Out-Null
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
@@ -592,21 +587,18 @@ Describe 'switch_claude_account' {
             # alone.
             $out | Should -Match '(?m)^\s+Status:\s+limited 5h - no prompts until 5h window resets'
 
-            # Bucket rows still render below the Status line. Renamed
-            # from 'Session (5h)' / 'Weekly (all models)' to 'Session' /
-            # 'Week' to match the table column headers and the
-            # aggregate-bar labels above the table.
+            # Bucket rows still render below the Status line, labeled to
+            # match the table column headers and the aggregate-bar labels
+            # above the table.
             $out | Should -Match 'Session\s+100%\s+Resets '
             $out | Should -Match 'Week\s+28%\s+Resets '
         }
 
-        # When sca usage triggers a token refresh on the active slot,
-        # the new tokens must propagate to .credentials.json so Claude
-        # Code's next call uses the latest refresh_token. Pre-state-file
-        # this happened automatically through the hardlink; now
-        # Update-SlotTokens explicitly atomic-writes both endpoints when
-        # the slot is the tracked active. Regression guard for the
-        # correctness fix described in AGENTS.md.
+        # When sca usage triggers a token refresh on the active slot, the new
+        # tokens must propagate to .credentials.json or Claude Code's next
+        # call carries a refresh_token the server has already rotated away.
+        # Update-SlotTokens atomic-writes both endpoints when the slot is the
+        # tracked active.
         It 'refresh on active slot propagates new tokens to .credentials.json' {
             $slotPath = New-Slot -Name 'activeStale' -AccessToken 'sk-ant-oat-OLD' -ExpiresAt $script:PastMs
 
@@ -720,13 +712,10 @@ Describe 'switch_claude_account' {
         # filters that slot out of Get-Slots and returns $null. The
         # naive guard `if ($activeSlot -and $activeSlot.Path -eq ...)`
         # would silently skip propagation, leaving .credentials.json
-        # with the old refresh_token Anthropic just rotated away --
+        # with the old refresh_token Anthropic just rotated away:
         # Claude Code's next refresh would then 4xx and force re-login.
-        # Update-SlotTokens detects this case (active_slot set but
-        # Find-SlotByName null AND the parsed slot-name from $SlotPath
-        # equals state.active_slot) and emits a yellow advisory
-        # pointing at `sca save` / `sca switch` for recovery, without
-        # auto-propagating (sidecar absence is the visibility gate).
+        # Update-SlotTokens advises instead of auto-propagating, because
+        # sidecar absence is the visibility gate; see Update-SlotTokens.
         #
         # Driven through Update-SlotTokens directly: Invoke-UsageAction
         # cannot reach the new branch because Get-UsageSnapshot ->
@@ -754,10 +743,6 @@ Describe 'switch_claude_account' {
                 }
             }
 
-            # 6>&1 merges the Write-Color information stream into the
-            # success stream alongside Update-SlotTokens' return value
-            # (the new access token); Out-String stringifies both so a
-            # single Should -Match can probe for the advisory wording.
             $out = Update-SlotTokens -SlotPath $slotPath 6>&1 | Out-String
 
             # Advisory fired with sidecar-specific wording and the
@@ -765,8 +750,7 @@ Describe 'switch_claude_account' {
             $out | Should -Match 'identity sidecar is missing'
             $out | Should -Match 'sca save activeStale'
 
-            # Slot file got the new tokens (rotation reached the slot
-            # file via Update-SlotTokens' first atomic write).
+            # Slot file got the new tokens.
             $slotJson = Get-Content -LiteralPath $slotPath -Raw | ConvertFrom-Json
             $slotJson.claudeAiOauth.accessToken | Should -Be 'sk-ant-oat-NEW'
 
@@ -781,13 +765,12 @@ Describe 'switch_claude_account' {
             (Read-ScaState).last_sync_hash | Should -Be $hash
         }
 
-        # Pin the name-comparison guard inside the new elseif: when
-        # the tracked active slot is sidecar-hidden BUT we are
-        # refreshing some OTHER slot, the advisory must NOT fire
-        # (otherwise every refresh on any slot would print a
-        # false-positive warning while a hidden active exists, and the
-        # advisory text "Token refreshed in slot '<active>'" would be
-        # factually wrong about which slot was just refreshed).
+        # Pin the name comparison inside that branch: when the tracked
+        # active slot is sidecar-hidden but the refresh is on some OTHER
+        # slot, the advisory must NOT fire. Otherwise every refresh on any
+        # slot would print a false-positive warning while a hidden active
+        # exists, and the advisory text "Token refreshed in slot '<active>'"
+        # would name the wrong slot.
         It 'refresh on unrelated slot when active is sidecar-hidden does NOT print sidecar advisory' {
             $activeSlot   = New-Slot -Name 'active'   -AccessToken 'sk-ant-oat-ACTIVE'
             $inactiveSlot = New-Slot -Name 'inactive' -AccessToken 'sk-ant-oat-OLD' -ExpiresAt $script:PastMs
@@ -813,9 +796,8 @@ Describe 'switch_claude_account' {
             $out = Update-SlotTokens -SlotPath $inactiveSlot 6>&1 | Out-String
             $afterCred = Get-Content -LiteralPath $script:CredFilePath -Raw
 
-            # .credentials.json untouched: refresh hit 'inactive', and
-            # the elseif's name comparison ($parsed.Name -eq
-            # state.active_slot) rejects the false-positive case.
+            # .credentials.json untouched: refresh hit 'inactive', and the
+            # name comparison rejects the false-positive case.
             $afterCred | Should -Be $beforeCred
             $out | Should -Not -Match 'identity sidecar is missing'
         }
@@ -882,9 +864,9 @@ Describe 'switch_claude_account' {
             $out | Should -Match '(?m)^\s+Week\s+\d'
             $out | Should -Match 'Resets '
 
-            # Explicitly absent: labels for buckets we deliberately stopped
-            # rendering. Protects against accidental regression if a future
-            # refactor reintroduces a generic bucket loop.
+            # Explicitly absent: labels for the buckets deliberately not
+            # rendered, so a future refactor reintroducing a generic bucket
+            # loop fails here.
             $out | Should -Not -Match 'Weekly \(Opus only\)'
             $out | Should -Not -Match 'Weekly \(Sonnet only\)'
             $out | Should -Not -Match 'Extra usage'
@@ -892,7 +874,7 @@ Describe 'switch_claude_account' {
             $out | Should -Not -Match '(?m)^\s+five_hour\b'
             $out | Should -Not -Match '(?m)^\s+seven_day\b'
 
-            # Unofficial-endpoint footer removed.
+            # No unofficial-endpoint footer.
             $out | Should -Not -Match 'unofficial endpoint'
             Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
         }
@@ -951,10 +933,9 @@ Describe 'switch_claude_account' {
 
         It 'reconcile auto-saves an unknown active credential under a fresh name' {
             # No saved slots, .credentials.json present with novel tokens.
-            # Identity comes from ~/.claude.json (post-v2.1.0 probe), so
-            # set that up too; without it the auto-save would write a
-            # sidecar-less invisible slot and the table assertion below
-            # wouldn't find a row.
+            # Identity comes from ~/.claude.json, so set that up too;
+            # without it the auto-save would write a sidecar-less invisible
+            # slot and the table assertion below wouldn't find a row.
             $payload = @{
                 claudeAiOauth = @{
                     accessToken      = 'sk-ant-oat-LONER'
@@ -1012,7 +993,7 @@ Describe 'switch_claude_account' {
         # --- Get-UsageSnapshot / Format-UsageFrame / -Watch guards ---
         #
         # The watch loop itself (sleeps + key reads) is not unit-tested;
-        # instead we exercise the three seams it is built on:
+        # instead we exercise the seams it is built on:
         #   1. Get-UsageSnapshot returns the data shape the loop consumes.
         #   2. Format-UsageFrame renders a frame + optional footer.
         #   3. Invoke-UsageAction -Watch refuses bad surfaces (redirected
@@ -1081,11 +1062,10 @@ Describe 'switch_claude_account' {
             $snap.PSObject.Properties.Name | Should -Not -Contain 'HasCacheFallback'
         }
 
-        # Regression guard for the blind spot that hid this for two releases:
-        # Format-UsageTable's 'error <code>' arm reads $Row.HttpStatus, but
-        # Get-UsageSnapshot did not project it, so the arm was unreachable in
-        # every real code path while its unit test passed against a hand-built
-        # row that already carried the field.
+        # Format-UsageTable's 'error <code>' arm reads $Row.HttpStatus, so
+        # Get-UsageSnapshot has to project it. Without the projection the arm
+        # is unreachable in every real code path while its unit test still
+        # passes against a hand-built row that carries the field.
         It 'Get-UsageSnapshot projects HttpStatus onto the row' {
             New-Slot -Name 'beta' | Out-Null
             Mock Invoke-RestMethod -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' } -MockWith {
@@ -1214,8 +1194,8 @@ Describe 'switch_claude_account' {
 
             $out = Format-UsageFrame -Snapshot $snap -Footer "[Watch] Last poll at 07:56:48" 6>&1 | Out-String
 
-            # Advisory moved out from under the table and into the footer
-            # block, leading the [Watch] line (and, when present, [Monitor]).
+            # The advisory sits in the footer block, leading the [Watch] line
+            # (and, when present, [Monitor]).
             # 'throttled' appears first in the table row, then again in the
             # advisory; the advisory-only phrase anchors the ordering check.
             ($out.IndexOf('throttled')) | Should -BeLessThan ($out.IndexOf('sca warmup'))
@@ -1228,19 +1208,10 @@ Describe 'switch_claude_account' {
         }
 
         It 'Invoke-UsageAction -Watch throws when stdout is redirected (interactive guard)' {
-            # Pester cannot truly redirect the outer console, but we can
-            # fake [Console]::IsOutputRedirected by defining a local
-            # override. Use the script's defensive: we expect the check
-            # to run before any loop / HTTP, so the throw should be
-            # deterministic. To simulate, we temporarily alias Console's
-            # static property via a wrapper: not feasible without PSCustom
-            # refactor, so instead we assert the *loop itself does not run*
-            # by setting -Interval high and confirming the guard fires
-            # before any HTTP call. The cleanest check is to rely on the
-            # happy-path assertion elsewhere and skip the redirected test
-            # when [Console]::IsOutputRedirected is false (the Pester
-            # subprocess runs with stdout redirected, so IsOutputRedirected
-            # returns $true and the guard fires naturally).
+            # [Console]::IsOutputRedirected is a static property no mock can
+            # reach, so the guard is exercised only where the host already
+            # satisfies it: the Pester subprocess runs with stdout redirected
+            # and the throw fires naturally. Any other host skips.
             if (-not [Console]::IsOutputRedirected) {
                 Set-ItResult -Skipped -Because 'Console stdout is not redirected in this host; guard cannot be exercised here.'
                 return
@@ -1638,15 +1609,15 @@ Describe 'switch_claude_account' {
         # A slot at the weekly hard cap serves no prompt until the week
         # resets, so it leaves the Session average entirely, denominator
         # included: the number reports reachable capacity, and that slot's
-        # idle 5h reading describes capacity nobody can spend. These six pin
-        # the exclusion, its boundary, the all-capped floor, and the two
+        # idle 5h reading describes capacity nobody can spend. These pin the
+        # exclusion, its boundary, the all-capped floor, and the two
         # directions the rule does NOT run in.
 
         It 'drops a 7d-capped row from the Session average' {
             # 5h = 20/1 = 20. Not 10 (which would keep row 'a' in the
             # denominator at its idle 0%) and not 60 (which would score it
             # 100 and answer a question about nominal rather than reachable
-            # capacity). The three candidate rules are distinguishable here.
+            # capacity). Each candidate rule scores this fixture differently.
             $rows = @(
                 (New-OkRow -Name 'a' -FiveUtil  0 -SevenUtil 100)
                 (New-OkRow -Name 'b' -FiveUtil 20 -SevenUtil 0)
@@ -1809,7 +1780,6 @@ Describe 'switch_claude_account' {
         It 'renamed table column headers: "Session" / "Week" replace "5h" / "7d"' {
             $rows = @( (New-OkRow -Name 'alpha') )
             $out  = Format-UsageTable -Results $rows 6>&1 | Out-String
-            # New literals present; old literals absent in header line.
             $out | Should -Match '(?m)^\s+Slot\s+Account\s+Session\s+Week\s+Status\s*$'
             $out | Should -Not -Match '(?m)^\s+Slot\s+Account\s+5h\s+7d\s+Status\s*$'
         }
@@ -1883,7 +1853,7 @@ Describe 'switch_claude_account' {
             $future = [DateTimeOffset]::UtcNow.AddDays(4).AddHours(7).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
             # 4d 7h = 103h; test elapsed time may trim a minute so 102 or 103.
             Format-ResetDelta $future | Should -Match '^\(10[23]h\)$'
-            # And definitely not the old "Xd Yh" format.
+            # Never a days unit.
             Format-ResetDelta $future | Should -Not -Match 'd '
         }
 
@@ -1947,9 +1917,8 @@ Describe 'switch_claude_account' {
     Context 'Get-SlotProfile' {
         # Reuses the New-Slot BeforeAll helper from the Invoke-UsageAction
         # context so slot files have the exact claudeAiOauth shape the
-        # helper expects. Profile caching was removed along with the
-        # sidecar scheme; Get-SlotProfile is now a pure HTTP helper used
-        # by Invoke-SaveAction to embed the email in the slot filename.
+        # helper expects. Get-SlotProfile is a pure HTTP helper, uncached,
+        # used by Invoke-SaveAction to embed the email in the slot filename.
         BeforeAll {
             function New-ProfileSlot {
                 Param (
@@ -1989,9 +1958,9 @@ Describe 'switch_claude_account' {
             $res.Status | Should -Be 'ok'
             $res.Email  | Should -Be 'alice@example.com'
 
-            # No caching: a second call fires another HTTP request. This
-            # is by design; email is now encoded in the slot filename at
-            # save time, so Get-SlotProfile is only called at save time.
+            # No caching: a second call fires another HTTP request. The
+            # email is encoded into the slot filename at save time, which
+            # is the only time Get-SlotProfile runs.
             Get-SlotProfile -SlotPath $slot | Out-Null
             Should -Invoke Invoke-RestMethod -Times 2 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/profile' }
         }
@@ -2256,10 +2225,9 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Get-SlotUsage (429 retry-after-sleep on first-time cache miss)' {
-        # Documented behavior (see source ~line 2160): on usage-endpoint
-        # 429, if the slot has NO cache entry at all (first poll ever
-        # for this slot, hit by 429), wait 5s and retry once. Mock
-        # Start-Sleep so the test is fast.
+        # On a usage-endpoint 429 with NO cache entry at all (first poll ever
+        # for this slot), wait 5s and retry once; see Get-SlotUsage in the
+        # script. Start-Sleep is mocked so the test is fast.
         BeforeEach {
             $script:CredDirPath = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
@@ -2387,7 +2355,7 @@ Describe 'switch_claude_account' {
 
             $r = Get-SlotUsage -SlotPath $slot
             $r.Status | Should -Be 'rate-limited'
-            # Stale cache is now served (marked) so the row keeps its
+            # Stale cache is served and marked, so the row keeps its
             # last-known numbers instead of collapsing to em-dashes.
             $r.IsCachedFallback           | Should -BeTrue
             $r.Data.five_hour.utilization | Should -Be 1
@@ -2397,10 +2365,10 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Get-SlotUsage (network / timeout resilience)' {
-        # A codeless transport failure (the HttpClient.Timeout case)
-        # used to return Status='error' immediately, discarding a perfectly
-        # good cached reading and wiping the row's numbers for a whole poll
-        # interval. It now runs the same fallback ladder as the 429 arm.
+        # A codeless transport failure (the HttpClient.Timeout case) runs the
+        # same fallback ladder as the 429 arm. Returning Status='error'
+        # straight away would discard a perfectly good cached reading and
+        # wipe the row's numbers for a whole poll interval.
         BeforeEach {
             $script:CredDirPath = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $script:CredDirPath -Force | Out-Null
@@ -2418,8 +2386,7 @@ Describe 'switch_claude_account' {
             }
 
             # The real message PS7 raises for -TimeoutSec: a TaskCanceledException
-            # carrying NO .Response, which is what made $status $null and sent the
-            # row down the generic arm.
+            # carrying NO .Response, so $status stays $null.
             $script:TimeoutMessage = 'The request was canceled due to the configured HttpClient.Timeout of 12 seconds elapsing.'
 
             # A coded failure carrying a .Response, for the arms that branch on
@@ -2928,9 +2895,8 @@ Describe 'switch_claude_account' {
             $out | Should -Not -Match 'timed out'
         }
 
-        # Every hard-failure label is a short fixed string. The parenthetical
-        # remedies these used to carry ('no-oauth (api key or non-claude.ai
-        # slot)' and friends) moved to Format-UsageAdvisory's reason lines.
+        # Every hard-failure label is a short fixed string; the remedy for
+        # each lives on Format-UsageAdvisory's reason lines instead.
         It 'renders hard-failure statuses as bare labels' -ForEach @(
             @{ Status = 'no-oauth';     Hint = 'api key' }
             @{ Status = 'expired';      Hint = 'sca switch' }
@@ -2950,7 +2916,7 @@ Describe 'switch_claude_account' {
         }
     }
 
-    # The three units Format-UsageTable orchestrates. Asserted directly rather
+    # The units Format-UsageTable orchestrates. Asserted directly rather
     # than through rendered output: a cell rule that only a regex over a whole
     # table can reach is a rule nothing can pin down when it changes.
     Context 'Get-UsageStatusLabel' {
@@ -3405,10 +3371,10 @@ Describe 'switch_claude_account' {
 
     Context 'Get-SlotUsage token-refresh failure fallback' {
         # The token POST is the slowest of the three calls, so a transport
-        # blip is likeliest to land there. Without the cache ladder one slow hourly refresh wiped the row
-        # to em-dashes, printed the 'run sca switch' remedy for something
-        # sca switch cannot fix, and turned the monitor's active row into
-        # 'active-unknown', pausing rotation.
+        # blip is likeliest to land there. Without the cache ladder one slow
+        # hourly refresh wiped the row to em-dashes, printed the 'run sca
+        # switch' remedy for something sca switch cannot fix, and turned the
+        # monitor's active row into 'active-unknown', pausing rotation.
 
         BeforeEach {
             $script:TokSlot = Join-Path $script:SandboxHome '.claude/.credentials.tok(t@x.io).json'
@@ -3477,8 +3443,8 @@ Describe 'switch_claude_account' {
 
         # Update-SlotTokens also throws for a refresh response it cannot use and
         # for a slot-file write that fails after the server rotated the token.
-        # Neither carries an HTTP status, and both used to be read as a
-        # transport blip and served from a fresh cache as a healthy 'ok'.
+        # Neither carries an HTTP status, so reading either as a transport blip
+        # would serve a dead slot from a fresh cache as a healthy 'ok'.
         It 'reports expired when the refresh response is unusable: <Case>' -ForEach @(
             @{ Case = 'no access_token'; Body = @{ expires_in = 3600 } }
             @{ Case = 'no expires_in';   Body = @{ access_token = 'AT' } }
@@ -3527,12 +3493,11 @@ Describe 'switch_claude_account' {
             }
         }
 
-        # Email now lives in the slot filename; Get-Slots parses it via
+        # The email lives in the slot filename; Get-Slots parses it via
         # Get-SlotFileInfo and propagates .Email into the row objects.
         # These tests stage the filenames directly rather than running
         # Invoke-SaveAction, so they isolate the display path. Each
-        # also drops a sidecar so Get-Slots includes the row (post-v2.1.0
-        # contract).
+        # also drops a sidecar so Get-Slots includes the row.
         BeforeAll {
             function New-TestSidecar {
                 Param ([string] $SlotPath, [string] $Email)
@@ -3572,9 +3537,8 @@ Describe 'switch_claude_account' {
 
             $out = Invoke-UsageAction 6>&1 | Out-String
 
-            # Single-line row: slot name + email on the same line (the
-            # Account column is the second column now). No more '└─'
-            # continuation line anywhere.
+            # Single-line row: slot name + email on the same line, the
+            # Account column being the second, and no '└─' continuation.
             $out | Should -Match '(?m)^\s+work\s+ada\.lovelace@arpa\.net\b'
             $out | Should -Not -Match '└─'
             # Zero profile HTTP calls on the display path; email is from
@@ -3820,16 +3784,12 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Invoke-WarmAllSlots' {
-        # The orchestrator behind `sca warmup` and `-Warmup` startup.
-        # Builds its own snapshot from Get-Slots (filtered by -Name), then
-        # for each slot in alphabetical order: marks Status='priming' ->
-        # Invoke-SlotSwap makes it active -> Invoke-SlotActivator runs
-        # `claude -p` as that slot to open its 5h server-side session
-        # window -> on ok, Invoke-Reconcile mirrors then Get-SlotUsage
-        # reads live data -> copies result onto the row. Returns the
-        # populated snapshot; the caller hands it off to the polling loop
-        # as its first frame. A finally block restores the original active
-        # slot captured before the loop.
+        # The orchestrator behind `sca warmup` and `-Warmup` startup: per
+        # slot, alphabetically, swap it active and run `claude -p` to open
+        # its 5h server-side session window, then mirror and read usage back
+        # onto the row. The populated snapshot becomes the polling loop's
+        # first frame, and the original active slot is restored afterwards.
+        # See Invoke-WarmAllSlots in the script.
 
         BeforeAll {
             function New-WarmupSlot {
@@ -4289,7 +4249,7 @@ Describe 'switch_claude_account' {
             $snap.Advisory    | Should -Match "active on 'c'"
         }
 
-        # The three ways the mirror that the round-robin depends on can fail to
+        # The ways the mirror that the round-robin depends on can fail to
         # happen. Each ends with a slot holding a refresh token the server has
         # already rotated unless the pass stops, which is the one loss here no
         # later pass repairs. See Invoke-Reconcile's `Captured`.
@@ -4383,12 +4343,11 @@ Describe 'switch_claude_account' {
             $script:swapNames = @()
             Mock Invoke-SlotSwap -MockWith { Param ($Slot); $script:swapNames += $Slot.Name }
 
-            # Throws on the repaint that carries the abort advisory, which is
-            # the one this fix moved the decision in front of. The trigger is
-            # the advisory itself rather than a call count, so the test also
-            # fails if the decision moves back behind the repaint: the advisory
-            # would not be there yet, nothing would throw, and Should -Throw
-            # would catch it.
+            # Throws on the repaint that carries the abort advisory, which the
+            # decision has to precede. The trigger is the advisory itself
+            # rather than a call count, so the test also fails if the decision
+            # moves back behind the repaint: the advisory would not be there
+            # yet, nothing would throw, and Should -Throw would catch it.
             { Invoke-WarmAllSlots -Name '' -Repaint { Param ($snap) if ($snap.Advisory) { throw 'synthetic renderer failure' } } } |
                 Should -Throw '*synthetic renderer failure*'
 
@@ -4442,7 +4401,7 @@ Describe 'switch_claude_account' {
         }
 
         It 'a swap failure fails its own slot only, because an atomic rename leaves the file captured' {
-            # The counterpart to the three aborts above: Invoke-SlotSwap writes
+            # The counterpart to the aborts above: Invoke-SlotSwap writes
             # through an atomic rename, so a throw leaves .credentials.json
             # exactly as the previous slot's mirror captured it. Nothing is at
             # risk, so the pass must NOT stop.
@@ -4716,10 +4675,10 @@ Describe 'switch_claude_account' {
             Should -Invoke Invoke-WarmAllSlots -Times 1 -Exactly
         }
 
-        # The round-robin no longer refuses a live client. Claude Code
-        # serializes refreshes across its own processes, so the `claude -p` a
-        # warm pass spawns cannot race the live session's grant; what is left
-        # is a prompt sent mid-pass billing the mounted slot. See
+        # The round-robin runs beside a live client. Claude Code serializes
+        # refreshes across its own processes, so the `claude -p` a warm pass
+        # spawns cannot race the live session's grant; what is left is a
+        # prompt sent mid-pass billing the mounted slot. See
         # Test-ClaudeRunning.
         It 'warms even when Claude Code is running' {
             Mock Test-ClaudeRunning { $true }
@@ -4885,7 +4844,6 @@ Describe 'switch_claude_account' {
         }
 
         It 'omitting -WarmupFailures keeps the flat-cooldown behaviour' {
-            # Backward compatibility for one-shot callers and existing tests.
             $times = @{ 'a' = [DateTime]::Now.AddMinutes(-6) }
             $snap  = New-KwSnapshot @( (New-KwRow -Name 'a' -FiveResetsAt $null) )
 
@@ -5048,8 +5006,8 @@ Describe 'switch_claude_account' {
         }
 
         # Claude Code's own plan-limit sentences say neither 'rate limit' nor
-        # '429', so they used to fall into the default arm and surface as a
-        # hard 'error' on a plainly throttled slot.
+        # '429', so without their own arm they fall through to the default
+        # one and surface as a hard 'error' on a plainly throttled slot.
         It 'plan-limit text returns Status=rate-limited with the reset time kept: <Case>' -ForEach @(
             @{ Case = 'session limit'; Message = "You've hit your session limit `u{00B7} resets 6:10pm (Europe/Berlin)" }
             @{ Case = 'weekly limit';  Message = "You've hit your weekly limit `u{00B7} resets Nov 4 at 9am"            }
@@ -5069,10 +5027,9 @@ Describe 'switch_claude_account' {
         }
 
         It 'stores the reason raw, leaving the bound to the renderer' {
-            # 3 of the 10 sites that stamp .Error used to truncate and 7 did
-            # not, so a stored bound was never an invariant. Every display path
-            # runs through Format-StatusErrorTail, so the row (and -Json) keeps
-            # the full text.
+            # The bound belongs to the renderer: every display path runs
+            # through Format-StatusErrorTail, so a stored one would only cost
+            # the row (and -Json) text no consumer can recover.
             $path = New-ActivatorSlot -Name 'verbose'
             $long = 'Z' * ($Script:AdvisoryReasonMaxWidth * 3)
             Mock Invoke-ClaudeActivatorProcess -MockWith {
