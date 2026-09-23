@@ -86,10 +86,10 @@ When your changes overlap foreign WIP in the same file, stop and ask. Do not res
 
 ## Version Control
 
-- [Semantic Versioning](https://semver.org/). LF line endings enforced via `.gitattributes`.
+- [Semantic Versioning](https://semver.org/), with what counts as MAJOR, MINOR and PATCH for this script in `docs/conventions.md` → *Version numbers*. LF line endings enforced via `.gitattributes`.
 - **Branches**: `main` and `develop` are long-lived. A pull request takes `develop` into `main` and carries a release.
 - **Commits** take the [Conventional Commits](https://www.conventionalcommits.org/) form, `type(scope): imperative summary`, with the *why* in the body and no `Co-Authored-By` trailer. Common Changelog argues against this convention; the reason this repository keeps it anyway is `docs/conventions.md` → *Commit messages*.
-- **Changelog** follows [Common Changelog](https://common-changelog.org) with two deliberate deviations, each recorded with its reason in `docs/conventions.md` → *Changelog*. An entry is one imperative line of around 100 characters saying what changed, never why; the why is the commit body. Edit `CHANGELOG.md` only as a step of a release.
+- **Changelog** follows [Common Changelog](https://common-changelog.org) with two deliberate deviations, each recorded with its reason in `docs/conventions.md` → *Changelog*. An entry is one imperative line of around 100 characters saying what changed, never why; the why is the commit body. One entry per change rather than per commit, and prose earns one only in the four cases listed there. Edit `CHANGELOG.md` only as a step of a release.
 - A **pull request** body is English and answers **what** changed and **why**, names the **shortcomings** of the approach, says **which feedback** you want, and lists **what is not done**. A link supplements it and never carries it. A release groups its account by version, newest first. `docs/pull_requests.md`.
 - A **release** is tagged `vX.Y.Z` on the merge commit of its pull request, never on the `chore(release)` commit, and its asset is attached by `release-assets.yml` rather than by hand. `docs/releases.md`.
 
