@@ -3404,9 +3404,8 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Get-SlotUsage token-refresh failure fallback' {
-        # The token POST carries the largest budget of the three calls
-        # ($Script:TokenTimeoutSec), so a transport blip is likeliest to land
-        # there. Without the cache ladder one slow hourly refresh wiped the row
+        # The token POST is the slowest of the three calls, so a transport
+        # blip is likeliest to land there. Without the cache ladder one slow hourly refresh wiped the row
         # to em-dashes, printed the 'run sca switch' remedy for something
         # sca switch cannot fix, and turned the monitor's active row into
         # 'active-unknown', pausing rotation.

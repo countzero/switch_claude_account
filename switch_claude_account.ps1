@@ -298,23 +298,29 @@ $Script:UsageUserAgent      = "claude-code/2.1.278"
 # a live subscription span 46-2108 ms, so a shared 5 s budget left under
 # 2.4x headroom and a single latency spike collapsed a slot's row to an
 # 'error' carrying no numbers.
-# The refresh POST gets its own (larger) budget rather than borrowing the
-# usage constant: it does server-side crypto plus refresh-token rotation, so
-# it is the slowest of the three calls and was the one running tightest.
+#
+# All three sit above 21 s, the time Windows takes to abandon a TCP connect
+# (SYN retransmits at 3 + 6 + 12 s, measured 21.1 s). .NET tries IPv6 first and
+# moves to IPv4 only after that, so on a network whose IPv6 route silently
+# drops packets a shorter budget failed every request that IPv4 would have
+# answered. A budget cannot do the same on Linux, whose connect gives up only
+# after about 127 s (tcp_syn_retries = 6).
 #
 # What one slot can cost a watch frame, since Get-UsageSnapshot polls slots
 # serially and the loop cannot repaint mid-poll:
-#   * usage read times out                     -> 12 s.
-#   * refresh times out                        -> 15 s, and the usage call is
-#     never made (Get-SlotUsage returns on the token failure), so 15 s is the
-#     ceiling for that path rather than 12 + 15.
-#   * refresh succeeds slowly, then usage times out -> up to 27 s. This is the
+#   * usage read times out                     -> 30 s.
+#   * refresh times out                        -> 30 s, and the usage call is
+#     never made (Get-SlotUsage returns on the token failure), so 30 s is the
+#     ceiling for that path rather than 30 + 30.
+#   * refresh succeeds slowly, then usage times out -> up to 60 s. This is the
 #     real worst case for a reachable-but-degraded endpoint.
+#   * dead IPv6, live IPv4                     -> about 21 s per request that
+#     opens a connection, so a poll of three slots outlasts the 60 s interval.
 #   * refresh 429s three times                 -> ~6 s of backoff on top,
 #     because a 429 answers fast; see the retry policy below.
-$Script:UsageTimeoutSec     = 12
-$Script:TokenTimeoutSec     = 15
-$Script:ProfileTimeoutSec   = 10
+$Script:UsageTimeoutSec     = 30
+$Script:TokenTimeoutSec     = 30
+$Script:ProfileTimeoutSec   = 30
 
 # Retry policy for /v1/oauth/token on a 429 response. Empirically the
 # refresh endpoint's per-token rate limiter has a short cooldown
@@ -4215,10 +4221,10 @@ function Get-SlotUsage {
             if ($verdict) { return $verdict }
         }
         elseif ($tok.Status -eq 'expired' -and $tok.Transport) {
-            # The refresh POST died in transport, not on its merits. Its budget
-            # is the largest of the three calls ($Script:TokenTimeoutSec), so
-            # this is the likeliest place for a blip to land, and without the
-            # ladder one slow hourly refresh wiped the row to em-dashes, printed
+            # The refresh POST died in transport, not on its merits. It is the
+            # slowest of the three calls (server-side crypto plus refresh-token
+            # rotation), so this is the likeliest place for a blip to land, and
+            # without the ladder one slow hourly refresh wiped the row to em-dashes, printed
             # the 'run sca switch' remedy for something sca switch cannot fix,
             # and (in `sca monitor`) turned the active row into 'active-unknown',
             # pausing rotation until the next poll happened to succeed.
