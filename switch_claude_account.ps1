@@ -302,7 +302,7 @@ $Script:UsageUserAgent      = "claude-code/2.1.278"
 # All three sit above 21 s, the time Windows takes to abandon a TCP connect
 # (SYN retransmits at 3 + 6 + 12 s, measured 21.1 s). .NET tries IPv6 first and
 # moves to IPv4 only after that, so on a network whose IPv6 route silently
-# drops packets a shorter budget failed every request that IPv4 would have
+# drops packets a shorter budget fails every request that IPv4 would have
 # answered. A budget cannot do the same on Linux, whose connect gives up only
 # after about 127 s (tcp_syn_retries = 6).
 #
@@ -4224,10 +4224,11 @@ function Get-SlotUsage {
             # The refresh POST died in transport, not on its merits. It is the
             # slowest of the three calls (server-side crypto plus refresh-token
             # rotation), so this is the likeliest place for a blip to land, and
-            # without the ladder one slow hourly refresh wiped the row to em-dashes, printed
-            # the 'run sca switch' remedy for something sca switch cannot fix,
-            # and (in `sca monitor`) turned the active row into 'active-unknown',
-            # pausing rotation until the next poll happened to succeed.
+            # without the ladder one slow hourly refresh wiped the row to
+            # em-dashes, printed the 'run sca switch' remedy for something sca
+            # switch cannot fix, and (in `sca monitor`) turned the active row
+            # into 'active-unknown', pausing rotation until the next poll
+            # happened to succeed.
             #
             # The verdict comes from Resolve-SlotAccessToken, which had the
             # exception; see Test-IsTransportFailure for what it excludes.
@@ -5933,7 +5934,6 @@ function Format-UsageFooter {
 # Word-wrap one footer line to -Width columns. Continuation rows hang under the
 # text after the leading "[Tag] ", so a wrapped message reads as one block. A
 # word longer than a row is hard-broken; -Width 0 (unknown) wraps nothing.
-# The indent is dropped when it would leave less than half a row for text.
 function Split-FooterLine {
     Param (
         [AllowEmptyString()] [string] $Text,
