@@ -13,14 +13,11 @@ description: >
 This skill performs 3 iterative review passes over a pull request diff with
 escalating focus: general defects, cross-file interactions, then absent
 behavior. After all passes, a final summary deduplicates, validates, assigns
-severity, and filters to Critical/High/Medium. The output includes clickable
-deep links to the relevant code on GitHub so the developer or reviewer can
-easily navigate to each finding.
+severity, and filters to Critical/High/Medium.
 
 ### PR and Diff Resolution
 
-1. Run `gh pr view --json number,baseRefName,state,isDraft`. This single call
-   determines whether a PR exists and, if so, its state.
+1. Run `gh pr view --json number,baseRefName,state,isDraft`.
 2. **If a PR exists:**
    - If the PR is closed or a draft, inform the user and stop.
    - Otherwise, use the PR's `baseRefName` as the base for the diff.
@@ -91,9 +88,8 @@ final severity tables directly in the conversation.
 
 ### Review Passes
 
-Three passes over the full diff, each with a different focus. All passes
-review the full diff. Findings are recorded **without severity**: just File,
-Line(s), and Description.
+Three passes over the full diff, each with a different focus. Findings are
+recorded **without severity**: just File, Line(s), and Description.
 
 Only flag defects in lines that are added or modified in this PR. Do not flag
 issues in unchanged context lines, even if they appear in diff hunks.
@@ -112,23 +108,20 @@ practices, missing validation, incorrect error handling. For new or
 significantly changed functions in `switch_claude_account.ps1`, check whether
 corresponding test files in `tests/` cover the changed behavior; flag missing
 test coverage as a finding. Also check the project-specific concerns listed
-in the Project-Specific Review Checklist section below. Only flag defects in
-lines that are added or modified in this PR.
+in the Project-Specific Review Checklist section below.
 
 **Pass 2: What was missed**
 Review the diff again, assuming defects were missed on the first pass. Focus
 on interactions between changed files, subtle logic errors, and implicit
-assumptions in the code. Only flag defects in lines that are added or modified
-in this PR.
+assumptions in the code.
 
 **Pass 3: What the code does NOT do**
 Assume there are still undiscovered defects. Focus on what is absent: missing
 error handling, missing edge cases, missing input validation, missing null
 checks, race conditions, resource leaks, and incorrect assumptions about
-state. Only flag defects in lines that are added or modified in this PR.
+state.
 
-Track findings internally across passes (in conversation context). The format
-for each finding is: File, Line(s), Description.
+Track findings internally across passes (in conversation context).
 
 ### False Positive Exclusion List
 
@@ -191,13 +184,9 @@ After Pass 3:
    it has no defects. If all severity buckets are empty, print
    `No Critical/High/Medium findings.` in place of the severity tables.
 
-No data is written to GitHub. The developer or reviewer uses the output to
-manually create PR comments.
+The developer or reviewer uses the output to manually create PR comments.
 
 ### Link Format
-
-This section defines how links appear in the output tables. Follow these
-rules exactly.
 
 **Columns:** File, Description. The File column contains a markdown link. The
 link label is the file path relative to the repository root with a leading
@@ -211,7 +200,7 @@ links to lines 41-46. The label always uses `:{start}-{end}` regardless of
 whether the URL uses `L` or `R` anchors.
 
 **SHA-256 hash for PR links:** Compute the SHA-256 hex digest of each unique
-file path. Prefer PowerShell (this is a Windows project):
+file path. Prefer PowerShell (the repository's required shell on every platform):
 `$hasher = [System.Security.Cryptography.SHA256]::Create(); $bytes = [System.Text.Encoding]::UTF8.GetBytes('{path}'); -join(($hasher.ComputeHash($bytes) | ForEach-Object ToString('x2')))`
 Fallback if Node.js is available:
 `node -e "process.stdout.write(require('crypto').createHash('sha256').update('{path}').digest('hex'))"`.
@@ -292,9 +281,8 @@ from the repository root with a leading `/`.
 - **Diff:** plain text. Format: `<files> files · +<additions> · −<deletions>`,
   with middle dots (` · `, U+00B7) as separators. Use the Unicode minus sign
   (U+2212, `−`) for the deletions count, not the ASCII hyphen-minus.
-- **Findings:** `🔴 <n> Critical · 🟠 <n> High · 🟡 <n> Medium`. Severity
-  glyphs replace coloured pills to keep the recipe free of custom CSS while
-  staying scannable. Always show all three severities, even when zero.
+- **Findings:** `🔴 <n> Critical · 🟠 <n> High · 🟡 <n> Medium`. Always show
+  all three severities, even when zero.
 
 ### Constraints
 

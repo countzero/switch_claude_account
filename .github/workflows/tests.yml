@@ -1,10 +1,10 @@
 name: Tests
 
 # `push` is main-only on purpose. Every branch here reaches main through a pull
-# request, so listing `develop` too matched both triggers for one commit and ran
+# request, so listing `develop` too matches both triggers for one commit and runs
 # the whole 3-OS matrix twice. Deduplicating with a concurrency group cannot fix
 # that: the two events carry different refs (`refs/heads/develop` against
-# `refs/pull/N/merge`), and normalising the key so they collide would make the
+# `refs/pull/N/merge`), and normalizing the key so they collide would make the
 # two runs cancel each other, with no say in which survives. A cancelled run
 # reads as a failed required check, so that trades duplicate work for a flaky
 # gate. Narrowing the trigger is deterministic instead.
@@ -74,8 +74,8 @@ jobs:
       # On-demand only. This tool's entire premise is that .credentials.json is
       # where Claude Code keeps the active login, and that premise is an
       # observation about someone else's binary, not a contract. The scan
-      # re-checks it against the darwin build, which is the one platform whose
-      # storage backend this repo previously got wrong. Gated to
+      # re-checks it against the darwin build, the one platform carrying an OS
+      # keychain the login could move into instead. Gated to
       # workflow_dispatch because it pulls a ~200 MB package: per-push cost
       # nobody is paying for a fact that changes at most once a release.
       - name: Verify Claude Code credential backends
@@ -125,21 +125,11 @@ jobs:
         shell: pwsh
         run: ./tests/Invoke-Tests.ps1 -SkipCoverage
 
-      # The Pester suite runs with stdout redirected, because that is what a
-      # test host is, and under redirection the console cursor API is a no-op
-      # or throws and the alternate screen buffer is a string in a
-      # StringWriter. So the suite proves the watch lifecycle does not crash
-      # and cannot prove it works. That gap held a real bug:
-      # [Console]::CursorVisible's getter is Windows-only and aborted
-      # `sca usage -Watch` at startup on both these platforms, with the
-      # interactive guard refusing before that line whenever a test was
-      # watching. script(1) hands the probe a pseudo terminal, so the real
-      # guard passes and the real console handle is exercised.
-      #
-      # Windows is absent because it has no script(1) and ConPTY is
-      # disproportionate for one probe; it keeps the suite and the coverage
-      # gate. The probe bounds itself by counted redraws rather than a clock,
-      # so timeout-minutes is a backstop against a hang, not the mechanism.
+      # What the Pester suite cannot prove under a redirected stdout, and why
+      # Windows is absent here, is the docblock of
+      # tests/Invoke-WatchPtyProbe.ps1. The probe bounds itself by counted
+      # redraws rather than a clock, so timeout-minutes is a backstop against
+      # a hang, not the mechanism.
       - name: Probe the watch against a real terminal
         if: matrix.os != 'windows-latest'
         shell: pwsh

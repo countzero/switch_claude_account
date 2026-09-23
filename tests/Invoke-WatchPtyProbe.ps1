@@ -12,11 +12,11 @@
     StringWriter rather than a terminal mode. So the suite can prove the watch
     lifecycle does not crash, and cannot prove it works.
 
-    That gap is where a real bug lived: `[Console]::CursorVisible`'s getter is
-    Windows-only and threw on Linux and macOS, aborting `sca usage -Watch` and
-    `sca monitor` at startup on two of the three supported platforms. Nothing
-    caught it, because the interactive guard refuses before that line whenever
-    a test is watching.
+    That gap hides a whole class of bug: `[Console]::CursorVisible`'s getter is
+    Windows-only, so a read of it throws on Linux and macOS and aborts
+    `sca usage -Watch` and `sca monitor` at startup on two of the three
+    supported platforms. The Pester suite cannot catch that, because the
+    interactive guard refuses before that line whenever a test is watching.
 
     This probe closes it by re-entering itself under script(1), whose pseudo
     terminal makes `[Console]::IsOutputRedirected` false. The real guard then

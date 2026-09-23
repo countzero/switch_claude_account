@@ -15,10 +15,9 @@ they describe what Anthropic ships, not why this tool is written the way it is.
 A fact that fails any of these stays in the code, at its point of use. Measured
 constants (HTTP budgets, retry policy) and the rules this tool derives from the
 findings below are *not* here for that reason: a number and what measured it
-must be adjacent, and a rule must be visible where it is applied.
-
-Nothing here is a second copy. Where the code needs a rule that follows from a
-finding, the code states the rule and this file states the evidence.
+must be adjacent, and a rule must be visible where it is applied. Where the code
+needs a rule that follows from a finding, the code states the rule and this file
+states the evidence.
 
 ## Re-extraction recipe
 
@@ -138,13 +137,13 @@ request.
 **Cross-process lock, with peer-adopt rather than a race.** The core is `eE`,
 and it guards the grant three times over:
 
-| Step                                    | Behavior                                                                                     |
-| --------------------------------------- | --------------------------------------------------------------------------------------------- |
-| Pre-check                               | returns `not_needed` unless the access token is at or near expiry                            |
-| Re-read before locking                  | if `accessToken` changed since entry, returns `refreshed` and uses the peer's token           |
-| Lock acquire                            | `ELOCKED` retries 5 times at 1000 + random(1000) ms, then gives up as `lock_busy` / `lock_timeout` |
-| Re-read under the lock                  | same `accessToken` comparison again before the request goes out                              |
-| On refresh failure                      | re-reads once more; a moved token still returns `refreshed`                                  |
+| Step                   | Behavior                                                                                           |
+| ---------------------- | -------------------------------------------------------------------------------------------------- |
+| Pre-check              | returns `not_needed` unless the access token is at or near expiry                                  |
+| Re-read before locking | if `accessToken` changed since entry, returns `refreshed` and uses the peer's token                |
+| Lock acquire           | `ELOCKED` retries 5 times at 1000 + random(1000) ms, then gives up as `lock_busy` / `lock_timeout` |
+| Re-read under the lock | same `accessToken` comparison again before the request goes out                                    |
+| On refresh failure     | re-reads once more; a moved token still returns `refreshed`                                        |
 
 So two Claude Code processes on one account cannot both rotate the refresh
 token: the loser adopts the winner's result. Anthropic instruments the path for

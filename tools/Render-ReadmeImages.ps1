@@ -25,7 +25,7 @@
     Why hand-authored: the README's existing block 1 (-Watch) shows a Week
     bar of 62% but the per-row Week percentages sum to 55% over 5*100%, so
     no fixture data can produce the exact bar shown. Treating the README
-    text as the source of truth and colorising it is simpler than
+    text as the source of truth and colorizing it is simpler than
     reverse-engineering inputs that round-trip through the real renderer.
 
     The Session bar of 25% does not average the visible Session cells
@@ -39,8 +39,7 @@
     One deliberate divergence from the README's pre-image ASCII: the bar's
     empty portion is rendered with `▓` (medium shade block, U+2593) rather
     than spaces. That matches what `Format-AggregateBars` actually emits
-    (see Format-AggregateBars in switch_claude_account.ps1 around line 2516)
-    and gives the rendered SVG a visible progress-bar look instead of a
+    (see Format-AggregateBars in switch_claude_account.ps1) and gives the rendered SVG a visible progress-bar look instead of a
     huge invisible gap between the fill and the closing bracket. Bar
     widths and percentages are unchanged from the README.
 
@@ -86,7 +85,7 @@
 .EXAMPLE
     pwsh -NoProfile -File tools/Render-ReadmeImages.ps1
 
-    Regenerate all three SVGs into docs/images/.
+    Regenerate every SVG into docs/images/.
 
 .NOTES
     Requires `freeze` on PATH. Install with:
@@ -144,10 +143,8 @@ $tmpRoot = Join-Path $repoRoot '.tmp/render'
 New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 
 # --- ANSI SGR helpers -------------------------------------------------------
-# Truecolor SGR (`ESC[38;2;R;G;Bm`) targeting Microsoft's Campbell palette
-# (Windows Terminal default) so the rendered SVGs match what users see in
-# default `pwsh.exe`, not freeze's hardcoded charm palette. See
-# .DESCRIPTION above for rationale.
+# Truecolor SGR (`ESC[38;2;R;G;Bm`) targeting Microsoft's Campbell palette;
+# .DESCRIPTION above has why not named ANSI.
 $ESC = [char]27
 $RESET  = "$ESC[0m"
 $DKYEL  = "$ESC[38;2;193;156;0m"    # #C19C00  Campbell Yellow      (Heading)
@@ -209,9 +206,9 @@ $verboseLines = @(
 #
 #   1. Right-aligned header indicator '▶ switching slot at 95%'. Glyph
 #      in Neutral (white-ish, high-contrast lozenge); text in Muted
-#      (matches footer ambient-metadata weight). See Format-UsageTable in
-#      switch_claude_account.ps1 around line 2779-2810 for the runtime's
-#      three-segment Write-Color composition we are imitating here.
+#      (matches footer ambient-metadata weight). Format-UsageTable in
+#      switch_claude_account.ps1 has the runtime's three-segment Write-Color
+#      composition this imitates.
 #
 #      Pad count math (right-edge alignment): widest body row in the
 #      watch frame is 78 cols (e.g. the 'legacy' row). Header
@@ -222,17 +219,14 @@ $verboseLines = @(
 #      the table's Status column.
 #
 #   2. Extra blank line under the header (the '$AutoThreshold -gt 0'
-#      branch in Format-UsageTable, switch_claude_account.ps1:2816-2818)
-#      to balance the visually busier right-aligned indicator.
+#      branch in Format-UsageTable) to balance the visually busier
+#      right-aligned indicator.
 #
 #   3. Latched '[Monitor] Rotated from "<from>" to "<to>" at HH:mm:ss'
 #      footer line above the '[Watch] Last poll' line. Wording matches
-#      Invoke-AutoRotationStep at switch_claude_account.ps1:3607.
-#      Narrative: the active slot in the table (marked with '*') is
-#      the rotation DESTINATION; the rotation SOURCE is the row at
-#      100% utilization. With the body rows below 'work' is active
-#      (the destination) and 'legacy' is at the 100% Week limit (the
-#      source).
+#      Invoke-AutoRotationStep. Narrative: the slot marked '*' is the
+#      rotation DESTINATION and the row at 100% utilization is the
+#      SOURCE.
 #
 # Body rows identical to $watchLines so the two SVGs diff visually as
 # auto-mode-on vs. auto-mode-off with no other deltas.
@@ -371,8 +365,8 @@ $scenarios = @(
 # One file per theme, not one tall strip. docs/themes.md gives each theme a
 # heading of its own so a reader can link straight to the one they want, and a
 # heading needs its own content underneath for that anchor to be worth
-# following. The theme name lives in the markdown heading, so the panel no
-# longer carries a label of its own.
+# following. The theme name lives in the markdown heading, so the panel carries
+# no label of its own.
 foreach ($gt in $galleryThemes) {
     $scenarios += [pscustomobject]@{
         Name       = "theme-$($gt.Name)"
@@ -393,8 +387,8 @@ foreach ($gt in $galleryThemes) {
 #   --margin 0           : flush panel edge so the SVG fills the README
 #                          column with no transparent gutter; README pins
 #                          rendering at 1x via <img width="720">
-#   --width 720          : forced canvas width (px) shared by all three
-#                          renders so they scale identically when the README
+#   --width 720          : forced canvas width (px) shared by every
+#                          render so they scale identically when the README
 #                          displays them. Without this, freeze auto-sizes
 #                          each canvas to its longest line, which gives
 #                          usage-verbose (51 chars) a much smaller intrinsic
@@ -406,12 +400,11 @@ foreach ($gt in $galleryThemes) {
 #                          gain empty dark space on the right; that's the
 #                          deliberate cost of uniform on-screen sizing.
 #
-#                          README contract: the five <img> refs in README.md
-#                          (monitor.svg is referenced twice) cap rendering at
-#                          this width (width="720" HTML attribute, 1x
-#                          intrinsic). If you change --width here in either
-#                          direction, change the five width
-#                          values in README.md to match: width below --width
+#                          README contract: every <img> ref in README.md caps
+#                          rendering at this width (width="720" HTML
+#                          attribute, 1x intrinsic). If you change --width
+#                          here in either direction, change every width
+#                          value in README.md to match: width below --width
 #                          crops the panel; width above --width re-introduces
 #                          blurry upscaling of the embedded monospace text.
 #                          Keep the two numbers equal.
@@ -422,9 +415,9 @@ foreach ($gt in $galleryThemes) {
 # installed fonts. That costs ~365 KB of every file against ~1 KB of actual
 # drawing, and is paid once per image including each theme panel.
 #
-# Stripping it for a fallback chain was tried and reverted. freeze emits no
-# per-glyph positions and no textLength: the advance of every line comes from
-# the font, so a substituted face moves the text off the geometry freeze
+# The embedding cannot be traded for a fallback chain: freeze emits no
+# per-glyph positions and no textLength, so the advance of every line comes from
+# the font, and a substituted face moves the text off the geometry freeze
 # computed from JetBrains Mono metrics. The visible symptom is the usage bars,
 # whose block glyphs (U+2588 / U+2593) stop filling their cell. Pixel fidelity
 # here is load-bearing, not a nicety.

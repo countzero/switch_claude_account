@@ -2,10 +2,9 @@
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
 # Pester 5 tests for Invoke-RemoveAction in switch_claude_account.ps1.
-# After the state-file redesign Invoke-RemoveAction refuses to remove
-# the currently-tracked active slot (the user must `sca switch` first)
-# and there is no longer any hardlink involvement to verify. Per-test
-# sandbox setup lives in tests/Common.ps1.
+# Invoke-RemoveAction refuses to remove the slot state tracks as active;
+# the user must `sca switch` away first. Per-test sandbox setup lives in
+# tests/Common.ps1.
 
 BeforeAll {
     $script:OriginalUserProfile = $env:USERPROFILE
@@ -81,9 +80,7 @@ Describe 'switch_claude_account' {
         # wildcard expansion of `foo[bar]` into a character class that
         # matches unrelated slot files (fooa, foob, foor). Get-SafeName
         # sanitizes brackets to _ so the user-facing name becomes
-        # foo_bar_; the lookup then misses and throws. The key assertions
-        # are that the unrelated slots survive and the throw message
-        # references the sanitized name.
+        # foo_bar_; the lookup then misses and throws.
         It 'user-supplied bracket name is sanitized and does not wildcard-delete sibling slots' {
             $credDir = Join-Path $script:SandboxHome '.claude'
             $fooaPath = New-SlotPair -CredDir $credDir -Name 'fooa' -Content 'A'

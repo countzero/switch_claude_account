@@ -89,7 +89,7 @@ sca save personal
 sca save test-project
 ```
 
-`save` refuses to run while Claude Code is open and refuses to save a slot whose identity it cannot resolve from `~/.claude.json` (primary) or `/api/oauth/profile` (fallback). There are no unlabeled-no-identity slots. To rename a slot: `sca switch old-name; sca save new-name; sca remove old-name`.
+`save` refuses to run while Claude Code is open and refuses to save a slot whose identity it cannot resolve from `~/.claude.json` (primary) or `/api/oauth/profile` (fallback). To rename a slot: `sca switch old-name; sca save new-name; sca remove old-name`.
 
 ### List saved slots
 
@@ -133,7 +133,7 @@ Slot names are user-assigned labels; nothing stops you from naming a slot `work`
 ~/.claude/.credentials.work(ada.lovelace@arpa.net).json
 ```
 
-A paired sidecar `.credentials.work(ada.lovelace@arpa.net).account.json` holds the full whitelisted identity (`accountUuid`, `emailAddress`, `organizationUuid`, `displayName`, `organizationName`) so `sca switch` can restore the matching `oauthAccount` block to `~/.claude.json`. Because the email is captured at save time and carried in both the filename and sidecar, it cannot drift from the OAuth tokens; the only way to update a slot's email label is to re-run `sca save`.
+A paired sidecar `.credentials.work(ada.lovelace@arpa.net).account.json` holds the full whitelisted identity (`accountUuid`, `emailAddress`, `organizationUuid`, `displayName`, `organizationName`) so `sca switch` can restore the matching `oauthAccount` block to `~/.claude.json`. The email cannot drift from the OAuth tokens; the only way to update a slot's email label is to re-run `sca save`.
 
 When the slot name already equals the OAuth email, the filename is deduplicated to `.credentials.alice@example.com.json` and the `Account` column shows `—`.
 
@@ -154,7 +154,7 @@ The output shows the 5-hour session limit (`Session` column, "Current session" i
 
 Decoding the output:
 
-- **Pool-aggregate bars**: sum utilization over `N × 100%` across every slot with numbers to show, whether read live or served from the cache after a failed read. The `Session` bar reports the capacity you can still reach, so a slot at the 100% `Week` cap leaves it entirely, denominator included: that account serves nothing until its week resets, and its idle `Session` cell describes capacity nobody can spend. The `Week` bar keeps the same slot at its real 100%, because dropping it there would hide the exhaustion. Worth knowing: the `Session` bar therefore improves as slots fall out of the pool, and reads 100% once every slot still in that pool has spent its own session window. A week that has capped every slot reaches the same 100% by a second route: an empty pool is reported as spent rather than left blank. Bar color: green &lt;50%, yellow ≥50%, red ≥90%.
+- **Pool-aggregate bars**: sum utilization over `N × 100%` across every slot with numbers to show, whether read live or served from the cache after a failed read. The `Session` bar reports the capacity you can still reach, so a slot at the 100% `Week` cap leaves it entirely, denominator included: that account serves nothing until its week resets, and its idle `Session` cell describes capacity nobody can spend. The `Week` bar keeps the same slot at its real 100%, because dropping it there would hide the exhaustion. The `Session` bar therefore improves as slots fall out of the pool, and reads 100% once every slot still in that pool has spent its own session window. A week that has capped every slot reaches the same 100% by a second route: an empty pool is reported as spent rather than left blank. Bar color: green &lt;50%, yellow ≥50%, red ≥90%.
 - **Active marker (`*`)**: sourced from `~/.claude/.sca-state.json`; appears at the start of the row and inherits the row's color.
 - **`Account` column**: the OAuth email captured at save time. Shows `—` when the email equals the slot name (deduped filename), the actual email otherwise.
 - **`Session` / `Week` cells**: `<pct>% <delta>`. The delta is `(2h 11m)` under 24h with minute precision, `(102h)` at 24h+ with integer hours, or `—` when there is no data. A bucket whose window has already rolled also shows `—`: the percentage it carried describes a window the account has left, so it is dropped rather than shown as stale.
@@ -203,7 +203,7 @@ The terminal-tab title is updated on every poll so a backgrounded watch is glanc
 
 ### Warm up cold slots
 
-Anthropic only reports `/api/oauth/usage` data for slots that have an open server-side 5h session window, which only a real message can open. Warmup automates the manual "switch to a slot, send one message" routine across every saved slot: for each slot it switches in and runs the real Claude Code CLI (`claude -p "Hi"` in safe-mode on Haiku, ~$0.004/slot), then restores the slot you started on. Because it runs the actual client, it opens the window exactly like you typing a message would.
+Anthropic only reports `/api/oauth/usage` data for slots that have an open server-side 5h session window, which only a real message can open. Warmup automates the manual "switch to a slot, send one message" routine across every saved slot: for each slot it switches in and runs the real Claude Code CLI (`claude -p "Hi"` in safe-mode on Haiku, ~$0.004/slot), then restores the slot you started on.
 
 ```powershell
 sca warmup                            # warm every slot once, print the table, exit
@@ -253,7 +253,7 @@ sca help         # Show usage info
 5. **Close Claude Code**
 6. Run `sca save personal`
 
-`save` refuses while Claude Code is running. It exits immediately with a clear message if you forget; no partial writes occur. See [Which actions still need Claude Code closed](#which-actions-still-need-claude-code-closed) for the full list.
+`save` refuses while Claude Code is running, exiting with a clear message and no partial writes. See [Which actions still need Claude Code closed](#which-actions-still-need-claude-code-closed) for the full list.
 
 ### Switching between accounts
 
@@ -266,7 +266,7 @@ sca help         # Show usage info
 
 Claude Code 2.1.274 follows both files on its own: it polls `~/.claude.json` once a second and picks up external edits, and it re-`stat`s `.credentials.json` at the top of every token-refresh check, dropping its cached credentials when the file moved. Verified against 2.1.274 by handing a running session a different account's credentials mid-request; it re-read them and hit the *new* account's rate limit four seconds later.
 
-That makes Claude Code equivalent to [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4** for this purpose, so `sca monitor` is no longer OpenCode-scoped.
+That makes Claude Code equivalent to [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4** for this purpose.
 
 One residual difference from closing the app: `sca` does not take Claude Code's `~/.claude.json.lock`. It re-reads that file immediately before writing and starts over, then gives up, rather than overwrite a change that landed while it was working. That narrows the window to the write itself without closing it. What is at stake there is configuration and per-project prompt history, never a credential.
 
@@ -285,12 +285,12 @@ Code and run 'sca save work' to capture them by hand.
 
 ### Which actions still need Claude Code closed
 
-| Action | While Claude Code runs | Why |
-|---|---|---|
-| `switch`, `usage`, `list`, `remove` | fine | `switch` writes one destination and Claude Code follows it |
-| `monitor` | fine | rotation is one destination at a time, same as `switch` |
-| `save` | **refuses** | it pairs tokens from `.credentials.json` with an identity from `~/.claude.json`, and a `/login` updates those two separately. Catching that window writes a sidecar naming the wrong account, and nothing later corrects it |
-| `warmup`, `monitor -KeepWarm` | fine, with a warning | both make *every* slot active in turn and a live session follows, so a prompt sent mid-pass bills whichever slot is mounted. No login is at risk: Claude Code serializes token refreshes across its own processes and adopts a peer's result rather than racing it, so the `claude -p` a warm pass spawns cannot rotate the token out from under your session |
+| Action                              | While Claude Code runs | Why                                                                                                                                                                                                                                                                                                                                                           |
+| ----------------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `switch`, `usage`, `list`, `remove` | fine                   | `switch` writes one destination and Claude Code follows it                                                                                                                                                                                                                                                                                                    |
+| `monitor`                           | fine                   | rotation is one destination at a time, same as `switch`                                                                                                                                                                                                                                                                                                       |
+| `save`                              | **refuses**            | it pairs tokens from `.credentials.json` with an identity from `~/.claude.json`, and a `/login` updates those two separately. Catching that window writes a sidecar naming the wrong account, and nothing later corrects it                                                                                                                                   |
+| `warmup`, `monitor -KeepWarm`       | fine, with a warning   | both make *every* slot active in turn and a live session follows, so a prompt sent mid-pass bills whichever slot is mounted. No login is at risk: Claude Code serializes token refreshes across its own processes and adopts a peer's result rather than racing it, so the `claude -p` a warm pass spawns cannot rotate the token out from under your session |
 
 Slot-file updates done by `sca usage`'s token refresh use `MoveFileEx` with retry, so those survive an open Claude Code on `.credentials.json` itself.
 
@@ -342,7 +342,7 @@ $env:SCA_THEME = 'material'      # PowerShell; add to $PROFILE to make it stick
 export SCA_THEME=material        # bash / zsh
 ```
 
-**[docs/themes.md](docs/themes.md) shows every theme**, each rendered as the whole `sca monitor` view so what you see is what you get, with its own heading to link to: [claude](docs/themes.md#claude), [dracula](docs/themes.md#dracula), [everforest](docs/themes.md#everforest), [flexoki](docs/themes.md#flexoki), [gruvbox](docs/themes.md#gruvbox), [kanagawa](docs/themes.md#kanagawa), [material](docs/themes.md#material), [monokai](docs/themes.md#monokai), [nord](docs/themes.md#nord), [onedark](docs/themes.md#onedark).
+**[docs/themes.md](docs/themes.md) shows every theme**, each rendered as the whole `sca monitor` view so what you see is what you get: [claude](docs/themes.md#claude), [dracula](docs/themes.md#dracula), [everforest](docs/themes.md#everforest), [flexoki](docs/themes.md#flexoki), [gruvbox](docs/themes.md#gruvbox), [kanagawa](docs/themes.md#kanagawa), [material](docs/themes.md#material), [monokai](docs/themes.md#monokai), [nord](docs/themes.md#nord), [onedark](docs/themes.md#onedark).
 
 Nine are the [base16](https://github.com/tinted-theming/schemes) scheme of the same name, so a palette you know from your editor reads the same here; `claude` is an original one keyed to the interface this tool manages logins for.
 

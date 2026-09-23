@@ -7,11 +7,11 @@
 # is a thin adapter over the shared watch engine (Invoke-UsageWatch); the
 # rotation and keep-warm mechanics themselves are covered by
 # Invoke-AutoRotation.Tests.ps1 and the Invoke-KeepWarmStep / Invoke-WarmAllSlots
-# contexts in Invoke-UsageAction.Tests.ps1. Here we cover the action-level
+# contexts in Invoke-UsageAction.Tests.ps1. This file covers the action-level
 # contract: that monitor maps to the engine with -Auto set, threads -Threshold
 # and -KeepWarm through, ignores a positional name, and surfaces the
 # watch-engine guards. Both plain `monitor` and -KeepWarm run beside a live
-# Claude Code, so neither asserts a Claude-Code refusal any more.
+# Claude Code, so neither asserts a Claude-Code refusal.
 # Per-test sandbox setup lives in tests/Common.ps1.
 
 BeforeAll {
@@ -31,8 +31,9 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Invoke-MonitorAction routing' {
-        # The engine is mocked here, so none of its guards run; we only assert
-        # the public surface maps onto Invoke-UsageWatch's internal contract.
+        # The engine is mocked here, so none of its guards run; the assertions
+        # are only that the public surface maps onto Invoke-UsageWatch's
+        # internal contract.
         BeforeEach {
             Mock Invoke-UsageWatch -MockWith { }
         }
@@ -74,11 +75,11 @@ Describe 'switch_claude_account' {
         # The engine is NOT mocked here, so its pre-loop guards run for real.
 
         It 'does NOT refuse at startup when Claude Code is running' {
-            # Rotation beside a live Claude Code is the supported case as of
-            # 2.1.274. With the Claude-Code guard gone for plain `monitor`,
-            # the next guard reached is IsOutputRedirected, so that is what
-            # this must now throw. Skipped on an interactive terminal, where
-            # IsOutputRedirected is $false and the alt-screen would blank it.
+            # Rotation beside a live Claude Code is supported, so plain
+            # `monitor` has no Claude-Code guard and the first guard reached
+            # is IsOutputRedirected: that is what this must throw. Skipped on
+            # an interactive terminal, where IsOutputRedirected is $false and
+            # the alt-screen would blank it.
             Mock Test-ClaudeRunning -MockWith { $true }
 
             if (-not [Console]::IsOutputRedirected) {
@@ -90,12 +91,11 @@ Describe 'switch_claude_account' {
         }
 
         It 'does NOT refuse -KeepWarm when Claude Code is running either' {
-            # Keep-warm makes every slot active in turn, which used to refuse a
-            # live client. It no longer does: claude serializes refreshes across
-            # its own processes, and the loss that justified the guard was sca's
-            # own discarded mirror, fixed in Invoke-WarmAllSlots. With that guard
-            # gone the next one reached is IsOutputRedirected, exactly as for
-            # plain `monitor` above.
+            # Keep-warm makes every slot active in turn, and that is safe
+            # beside a live client: claude serializes refreshes across its own
+            # processes, and the mirror sca would otherwise discard is kept by
+            # Invoke-WarmAllSlots. So the first guard reached here is
+            # IsOutputRedirected too, exactly as for plain `monitor` above.
             Mock Test-ClaudeRunning -MockWith { $true }
 
             if (-not [Console]::IsOutputRedirected) {
@@ -112,8 +112,7 @@ Describe 'switch_claude_account' {
             # passes; the IsOutputRedirected guard throws next because Pester's
             # stdout is redirected. On an interactive terminal (test runner
             # invoked without redirection), IsOutputRedirected is $false and
-            # the alt-screen would blank the terminal; skip in that case
-            # (same pattern as the watch-mode tests elsewhere in the suite).
+            # the alt-screen would blank the terminal; skip in that case.
             if (-not [Console]::IsOutputRedirected) {
                 Set-ItResult -Skipped -Because 'Console stdout is not redirected; running this test would enter the alt-screen buffer and blank the terminal.'
                 return

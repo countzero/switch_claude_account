@@ -4,20 +4,19 @@ Read when changing how a credential, slot, sidecar or state file is resolved or 
 
 This document carries the contracts and the reasoning. What a user sees of the same
 mechanics is `README.md` → *Platform Notes*, and each section below points at its
-counterpart there; the pointers run one way only, so the two cannot loop.
+counterpart there.
 
 ## The four artifacts
 
-| File | Owner | What it holds |
-| ---------------------------------------- | ----------- | --------------------------------------------------------- |
-| `.credentials.json` | Claude Code | The active login's OAuth tokens |
-| `.credentials.<name>(<email>).json` | `sca` | One saved slot's tokens, byte-equal to the active file |
-| `.credentials.<name>(<email>).account.json` | `sca` | That slot's identity sidecar: uuid, email, org, display name |
-| `.sca-state.json` | `sca` | `{ schema, active_slot, last_sync_hash }` |
-| `~/.claude.json` | Claude Code | Claude Code's config, whose `oauthAccount` block is the "Email:" in `/status` |
+| File                                        | Owner       | What it holds                                                                 |
+| ------------------------------------------- | ----------- | ----------------------------------------------------------------------------- |
+| `.credentials.json`                         | Claude Code | The active login's OAuth tokens                                               |
+| `.credentials.<name>(<email>).json`         | `sca`       | One saved slot's tokens, byte-equal to the active file                        |
+| `.credentials.<name>(<email>).account.json` | `sca`       | That slot's identity sidecar: uuid, email, org, display name                  |
+| `.sca-state.json`                           | `sca`       | `{ schema, active_slot, last_sync_hash }`                                     |
+| `~/.claude.json`                            | Claude Code | Claude Code's config, whose `oauthAccount` block is the "Email:" in `/status` |
 
-The first four sit in `$CredDir`. The fifth is a sibling of that directory by default
-and moves inside it when `CLAUDE_CONFIG_DIR` is set.
+The first four sit in `$CredDir`; where the fifth sits is *Claude Code's config* below.
 
 ## Resolving the credentials directory
 
@@ -29,7 +28,7 @@ still work, and `Assert-CredentialDir` refuses the other actions.
 Home is the platform's environment variable (`$env:USERPROFILE` / `$env:HOME`)
 **first**, then the `$HOME` automatic variable. The environment leads because `$HOME`
 binds at session start and never re-reads it, so the test sandbox could not redirect
-it; `$HOME` is kept as the fallback because it is the only getpwuid path we have, and
+it; `$HOME` is kept as the fallback because it is the only getpwuid path available, and
 `claude` keeps working without the variable.
 
 ### `CLAUDE_CONFIG_DIR` has no `~` expansion
@@ -108,7 +107,7 @@ User-facing form: `README.md` → *File permissions (Linux and macOS)*.
 
 Claude Code >= 2.1.274 polls `~/.claude.json` at 1 s and re-`stat`s
 `.credentials.json` on every refresh check, so every action but `save` runs with it
-open, `warmup` and `monitor -KeepWarm` included. `save` alone still refuses.
+open, `warmup` and `monitor -KeepWarm` included. `save` alone refuses.
 `Test-ClaudeRunning` owns the evidence and that one exception.
 
 ### POSIX has no mandatory locking
@@ -197,7 +196,7 @@ added later cannot reintroduce it.
 `Background` and `Foreground` travel together: painting a canvas without pinning a
 foreground leaves a light-terminal user reading dark default text on a dark background.
 Inside the frame the pair becomes the effective default, which is the second reason
-`Neutral` stays out of the palette — it inherits the chrome foreground there and the
+`Neutral` stays out of the palette: it inherits the chrome foreground there and the
 terminal's foreground in scrollback, and both are right.
 
 `ConvertTo-WatchFrameSequence` weaves chrome in at three points, because a background is
@@ -214,8 +213,7 @@ along the right and bottom edges keeps the terminal's own background and seams a
 canvas. `Get-WatchBackgroundOsc` moves that default with OSC 11 (hence the raw
 `BackgroundRgb` beside the formatted `Background` SGR) and `Exit-WatchTerminal` restores
 it with OSC 111. Windows Terminal declined to paint the gutter from the adjacent cells
-(microsoft/terminal#19860, closed as not-planned), so this is the only lever available,
-not a stopgap awaiting an upstream fix.
+(microsoft/terminal#19860, closed as not-planned), so this is the only lever available.
 
 Three properties of that pair are load-bearing. Its guard **derives** from
 `Get-WatchChrome` instead of restating the conditions, because gutter and canvas must
@@ -229,7 +227,7 @@ after the leave it would flash the theme background across the restored scrollba
 
 `$Script:FramePadColumns` / `$Script:FramePadRows` lift the frame two columns and one row
 off the window edge. `Write-WatchFrame` owns them, raising the pair for one paint and
-dropping it in a `finally`, so scrollback renderers see 0 and stay flush left — an indent
+dropping it in a `finally`, so scrollback renderers see 0 and stay flush left: an indent
 there would be noise and would break copy-paste.
 
 `Get-RenderWidth` is the width a renderer may lay out in. It exists because the `-Auto`

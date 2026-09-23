@@ -83,18 +83,14 @@ function Get-FunctionMetrics {
 
     $cc = 1
 
-    # If clauses: each `if` / `elseif` arm counts; trailing `else` does not
-    # (it's the fall-through, not a separate decision).
     $ifs = $Func.FindAll({ $args[0] -is [System.Management.Automation.Language.IfStatementAst] }, $true) |
         Where-Object { (Get-EnclosingFunction $_) -eq $Func }
     foreach ($i in $ifs) { $cc += $i.Clauses.Count }
 
-    # Switch clauses: each case arm counts; `default` is fall-through and excluded.
     $switches = $Func.FindAll({ $args[0] -is [System.Management.Automation.Language.SwitchStatementAst] }, $true) |
         Where-Object { (Get-EnclosingFunction $_) -eq $Func }
     foreach ($s in $switches) { $cc += $s.Clauses.Count }
 
-    # Loops: each contributes +1.
     $loops = $Func.FindAll({
         $n = $args[0]
         $n -is [System.Management.Automation.Language.ForEachStatementAst] -or
@@ -105,20 +101,16 @@ function Get-FunctionMetrics {
     }, $true) | Where-Object { (Get-EnclosingFunction $_) -eq $Func }
     $cc += @($loops).Count
 
-    # Try/Catch: each catch arm counts (the `try` itself is +0; the catches
-    # are the branch points).
     $tries = $Func.FindAll({ $args[0] -is [System.Management.Automation.Language.TryStatementAst] }, $true) |
         Where-Object { (Get-EnclosingFunction $_) -eq $Func }
     foreach ($t in $tries) { $cc += $t.CatchClauses.Count }
 
-    # Boolean -and / -or short-circuit operators each create a branch.
     $bins = $Func.FindAll({ $args[0] -is [System.Management.Automation.Language.BinaryExpressionAst] }, $true) |
         Where-Object { (Get-EnclosingFunction $_) -eq $Func }
     foreach ($b in $bins) {
         if ($b.Operator -eq 'And' -or $b.Operator -eq 'Or') { $cc++ }
     }
 
-    # Ternary (PS 7+) is a single decision.
     $ternaries = $Func.FindAll({ $args[0] -is [System.Management.Automation.Language.TernaryExpressionAst] }, $true) |
         Where-Object { (Get-EnclosingFunction $_) -eq $Func }
     $cc += @($ternaries).Count
@@ -161,13 +153,11 @@ function Get-FunctionMetrics {
 $funcs = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 $results = foreach ($f in $funcs) { Get-FunctionMetrics -Func $f }
 
-# Sort by CC desc, tiebreak by MaxNest desc, then LOC desc.
 $results = $results | Sort-Object `
     @{Expression='CC';      Descending=$true}, `
     @{Expression='MaxNest'; Descending=$true}, `
     @{Expression='LOC';     Descending=$true}
 
-# Output
 $nameW = 8  # min header width for "Function"
 foreach ($r in $results) { if ($r.Name.Length -gt $nameW) { $nameW = $r.Name.Length } }
 

@@ -92,10 +92,10 @@ Describe 'switch_claude_account' {
             $row.Data.PSObject.Properties.Name | Should -Not -Contain 'five_hour'
         }
 
-        # The regression this whole change exists for: one row printed '100%
-        # now' in the Session cell and 'limited 5h' in Status while the
-        # aggregate bar above it read 0%, the terminal title read '[!] 100%',
-        # and auto-rotation treated the slot as idle and refused to move.
+        # The regression this pins: one row printed '100% now' in the Session
+        # cell and 'limited 5h' in Status while the aggregate bar above it read
+        # 0%, the terminal title read '[!] 100%', and auto-rotation treated the
+        # slot as idle and refused to move.
         It 'leaves the cell, the status, the bar, the title and rotation agreeing' {
             $data = [pscustomobject]@{
                 five_hour = [pscustomobject]@{ utilization = 100.0; resets_at = (IsoAt ([TimeSpan]::FromHours(-1))) }
@@ -112,7 +112,7 @@ Describe 'switch_claude_account' {
 
             # Session cell: em-dash, not '100% now'.
             $table | Should -Not -Match '100%'
-            # Status: no longer 'limited 5h'.
+            # Status: not 'limited 5h'.
             Get-PlanStatus $row.Data | Should -Be 'ok'
             # Bar and rotation: both read the surviving 7d bucket only.
             Get-PoolMeanUtilization -Results @($row) -BucketKey 'five_hour' | Should -Be 0
@@ -162,12 +162,11 @@ Describe 'switch_claude_account' {
             Get-RowMaxUtilization -Row $row | Should -Be 0.0
         }
 
-        # This used to return 0 for ANY non-ok row
-        # even when Data was present, which meant a single usage-endpoint
-        # timeout on the active slot made it look 0%-utilized and silently
-        # disarmed auto-rotation. Format-UsageTable already renders bucket
-        # percentages from Data regardless of Status, so a row good enough to
-        # show the user is now good enough to decide on.
+        # Returning 0 for any non-ok row that still carries Data would let a
+        # single usage-endpoint timeout on the active slot make it look
+        # 0%-utilized and silently disarm auto-rotation. Format-UsageTable
+        # renders bucket percentages from Data regardless of Status, so a row
+        # good enough to show the user is good enough to decide on.
         It 'judges a non-ok row on its cached Data' {
             foreach ($status in @('error', 'rate-limited', 'expired')) {
                 $row = [pscustomobject]@{
@@ -184,8 +183,7 @@ Describe 'switch_claude_account' {
 
         # The window-rolled rule lives in Select-LiveBuckets, one layer up, so
         # a rolled bucket is already absent by the time a row exists. Reading
-        # resets_at again here is what let this function and the table
-        # disagree; the Select-LiveBuckets Context owns those cases now.
+        # resets_at again here would let this function and the table disagree.
         It 'reads resets_at nowhere, so a rolled bucket that reached it still counts' {
             $row = [pscustomobject]@{
                 Status = 'ok'
@@ -496,10 +494,9 @@ Describe 'switch_claude_account' {
             $d.SuggestionName | Should -Be 'only'
         }
 
-        # A data-less non-ok active row used to fall into the
-        # below-threshold 'noop' branch, which preserved the previous latch and
-        # left the monitor silently unable to rotate for as long as the failure
-        # lasted. It now reports instead.
+        # A data-less non-ok active row must not fall into the below-threshold
+        # 'noop' branch, which preserves the previous latch and leaves the
+        # monitor silently unable to rotate for as long as the failure lasts.
         It 'returns active-unknown when the active row is non-ok with no Data' {
             foreach ($status in @('error', 'expired', 'unauthorized', 'no-oauth', 'rate-limited')) {
                 $rows = @(
@@ -544,7 +541,7 @@ Describe 'switch_claude_account' {
         }
 
         # Cached data is good enough to decide to LEAVE a slot but not to
-        # ENTER one: a peer we cannot verify may be throttled or broken.
+        # ENTER one: an unverifiable peer may be throttled or broken.
         It 'never rotates INTO a non-ok peer even when its cached data looks free' {
             $future = [DateTimeOffset]::UtcNow.AddHours(2).ToString('o', [Globalization.CultureInfo]::InvariantCulture)
             $rows = @(
@@ -583,8 +580,8 @@ Describe 'switch_claude_account' {
         }
 
         # The whole point of the 'active-unknown' action: it must REPLACE a
-        # latched 'Rotated ...' line, because preserving that line is what made
-        # a blind monitor look like a working one.
+        # latched 'Rotated ...' line, because preserving that line makes a
+        # blind monitor look like a working one.
         It 'on active-unknown reports the status and replaces a latched Rotated line' {
             Mock Get-AutoRotationDecision { return [pscustomobject]@{
                 Action       = 'active-unknown'
@@ -697,7 +694,7 @@ Describe 'switch_claude_account' {
         }
 
         # The latch becomes one footer entry and Format-UsageFooter splits the
-        # footer on newlines to colour each line, so a multi-line exception
+        # footer on newlines to color each line, so a multi-line exception
         # (socket errors span several) would fork this into unprefixed lines.
         It 'collapses a multi-line swap exception onto one latch line' {
             Mock Get-AutoRotationDecision { return [pscustomobject]@{
@@ -732,9 +729,10 @@ Describe 'switch_claude_account' {
 
         # The regression this call exists for. The watch loop reconciles BEFORE
         # Get-UsageSnapshot, then spends a full serial HTTP pass across every
-        # slot before reaching the swap. A Claude Code refresh landing in that
-        # window used to be overwritten by the swap and never mirrored, leaving
-        # the outgoing slot holding a refresh token the server already rotated.
+        # slot before reaching the swap. Without this call a Claude Code
+        # refresh landing in that window is overwritten by the swap and never
+        # mirrored, leaving the outgoing slot holding a refresh token the
+        # server already rotated.
         # Real Invoke-Reconcile here, not a mock: the point is the capture.
         It 'on rotate captures a refresh that landed since the poll reconciled' {
             $cd = Join-Path $script:SandboxHome '.claude'
@@ -860,10 +858,10 @@ Describe 'switch_claude_account' {
         }
 
         # Regression guard for the default arm: if Get-AutoRotationDecision
-        # ever returns an Action value the switch does not recognise (a
-        # contract bug in the decision helper, or a future Action we
-        # forgot to handle), Invoke-AutoRotationStep must NOT crash; it
-        # preserves the existing latch and lets the watch loop continue.
+        # ever returns an Action value the switch does not recognize (a
+        # contract bug in the decision helper, or an unhandled future
+        # Action), Invoke-AutoRotationStep must NOT crash; it preserves the
+        # existing latch and lets the watch loop continue.
         It 'on unknown decision Action, preserves the current latch (default arm)' {
             Mock Get-AutoRotationDecision { return [pscustomobject]@{
                 Action = 'something-unexpected'
@@ -874,10 +872,8 @@ Describe 'switch_claude_account' {
         }
     }
 
-    # Regression guard for Get-AutoRotationDecision's "empty Results
-    # after the @() cast" branch: NoSlots=false but Results is empty.
-    # Difference from the NoSlots branch test above; both arms must
-    # return the 'noop' decision struct.
+    # Regression guard for Get-AutoRotationDecision's "empty Results after the
+    # @() cast" branch, distinct from the NoSlots branch above.
     Context 'Get-AutoRotationDecision (empty Results not flagged NoSlots)' {
         It 'returns noop when Results is empty but NoSlots is false' {
             $snap = [pscustomobject]@{

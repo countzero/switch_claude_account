@@ -1,9 +1,7 @@
 #Requires -Version 7.4
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
-# Pester 5 tests for the small pure-helper functions in
-# switch_claude_account.ps1: Get-SafeName, Get-ProfileEncoding, Get-Slots,
-# Get-SlotFileInfo, Show-Help.
+# Pester 5 tests for the pure-helper functions in switch_claude_account.ps1.
 #
 # Per-test sandbox setup lives in tests/Common.ps1; see that file for the
 # scoping rationale. Each top-level Describe must wrap a BeforeEach (Pester 5
@@ -12,13 +10,11 @@
 # split files so test FullName paths stay stable.
 
 BeforeAll {
-    # Capture the pre-suite values of the two globals BeforeEach mutates so
-    # we can restore them in AfterAll. Without this, running Invoke-Pester
+    # Capture the pre-suite values of the globals BeforeEach mutates so we
+    # can restore them in AfterAll. Without this, running Invoke-Pester
     # directly in an interactive shell (as the README suggests) would leave
     # the session's $env:USERPROFILE pointing at a deleted $TestDrive path
     # and $PROFILE as a PSCustomObject stub, which breaks later commands.
-    # Running via the subprocess `pwsh -NoProfile -File tests/Invoke-Tests.ps1`
-    # was already safe because the mutations died with the subprocess.
     $script:OriginalUserProfile = $env:USERPROFILE
     $script:OriginalProfile     = $global:PROFILE
     $script:OriginalHome        = $env:HOME
@@ -57,8 +53,8 @@ BeforeAll {
             $family -contains $n.Name
         }, $true))
 
-        # A rename that forgets this list would otherwise shrink the family
-        # silently, which is the exact failure the list exists to prevent.
+        # A rename that forgets the list above would otherwise shrink the
+        # family silently, which is the failure the list exists to prevent.
         $missing = @($family | Where-Object { $_ -notin @($found.Name) })
         if ($missing.Count -gt 0) {
             throw "watch-family functions missing from the script: $($missing -join ', ')"
@@ -191,11 +187,9 @@ Describe 'switch_claude_account' {
             $active[0].Name  | Should -Be 'foo[bar]'
         }
 
-        # Labeled filename support: Get-Slots parses the parenthesized
-        # email out of the filename and exposes it as .Email on each
-        # slot object. The slot Name is the portion before the parens,
-        # so the user-visible slot name stays the same whether the file
-        # is labeled or not.
+        # The slot Name is the portion before the parens, so the
+        # user-visible slot name stays the same whether the file is
+        # labeled or not.
         It 'parses labeled filenames into (Name, Email) pairs' {
             $credDir = Join-Path $script:SandboxHome '.claude'
             New-SlotPair -CredDir $credDir -Name 'work' -Email 'alice@example.com' -Content 'W' | Out-Null
@@ -211,7 +205,6 @@ Describe 'switch_claude_account' {
             $bySlotName['solo'].Email       | Should -BeNullOrEmpty
         }
 
-        # New: verify Get-Slots filters out slots without sidecars.
         It 'hides slot files that have no sidecar (post-v2.1.0 contract)' {
             $credDir = Join-Path $script:SandboxHome '.claude'
             New-Item -ItemType Directory -Path $credDir -Force | Out-Null
@@ -225,7 +218,6 @@ Describe 'switch_claude_account' {
             $names | Should -Not -Contain 'legacy'
         }
 
-        # New: sidecar files themselves must not be enumerated as slots.
         It 'does not enumerate .account.json sidecar files as slot credentials' {
             $credDir = Join-Path $script:SandboxHome '.claude'
             New-SlotPair -CredDir $credDir -Name 'work' -Content 'W' | Out-Null
@@ -239,12 +231,8 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Get-SlotFileInfo' {
-        # Parses a .credentials.*.json filename into a (Name, Email)
-        # tuple. The grammar is:
-        #   .credentials.<slot>.json                -> unlabeled
-        #   .credentials.<slot>(<email>).json       -> labeled; the parens
-        #                                              must contain '@' to
-        #                                              be treated as an email
+        # The filename grammar the cases below walk is owned by
+        # Get-SlotFileInfo in the script.
         # NOTE: The hashtable key is deliberately `SlotName`, not `Name`.
         # The script-under-test declares a top-level `[String] $Name`
         # parameter; dot-sourcing binds that into script scope, and a
@@ -305,15 +293,13 @@ Describe 'switch_claude_account' {
             $out | Should -Match '-NoColor'
         }
 
-        # Help moved -h / -Help into the GLOBAL options group (no standalone
-        # 'help' action line in the displayed help).
         It 'documents -h / -Help in the options instead of an ACTIONS entry' {
             $out = Show-Help 6>&1 | Out-String
             $out | Should -Match '-h, -Help'
         }
 
-        # Help is written with the canonical 'sca' invocation (matching every
-        # other user-facing message in the script), not a conditional path.
+        # Help uses the canonical 'sca' invocation, as every other
+        # user-facing message in the script does.
         It 'shows the sca invocation in USAGE' {
             $out = Show-Help 6>&1 | Out-String
             $out | Should -Match 'sca <action>'
@@ -339,12 +325,12 @@ Describe 'switch_claude_account' {
         # information stream 6.
         #
         # Each test also asserts the printed output matches the literal
-        # version shape (\d+\.\d+\.\d+). The shape pin is non-negotiable:
-        # the Param() block declares [switch] $Version, which previously
-        # shadowed the $Script:Version constant. Under that collision, both
-        # sides of `Should -Be $Script:ScriptVersion` could silently degrade
-        # to the same boolean and the equality assertion would still pass.
-        # The regex makes that failure mode impossible to miss.
+        # version shape (\d+\.\d+\.\d+). The shape pin is non-negotiable: the
+        # Param() block declares [switch] $Version, which shadows a
+        # $Script:Version constant, and under that collision both sides of
+        # `Should -Be $Script:ScriptVersion` degrade to the same boolean and
+        # the equality assertion still passes. The regex makes that failure
+        # mode impossible to miss.
 
         It 'prints $Script:ScriptVersion and returns before any action runs' {
             # We do NOT assign $Action; setting it to '' or $null in dynamic
@@ -393,8 +379,7 @@ Describe 'switch_claude_account' {
         # Invoke-Main routes the `monitor` action to Invoke-MonitorAction and
         # rejects the switch flags that belong to the other live verb
         # (-Watch / -Json on monitor; -KeepWarm anywhere but monitor). Same
-        # dynamic-scope pattern as the '-Version flag' context: assign the
-        # Param() variables in the It body and let Invoke-Main read them.
+        # dynamic-scope pattern as the '-Version flag' context.
 
         It 'routes the monitor action to Invoke-MonitorAction' {
             Mock Invoke-MonitorAction { }
@@ -431,9 +416,7 @@ Describe 'switch_claude_account' {
         # directly. Each case here mocks the destination and asserts the
         # routing, which is the whole contract of the arm.
         #
-        # Same dynamic-scope pattern as the two contexts above: assign the
-        # script's Param() variables in the It body and let Invoke-Main read
-        # them.
+        # Same dynamic-scope pattern as the two contexts above.
 
         It 'prints the help screen for the help action' {
             $Action = 'help'
@@ -445,7 +428,7 @@ Describe 'switch_claude_account' {
         # the script's own [ValidateSet] $Action parameter, which is in scope
         # here because the BeforeEach dot-sourced the script. Under the
         # collision Pester expands <Action> to empty and the assignment never
-        # reaches Invoke-Main, so all eight cases fail identically.
+        # reaches Invoke-Main, so every case fails identically.
         It 'routes <ActionName> to <Target>' -ForEach @(
             @{ ActionName = 'install';   Target = 'Add-To-Profile' }
             @{ ActionName = 'uninstall'; Target = 'Remove-From-Profile' }
@@ -520,20 +503,15 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Format-WatchTitle' {
-        # Pure string-builder for the OSC 0 watch-mode terminal title.
-        # The title carries the active slot's two utilization numbers +
-        # brand suffix, optionally prefixed with '[!]' (any bucket >=
-        # UtilLimitPct) or '[~]' (any bucket >= UtilWarnPct). Source
-        # row is the active slot (IsActive=true) by default, or the
-        # -Name match when -Name is set. These tests pin the format
-        # string, the active-slot selection rule, and the prefix tier
+        # Pure string-builder for the OSC 0 watch-mode terminal title; its
+        # contract is Format-WatchTitle in the script. These tests pin the
+        # format string, the active-slot selection rule and the prefix tier
         # thresholds so a future refactor cannot silently re-introduce
         # pool-mean averaging or drop the alarm prefix.
 
         # Build a minimal Get-UsageSnapshot-shaped object for a list of
-        # rows. Each row hashtable accepts: Name, Status, IsActive,
-        # FiveUtil, SevenUtil (any field omitted defaults to slot-x /
-        # ok / $false / null / null).
+        # rows. Each row hashtable accepts Name, Status, IsActive,
+        # FiveUtil and SevenUtil.
         function script:New-FakeSnapshot {
             Param ([object[]] $Rows)
             $results = foreach ($r in $Rows) {
@@ -703,10 +681,9 @@ Describe 'switch_claude_account' {
         }
 
         It 'ignores non-active rows (does not pool-mean across slots)' {
-            # Regression guard: a previous version pool-meaned across all
-            # HTTP-ok rows, which averaged a burned slot's 100% down to
-            # noise in multi-slot watches. The new contract reads the
-            # active slot's numbers directly.
+            # Regression guard: pool-meaning across all HTTP-ok rows
+            # averages a burned slot's 100% down to noise in a multi-slot
+            # watch.
             $snap = New-FakeSnapshot -Rows @(
                 @{ Name = 'a'; FiveUtil = 100; SevenUtil = 100 }
                 @{ Name = 'b'; FiveUtil = 10;  SevenUtil = 10; IsActive = $true }
@@ -957,18 +934,16 @@ Describe 'switch_claude_account' {
     Context 'Watch-mode VT control rendering' {
         # Regression guard for `sca usage -Watch -NoColor` flicker.
         #
-        # Background: -NoColor sets $PSStyle.OutputRendering='PlainText',
-        # which routes every Write-Host string through PowerShell's
+        # -NoColor sets $PSStyle.OutputRendering='PlainText', which routes
+        # every Write-Host string through PowerShell's
         # StringDecorated.AnsiRegex filter. That regex matches DEC private
         # modes (\x1b\[\?\d+[hl]) and strips them -- so when watch-mode
         # VT controls (DEC 2026 sync envelope, alt-buffer toggle, cursor
         # hide/show) go through Write-Host, the entire flicker-free
         # rendering envelope vanishes and -Watch -NoColor flickers.
         #
-        # Fix: Write-VTSequence uses [Console]::Out.Write which bypasses
-        # StringDecorated entirely. Two assertions pin the contract:
-        # one static (no Write-Host VT escapes in Invoke-UsageWatch),
-        # one behavioral (Write-VTSequence preserves DEC modes verbatim).
+        # Write-VTSequence uses [Console]::Out.Write, which bypasses
+        # StringDecorated entirely.
 
         It 'the watch family routes all VT control sequences through Write-VTSequence (no Write-Host VT escapes)' {
             # AST-based static check: pin the call sites without a brittle
@@ -1069,29 +1044,19 @@ Describe 'switch_claude_account' {
         }
 
         It 'the watch family suppresses the information stream on every nested action whose advisories would flash on screen' {
-            # AST-based static check for the sub-frame flash bug:
+            # AST-based static check for the sub-frame flash bug.
             #
-            # The polling loop calls three things inside its `if ($dueForPoll)`
-            # branch that may emit Write-Color advisories on their unhappy
-            # paths:
-            #   1. Invoke-Reconcile        -> [Sync] auto-save / identity-change
-            #   2. Get-UsageSnapshot       -> [Sync] token-propagation-failed
-            #                                  / sidecar-orphaned (via
-            #                                  Update-SlotTokens inside
-            #                                  Get-SlotUsage)
-            #   3. Invoke-AutoRotationStep -> [Switch] ~/.claude.json write
-            #                                  failed (via Invoke-SlotSwap
-            #                                  inside its 'rotate' arm; the
-            #                                  inner site already wraps the
-            #                                  swap in 6>$null)
-            #
-            # All three print straight to the alt buffer, OUTSIDE the
-            # captured frame; without 6>$null suppression the in-place
-            # repaint (no ESC[2J) never overwrites them and the user is
-            # left with a stray advisory line they cannot dismiss. The
-            # outer-most call sites for #1 and #2 must therefore carry
-            # 6>$null; #3's inner site is asserted separately by the
-            # Invoke-AutoRotationStep tests.
+            # Inside its `if ($dueForPoll)` branch the polling loop calls
+            # Invoke-Reconcile ([Sync] auto-save / identity-change),
+            # Get-UsageSnapshot ([Sync] token-propagation-failed /
+            # sidecar-orphaned, via Update-SlotTokens inside Get-SlotUsage)
+            # and Invoke-AutoRotationStep ([Switch] ~/.claude.json write
+            # failed, via Invoke-SlotSwap in its 'rotate' arm). Each prints
+            # straight to the alt buffer, OUTSIDE the captured frame;
+            # without 6>$null suppression the in-place repaint (no ESC[2J)
+            # never overwrites it and the user is left with a stray advisory
+            # line they cannot dismiss. The rotation step's inner site is
+            # asserted separately by the Invoke-AutoRotationStep tests.
             #
             # Static check rather than behavioral because the watch loop
             # is an infinite loop and hard to drive in a unit test.
@@ -1181,28 +1146,20 @@ Describe 'switch_claude_account' {
             # progress activity (Write-Progress / stream 4) flashing
             # between watch frames.
             #
-            # Background: Invoke-WebRequest / Invoke-RestMethod emit a
-            # progress activity by default with rotating status messages
-            # ("Waiting for response...", "Reading web response (NNN
-            # bytes)"). The host UI paints this directly to the alt
-            # buffer, bypassing the DEC 2026 byte-stream sync envelope
-            # around each watch frame. Without function-scoped
-            # $ProgressPreference = 'SilentlyContinue', it flashes for
-            # the duration of every HTTP call inside the watch loop's
-            # hot path.
+            # Invoke-WebRequest / Invoke-RestMethod emit a progress activity
+            # by default with rotating status messages ("Waiting for
+            # response...", "Reading web response (NNN bytes)"). The host UI
+            # paints this directly to the alt buffer, bypassing the DEC 2026
+            # byte-stream sync envelope around each watch frame. Without
+            # function-scoped $ProgressPreference = 'SilentlyContinue', it
+            # flashes for the duration of every HTTP call inside the watch
+            # loop's hot path. PowerShell's preference-variable scope chain
+            # masks the parent value for the function's duration only, so no
+            # try/finally is needed.
             #
-            # Fix: each function that calls Invoke-RestMethod sets
-            # $ProgressPreference = 'SilentlyContinue' at the top of
-            # its body. PowerShell's preference-variable scope chain
-            # masks the parent value for the function's duration only;
-            # no try/finally needed.
-            #
-            # Generalized contract (vs. naming the three current
-            # functions explicitly): every function whose body contains
-            # an Invoke-RestMethod call must suppress the progress
-            # activity. A future maintainer who adds a fourth HTTP-
-            # calling function will fail this test until they include
-            # the suppression line.
+            # Stated as a contract over every function whose body calls
+            # Invoke-RestMethod, so a later HTTP-calling function fails
+            # this test until it carries the suppression line too.
             $ast = [System.Management.Automation.Language.Parser]::ParseFile(
                 $script:ScriptPath, [ref]$null, [ref]$null)
 
@@ -1734,12 +1691,10 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Invoke-WatchPoll' {
-        # The poll step is the only extracted watch unit that touches
-        # credentials, and until it came out of the loop none of it was
-        # reachable by a test: the loop around it never terminates. Every
-        # collaborator is mocked, so these drive the step's own decisions
-        # (what it stores, what it swallows, what it skips, in what order)
-        # and nothing else.
+        # The poll step is the one watch unit that touches credentials.
+        # Every collaborator is mocked, so these drive the step's own
+        # decisions (what it stores, what it swallows, what it skips, in
+        # what order) and nothing else.
 
         BeforeEach {
             Mock Invoke-Reconcile        -MockWith { [pscustomobject]@{ Captured = $true } }
@@ -1862,9 +1817,6 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Format-WatchFooter' {
-        # Pure, and previously unreachable: every branch lived inline in the
-        # watch loop, so none of the four was exercised by anything.
-
         It 'orders mode state above transport detail' {
             # The mode lines lead so the user's eye finds them first; poll
             # timestamp and failure tail follow underneath.
@@ -1955,9 +1907,9 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Invoke-WatchStartupWarm' {
-        # The -Warmup startup pass, previously inline in the watch loop and
-        # so unreachable. Invoke-WarmAllSlots is mocked throughout: the real
-        # one spawns `claude -p` per slot and is billable.
+        # The -Warmup startup pass. Invoke-WarmAllSlots is mocked
+        # throughout: the real one spawns `claude -p` per slot and is
+        # billable.
 
         BeforeEach {
             Mock Invoke-Reconcile  -MockWith { [pscustomobject]@{ Captured = $true } }
@@ -2114,9 +2066,7 @@ Describe 'switch_claude_account' {
     Context 'Invoke-UsageWatch loop' {
         # The assembly, as opposed to the parts. Every piece the loop calls
         # is tested on its own above; what none of those cover is whether
-        # the loop wires them together -- and until Test-WatchInteractive
-        # existed nothing could reach the loop at all, because a test host
-        # is by definition the case its guard refuses.
+        # the loop wires them together.
         #
         # Enter-WatchTerminal and Exit-WatchTerminal run for real, so this
         # also proves the try/finally restores the terminal. The renderers
@@ -2265,10 +2215,9 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Watch-mode frame capture and in-place repaint' {
-        # Unit coverage for the two helpers that make the watch loop's
-        # single-write, no-clear repaint work (the flicker fix): the loop is
-        # an infinite Start-Sleep loop and stays untested, but these helpers
-        # are pure enough to drive directly.
+        # The helpers that make the watch loop's single-write, no-clear
+        # repaint work: the loop itself is an infinite Start-Sleep loop and
+        # cannot be driven, but these are pure enough to call directly.
 
         It 'ConvertTo-WatchFrameSequence homes the cursor and ends with erase-below' {
             $seq = ConvertTo-WatchFrameSequence "line1`nline2"
@@ -2381,12 +2330,11 @@ Describe 'switch_claude_account' {
 
     Context 'No-color mode' {
         # Verifies the $PSStyle.OutputRendering toggle wired into Invoke-Main.
-        # The toggle is the production no-color mechanism: every colored
-        # call site goes through `Write-Color` which emits inline ANSI SGR
-        # codes; PowerShell's WriteImpl -> GetOutputString filter then
-        # strips those SGR codes when OutputRendering=PlainText. So the
-        # only thing these tests need to verify is that the toggle is
-        # set during dispatch and restored on exit.
+        # It is the production no-color mechanism: PowerShell's
+        # WriteImpl -> GetOutputString filter strips the SGR that
+        # `Write-Color` emits whenever OutputRendering=PlainText, so these
+        # tests need only pin that the toggle is set during dispatch and
+        # restored on exit.
         #
         # Common.ps1 sets $PSStyle.OutputRendering='PlainText' globally
         # for tests so existing string-match assertions work against
@@ -2395,12 +2343,10 @@ Describe 'switch_claude_account' {
         # PlainText" from "was PlainText all along," then restore via
         # try/finally so subsequent tests see the BeforeEach baseline.
         #
-        # We mock Invoke-ListAction so the action body becomes a single
-        # capture line that records $PSStyle.OutputRendering DURING
-        # dispatch. Pester 5's dynamic scoping makes the in-It $NoColor
-        # / $Action assignments visible to Invoke-Main (which is defined
-        # at the dot-sourced script scope and reads its parameters via
-        # the parent scope chain).
+        # Pester 5's dynamic scoping makes the in-It $NoColor / $Action
+        # assignments visible to Invoke-Main (which is defined at the
+        # dot-sourced script scope and reads its parameters via the parent
+        # scope chain).
         BeforeEach {
             $script:capturedRendering = $null
             Mock Invoke-ListAction { $script:capturedRendering = $PSStyle.OutputRendering }
@@ -3037,10 +2983,6 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Format-UtilCell / Format-Truncate / Format-AccountCell / Format-BucketCell' {
-        # Direct unit tests for the pure cell-formatters; closes a
-        # coverage gap previously left by exercising them only through
-        # full Invoke-UsageAction renders.
-
         It 'Format-UtilCell renders em-dash for $null utilization' {
             (Format-UtilCell -Utilization $null) | Should -Be '   —'
         }
@@ -3254,9 +3196,9 @@ Describe 'switch_claude_account' {
                 Should -Be "[Usage] 'cached' is currently rate-limited or at a plan limit; showing last known usage."
         }
 
-        # The cache branch used to win outright, so a hard failure could
-        # hide behind a "showing last known usage" note. Both conditions now get
-        # their own line and no row is named twice.
+        # A cache branch that won outright would let a hard failure hide behind
+        # a "showing last known usage" note. Each condition gets its own line
+        # and no row is named twice.
         It 'emits one line per condition instead of letting the cache branch win' {
             $rows = @(
                 (New-RlRow -Name 'cached'  -Cached $true),
@@ -3315,8 +3257,8 @@ Describe 'switch_claude_account' {
 
         # --- per-slot reason lines ---
         #
-        # The Status column carries only a short label, so the detail it used
-        # to inline (a 60-char exception tail, cut mid-word) lands here.
+        # The Status column carries only a short label, so the detail of a
+        # failure lands here instead.
 
         It "prints the row's own message as its reason line" {
             $row  = New-RlRow -Name 'slot-1' -Status 'error'
@@ -3351,8 +3293,8 @@ Describe 'switch_claude_account' {
             Format-UsageAdvisory -Snapshot $snap | Should -Be "[Usage] 'slot-1': $Expected"
         }
 
-        # A remedy is a per-status constant, so repeating it once per slot said
-        # nothing new and burned the shared 3-line cap on identical text.
+        # A remedy is a per-status constant, so repeating it once per slot says
+        # nothing new and burns the shared 3-line cap on identical text.
         It 'names every slot sharing a remedy on one line' {
             $rows = @('a','b') | ForEach-Object { New-RlRow -Name $_ -Status 'no-oauth' }
             $snap = New-RlSnapshot -Results $rows
@@ -3400,9 +3342,9 @@ Describe 'switch_claude_account' {
         }
 
         # The fresh-cache path is the commonest transient failure there is (a
-        # cache under the TTL), and it used to arrive with its message stripped:
-        # the frame said "showing last known usage" and nothing anywhere said
-        # why, on the one row still painting numbers.
+        # cache under the TTL). Stripping its message leaves the frame saying
+        # "showing last known usage" with nothing anywhere saying why, on the
+        # one row still painting numbers.
         It 'explains a fresh cache fallback, which keeps its ok status' {
             $row = New-RlRow -Name 'blip' -Status 'ok' -Cached $true -Reason 'network'
             $row.Error = 'The operation has timed out.'
@@ -3605,6 +3547,74 @@ Describe 'switch_claude_account' {
             Mock Get-ConsoleWidth { 3 }
             $Script:FramePadColumns = 5
             Get-RenderWidth | Should -Be 0
+        }
+    }
+
+    Context 'Get-HttpFailureMessage' {
+        It 'replaces a timeout with a short text naming the budget' {
+            # Any wording: the .NET message is localized, so the type decides.
+            $ex = [System.Threading.Tasks.TaskCanceledException]::new('Die Anfrage wurde abgebrochen.')
+            Get-HttpFailureMessage -Exception $ex -TimeoutSec 12 | Should -Be 'request timed out after 12s'
+        }
+
+        It 'keeps the message of any other failure' {
+            $ex = [System.Net.Http.HttpRequestException]::new('No such host is known.')
+            Get-HttpFailureMessage -Exception $ex -TimeoutSec 12 | Should -Be 'No such host is known.'
+        }
+    }
+
+    Context 'Split-FooterLine' {
+        It 'returns a line that fits unchanged' {
+            Split-FooterLine -Text '[Usage] short' -Width 40 | Should -Be '[Usage] short'
+        }
+
+        It 'wraps nothing when the width is unknown' {
+            $text = '[Usage] ' + ('word ' * 40)
+            Split-FooterLine -Text $text -Width 0 | Should -Be $text
+        }
+
+        It 'wraps at word boundaries and hangs continuation rows under the tag' {
+            $rows = @(Split-FooterLine -Text "[Usage] 'slot-1', 'slot-2' could not be read live; showing last known usage." -Width 40)
+            $rows.Count | Should -BeGreaterThan 1
+            foreach ($row in $rows) { $row.Length | Should -BeLessOrEqual 40 }
+            foreach ($row in $rows[1..($rows.Count - 1)]) { $row | Should -Match '^ {8}\S' }
+            (($rows | ForEach-Object { $_.Trim() }) -join ' ') |
+                Should -Be "[Usage] 'slot-1', 'slot-2' could not be read live; showing last known usage."
+        }
+
+        It 'breaks a word longer than a row in place' {
+            $rows = @(Split-FooterLine -Text '[X] aaaaaaaaaaaaaaaaaaaaaaaaa bb' -Width 10)
+            $rows[0] | Should -Be '[X] aaaaaa'
+            foreach ($row in $rows) { $row.Length | Should -BeLessOrEqual 10 }
+            (($rows | ForEach-Object { $_.Trim() }) -join '') -replace ' ', '' |
+                Should -Be '[X]aaaaaaaaaaaaaaaaaaaaaaaaabb'
+        }
+
+        It 'does not indent a line without a tag' {
+            $rows = @(Split-FooterLine -Text 'abcdefghi jklmnopqrstuvwxyz' -Width 10)
+            $rows | Should -Be @('abcdefghi', 'jklmnopqrs', 'tuvwxyz')
+        }
+
+        It 'drops the hanging indent when it would leave under half a row' {
+            $rows = @(Split-FooterLine -Text '[LongTagName] one two three four' -Width 16)
+            foreach ($row in $rows[1..($rows.Count - 1)]) { $row | Should -Not -Match '^ ' }
+        }
+    }
+
+    Context 'Format-UsageFooter wrapping' {
+        AfterEach { $Script:FramePadColumns = 0 }
+
+        It 'keeps every row inside the inset render width' {
+            # A terminal-wrapped row starts at column 0, outside the frame
+            # inset; wrapping in the footer keeps each row inside it.
+            Mock Get-ConsoleWidth { 60 }
+            $Script:FramePadColumns = 2
+            $advisory = "[Usage] 'slot-1', 'slot-2', 'slot-3' could not be read live; showing last known usage."
+            $rows = @((Format-UsageFooter -Footer '[Watch] Last poll at 10:02:02' -Advisory $advisory 6>&1 | Out-String) -split "`r?`n" |
+                Where-Object { $_ })
+            $rows.Count | Should -Be 3
+            foreach ($row in $rows) { $row.Length | Should -BeLessOrEqual 55 }
+            $rows[1] | Should -Match '^ {8}\S'
         }
     }
 
@@ -3846,10 +3856,8 @@ Describe 'switch_claude_account' {
     }
 
     Context 'Update-SlotTokens (uncovered failure modes)' {
-        # Direct unit tests for Update-SlotTokens' guard clauses and
-        # advisory paths. The happy path is exercised through Invoke-
-        # UsageAction; here we hit the throws and the
-        # propagation-to-credentials.json failure branch.
+        # The happy path is exercised through Invoke-UsageAction; these
+        # drive the guard clauses and the advisory paths.
 
         It 'throws when the slot file has no OAuth material to refresh' {
             $credDir = Join-Path $script:SandboxHome '.claude'
@@ -4247,10 +4255,9 @@ Describe 'switch_claude_account' {
     }
 
     Context 'New-AutoSaveSlot (sidecar-write failure advisory)' {
-        # Direct test for the New-AutoSaveSlot helper's catch path:
-        # when Write-Sidecar throws, the function must NOT throw; it
-        # emits a yellow advisory and the slot tokens file remains on
-        # disk (Get-Slots will hide it, user can clean up by name).
+        # A failed sidecar write must not throw. The tokens file stays on
+        # disk: Get-Slots hides a sidecar-less slot, so the user can still
+        # clean it up by name.
 
         It 'emits a yellow advisory and keeps the tokens file when sidecar write fails' {
             $credDir = Join-Path $script:SandboxHome '.claude'
@@ -4287,9 +4294,7 @@ Describe 'switch_claude_account' {
     Context 'Write-Color (uncovered branches)' {
         # Common.ps1 forces OutputRendering=PlainText so the SGR codes
         # Write-Color emits are stripped by PowerShell's host filter
-        # before we see them. We can still verify the function does not
-        # throw on each role (covers the switch arms) and that
-        # NoNewline is honored.
+        # before we see them.
 
         It 'emits without throwing for every documented role' {
             foreach ($c in 'Heading','Warning','Success','Danger','Muted','Neutral') {
@@ -4302,8 +4307,7 @@ Describe 'switch_claude_account' {
         }
 
         It '-NoNewline switch is honored (single Write-Host call without a newline)' {
-            # Capture stream 6 and verify the emitted line carries the
-            # message text. PlainText stripping leaves the text intact.
+            # PlainText stripping leaves the message text intact.
             $out = Write-Color 'sentinel-no-newline' 'Neutral' -NoNewline 6>&1 | Out-String
             $out | Should -Match 'sentinel-no-newline'
         }
@@ -4870,7 +4874,7 @@ Describe 'switch_claude_account' {
     }
 
     AfterAll {
-        # Restore the two globals BeforeEach mutated so this suite leaves
+        # Restore the globals BeforeEach mutated so this suite leaves
         # the caller's session clean. Pester runs AfterAll even if tests
         # throw, so this covers the mid-suite-failure case too.
         $env:USERPROFILE       = $script:OriginalUserProfile

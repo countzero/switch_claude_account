@@ -14,7 +14,7 @@ The name is case-insensitive. An unrecognized one falls back to `default` withou
 
 **`default` is the one panel that cannot be honest.** It carries no colors of its own: it emits the standard ANSI codes and lets your terminal decide what they look like, so it already matches whatever scheme you have configured, on a light background as readily as a dark one. Its panel has to pick one interpretation to draw, and picks Windows Terminal's Campbell. If you like how your terminal already looks, `default` is the right answer and no image can show you that.
 
-The other ten are absolute 24-bit color and render exactly as pictured. Nine are the [base16](https://github.com/tinted-theming/schemes) scheme of the same name, dark variant, so a palette you know from your editor reads the same here. `claude` has no upstream: it is an original palette keyed to the warm accent and near-black of the Claude Code interface this tool manages logins for.
+The others are absolute 24-bit color and render exactly as pictured. Each is the [base16](https://github.com/tinted-theming/schemes) scheme of the same name, dark variant, so a palette you know from your editor reads the same here. Only `claude` has no upstream: it is an original palette keyed to the warm accent and near-black of the Claude Code interface this tool manages logins for.
 
 ---
 

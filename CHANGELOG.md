@@ -3,6 +3,13 @@
 This changelog follows [Common Changelog](https://common-changelog.org) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.1] - 2026-09-23
+
+### Fixed
+- Wait up to 30 s for the Anthropic endpoints, so a network whose IPv6 route drops packets still gets its answer over IPv4.
+- Report a timed-out request as `request timed out after 30s` instead of .NET's localized 101-character sentence.
+- Wrap long footer lines of `sca usage` and `sca monitor` inside the frame instead of letting the terminal break them at column 0.
+
 ## [4.3.0] - 2026-09-21
 
 _Under a named `SCA_THEME` the watch now sets the terminal's own background color for as long as it runs, and resets it on exit._
@@ -327,6 +334,7 @@ _Upgrading migrates active-slot tracking from hardlinks to a state file on first
 - Add a README with installation, usage, workflow, Windows notes and testing sections.
 - Add `CLAUDE.md` with agent guidance for the repo structure, gotchas and script-shape conventions.
 
+[4.3.1]: https://github.com/countzero/switch_claude_account/releases/tag/v4.3.1
 [4.3.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.3.0
 [4.2.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.2.0
 [4.1.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.1.0

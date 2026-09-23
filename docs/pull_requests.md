@@ -33,7 +33,7 @@ per change and are the durable record (`AGENTS.md` → *Code Comments*). The
 description covers the whole branch and is read once, by a reviewer deciding
 whether it may merge.
 
-Three things are easy to omit and are the ones a reviewer needs most:
+What is easiest to omit is what a reviewer needs most:
 
 - **The shortcomings of the approach.** Every non-trivial change has them. Naming
   them is what separates a description from a sales pitch, and it points the
@@ -52,7 +52,7 @@ template prompts for headings, and the headings are the part that legitimately
 varies between a security fix, a platform port and a documentation change; what
 does not vary is the substance above, which no template can check. A second copy
 of this rule, prefilled into every pull request and answered with "N/A", would
-rot the way the duplicated rules this repository has already deleted did.
+rot the way any duplicated rule does.
 
 ## A release pull request
 
@@ -74,8 +74,7 @@ number.
 
 This does not reach `CHANGELOG.md`, which keeps its Common Changelog groups. The
 overlap is deliberate: the file records what shipped, for whoever asks later what
-a version contained; the description is read once, by a reviewer deciding whether
-the release may merge.
+a version contained.
 
 ## Sources
 

@@ -5,8 +5,8 @@
 # Pester suite. By default, code coverage is collected on
 # switch_claude_account.ps1 and a summary line is printed; use
 # -SkipCoverage for the fastest local iteration loop. Exit code is 1
-# if any test failed or coverage falls below -CoverageThreshold
-# (default 90), 0 otherwise.
+# if any test failed or coverage falls below -CoverageThreshold,
+# 0 otherwise.
 
 [CmdletBinding()]
 Param (
@@ -52,10 +52,9 @@ if (Get-Module -ListAvailable PSScriptAnalyzer) {
         Write-Host 'PSScriptAnalyzer findings:' -ForegroundColor Yellow
         $findings | Format-Table Severity, RuleName, Line, Message -AutoSize | Out-String | Write-Host
         # Error severity fails the run; Warning stays advisory. The
-        # repo's PSScriptAnalyzerSettings.psd1 silences five rules
-        # documented there as deliberate design choices, so the
-        # remaining Warning surface is small and a new Error-level
-        # finding is almost always a genuine bug.
+        # rules PSScriptAnalyzerSettings.psd1 silences are documented
+        # there, so the remaining Warning surface is small and a new
+        # Error-level finding is almost always a genuine bug.
         if ($findings | Where-Object { $_.Severity -eq 'Error' }) {
             Write-Host 'PSScriptAnalyzer: Error-severity findings present; failing run.' -ForegroundColor Red
             exit 1
@@ -83,8 +82,7 @@ if (-not $SkipCoverage) {
 
     $config.CodeCoverage.Enabled        = $true
     # CodeCoverage.Path accepts string[]; wrap defensively so older 5.x
-    # versions don't trip on a bare string. We measure ONLY the script
-    # under test, not the test files themselves.
+    # versions don't trip on a bare string.
     $config.CodeCoverage.Path           = @($scriptPath)
     # Pester 5.2+ profiler-based collector: faster than the legacy
     # breakpoint-based path and does not mutate the script during the
@@ -92,10 +90,8 @@ if (-not $SkipCoverage) {
     $config.CodeCoverage.UseBreakpoints = $false
     $config.CodeCoverage.OutputFormat   = 'JaCoCo'
     $config.CodeCoverage.OutputPath     = Join-Path $coverageDir 'coverage.xml'
-    # Pester-native gate: below this percent, $result.Result becomes
-    # 'Failed' and the exit predicate below picks it up. Keeping the
-    # threshold inside Pester avoids a second, slightly-different
-    # percent calculation drifting out of sync with the displayed value.
+    # Informational only: the gate is computed after the run, see
+    # $coverageGateFailed below.
     $config.CodeCoverage.CoveragePercentTarget = $CoverageThreshold
 }
 
@@ -133,7 +129,7 @@ if (-not $SkipCoverage -and $result.CodeCoverage) {
         Write-Host ('Code coverage: {0}% (threshold {1}%)' -f $pctText, $CoverageThreshold) -ForegroundColor $color
         if (-not $passed) {
             # Show two extra decimals on failure so a value that rounds
-            # up to the threshold (e.g. 89.95 -> 90.0) cannot make the
+            # up to the threshold (e.g. 96.95 -> 97.0) cannot make the
             # red line look like a contradiction with the summary above.
             $pctPrecise = $pct.ToString('N2', $invariant)
             Write-Host ('Coverage gate FAILED: {0}% < {1}% minimum.' -f $pctPrecise, $CoverageThreshold) -ForegroundColor Red
@@ -143,7 +139,6 @@ if (-not $SkipCoverage -and $result.CodeCoverage) {
 }
 
 # --- Exit code ---
-# Nonzero iff any test failed OR the coverage gate was not met.
 if ($result.FailedCount -gt 0 -or $coverageGateFailed) {
     exit 1
 } else {

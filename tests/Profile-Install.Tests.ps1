@@ -59,10 +59,9 @@ Describe 'switch_claude_account' {
             # inject CRLF into an otherwise-LF profile. Every other assertion
             # in this file is terminator-agnostic (Should -Match uses \r?\n,
             # and the byte round-trips pass under either terminator because
-            # Remove-From-Profile splices on \r?\n), and the coverage gate runs
-            # on Windows only, where the change is indistinguishable from the
-            # hardcoded `r`n it replaced. Pin it explicitly or Unix regresses
-            # silently.
+            # Remove-From-Profile splices on \r?\n), and on Windows the join
+            # yields CRLF either way. Pin the terminator explicitly or Unix
+            # regresses silently.
             Add-To-Profile 6>$null
 
             $content = Get-Content -LiteralPath $script:FakeProfilePath -Raw

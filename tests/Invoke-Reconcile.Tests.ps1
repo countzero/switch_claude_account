@@ -3,12 +3,10 @@
 
 # Pester 5 tests for Invoke-Reconcile in switch_claude_account.ps1.
 #
-# Reconcile is the heart of the new robust active-slot tracking model: on
-# every credentials-touching action it brings the saved slot file in line
-# with .credentials.json (which Claude Code may have rewritten via an
-# atomic-rename refresh since the last sca call). The tests below exercise
-# all four documented outcomes plus the offline-tolerance and missing-slot
-# fallbacks. Per-test sandbox setup lives in tests/Common.ps1.
+# Reconcile carries active-slot tracking: on every credentials-touching
+# action it brings the saved slot file in line with .credentials.json, which
+# Claude Code may have rewritten via an atomic-rename refresh since the last
+# sca call. Per-test sandbox setup lives in tests/Common.ps1.
 
 BeforeAll {
     $script:OriginalUserProfile = $env:USERPROFILE
@@ -39,7 +37,6 @@ Describe 'switch_claude_account' {
             $r.Action | Should -Be 'noop'
             $r.Reason | Should -Be 'no-active-credentials'
 
-            # No state file should have been written by a noop.
             Test-Path -LiteralPath $StateFile | Should -BeFalse
         }
 
@@ -49,7 +46,6 @@ Describe 'switch_claude_account' {
             Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
             Set-Content -LiteralPath $slotFile -Value $script:CredsBody -NoNewline
 
-            # Seed state with the current hash (matching .credentials.json).
             $hash = (Get-FileHash -LiteralPath $credFile -Algorithm SHA256).Hash
             Update-ScaState -ActiveSlot 'work' -LastSyncHash $hash | Out-Null
 
@@ -78,10 +74,8 @@ Describe 'switch_claude_account' {
             $r.Action | Should -Be 'mirror'
             $r.Slot   | Should -Be 'work'
 
-            # Slot file now byte-equal to .credentials.json.
             Get-Content -LiteralPath $slotFile -Raw | Should -Be $script:CredsBody
 
-            # state.last_sync_hash updated to the current hash.
             $expectedHash = (Get-FileHash -LiteralPath $credFile -Algorithm SHA256).Hash
             (Read-ScaState).last_sync_hash | Should -Be $expectedHash
         }
@@ -91,7 +85,7 @@ Describe 'switch_claude_account' {
         # response on one login path and from the access token's own embedded
         # account_email on another. On the email alone this reads as a
         # cross-account swap and auto-saves a second slot for an account
-        # already saved, mislabelled with the other email form. The uuid both
+        # already saved, mislabeled with the other email form. The uuid both
         # records agree on settles it offline.
         It 'mirrors when the emails disagree but the uuid says one account' {
             $credFile = Join-Path $script:CD '.credentials.json'
@@ -133,8 +127,8 @@ Describe 'switch_claude_account' {
 
         # When ~/.claude.json is missing AND the /api/oauth/profile fallback
         # fails, nothing can say whose tokens these are. Mirroring on a guess
-        # is what overwrote a working login in practice, so the unattributable
-        # case now writes nothing at all and waits for a later reconcile.
+        # overwrites a working login, so the unattributable case writes nothing
+        # at all and waits for a later reconcile.
         It 'refuses to write when neither ~/.claude.json nor /api/oauth/profile yields an email' {
             $credFile = Join-Path $script:CD '.credentials.json'
             Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
@@ -175,11 +169,9 @@ Describe 'switch_claude_account' {
         }
 
         # The no-tracked-slot path is not the harmless one, which is why the
-        # guard sits ahead of it rather than inside the tracked-slot branch.
-        # Auto-saving here writes a credential file with no sidecar, because
-        # there is no account to write one from; Get-Slots then hides it and
-        # `sca remove` cannot reach it by name, while state.active_slot points
-        # at that invisible slot.
+        # guard sits ahead of it rather than inside the tracked-slot branch:
+        # auto-saving here leaves the invisible slot the auto-save Context
+        # below describes.
         It 'writes nothing when identity is unresolvable and no slot is tracked' {
             $credFile = Join-Path $script:CD '.credentials.json'
             Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
@@ -249,11 +241,9 @@ Describe 'switch_claude_account' {
             $r.Slot         | Should -Be 'personal'
             $r.PreviousSlot | Should -Be 'work'
 
-            # Neither slot file was written.
             Get-Content -LiteralPath $workFile -Raw | Should -Be $script:CredsBody
             Get-Content -LiteralPath $persFile -Raw | Should -Be $otherBody
 
-            # State now tracks the slot that is genuinely active.
             $st = Read-ScaState
             $st.active_slot    | Should -Be 'personal'
             $st.last_sync_hash | Should -Be (Get-FileHash -LiteralPath $credFile -Algorithm SHA256).Hash
@@ -265,12 +255,12 @@ Describe 'switch_claude_account' {
             (Get-OAuthAccountFromClaudeJson).emailAddress | Should -Be 'bob@example.com'
         }
 
-        # Adopt is the one outcome that changes WHICH account is active, so the
-        # two files must agree about it. Committing state while ~/.claude.json
-        # still names the old account splits them, and nothing revisits it: the
-        # next reconcile hash-matches and returns. The one after that reads two
-        # identities that disagree and files the adopted slot's tokens under the
-        # old account's name, the mislabelled slot `sca save` refuses to create.
+        # State and ~/.claude.json must agree about which account is active.
+        # Committing state while ~/.claude.json still names the old account
+        # splits them, and nothing revisits it: the next reconcile hash-matches
+        # and returns. The one after that reads two identities that disagree and
+        # files the adopted slot's tokens under the old account's name, the
+        # mislabeled slot `sca save` refuses to create.
         It 'leaves tracking alone when ~/.claude.json names another account and cannot be updated' {
             $credFile  = Join-Path $script:CD '.credentials.json'
             $otherBody = '{"claudeAiOauth":{"accessToken":"sk-ant-oat-OTHER","refreshToken":"sk-ant-ort-OTHER","expiresAt":9999999999999}}'
@@ -322,9 +312,9 @@ Describe 'switch_claude_account' {
         # carries no identity. An unreadable one proves nothing: it may name
         # any account, and it is also the likeliest reason the identity write
         # threw in the first place, so deciding on the resolved email alone
-        # stood the guard down in exactly the case that needs it. The two
-        # causes are distinguished by Read-ClaudeJson, not by whether an email
-        # came back.
+        # would stand the guard down in exactly the case that needs it. The
+        # two causes are distinguished by Read-ClaudeJson, not by whether an
+        # email came back.
         It 'refuses to adopt while ~/.claude.json is unreadable' {
             $credFile  = Join-Path $script:CD '.credentials.json'
             $otherBody = '{"claudeAiOauth":{"accessToken":"sk-ant-oat-OTHER","refreshToken":"sk-ant-ort-OTHER","expiresAt":9999999999999}}'
@@ -333,7 +323,7 @@ Describe 'switch_claude_account' {
             Set-Content -LiteralPath $credFile -Value $otherBody -NoNewline
             # Truncated mid-object: Get-Content succeeds, ConvertFrom-Json does
             # not, and the identity write throws on the missing block. One
-            # cause, both failures, which is the pairing the old guard missed.
+            # cause, both failures.
             Set-Content -LiteralPath $ClaudeJsonPath -Value '{"numStartups":' -NoNewline -Encoding utf8NoBOM
             Update-ScaState -ActiveSlot 'work' -LastSyncHash 'STALE_HASH' | Out-Null
 
@@ -546,10 +536,9 @@ Describe 'switch_claude_account' {
         }
 
         # The probe answered about the file as it stood when it read it. If the
-        # bytes moved under us since, the caller's hash describes a login that
-        # is already gone, and 'moved' is what says so. An unhashable file is
-        # the same situation: we cannot show the bytes are still the ones asked
-        # about.
+        # bytes moved since, the caller's hash describes a login that is already
+        # gone, and 'moved' is what says so. An unhashable file is the same
+        # situation: nothing shows the bytes are still the ones asked about.
         It 'reports moved when the credentials file can no longer be hashed' {
             $credPath = Join-Path $script:CD '.credentials.json'
             Set-Content -LiteralPath $credPath -Value $script:CredsBody -NoNewline
@@ -632,7 +621,7 @@ Describe 'switch_claude_account' {
         # the top of reconcile, and a /login landing between the two is the
         # event this branch exists to catch. Auto-saving anyway would file the
         # OLD account's tokens under the NEW account's email and uuid: the
-        # mislabelled slot `sca save` refuses to create, with nothing later to
+        # mislabeled slot `sca save` refuses to create, with nothing later to
         # correct it.
         It 'writes nothing when the credentials move while their account is being verified' {
             Mock Test-ClaudeRunning { $true }
@@ -800,12 +789,12 @@ Describe 'switch_claude_account' {
             (Read-ScaState).active_slot | Should -Be $r.Slot
         }
 
-        # The auto-save fallback used to run on no identity at all, writing an
-        # unlabeled slot file with no sidecar. Get-Slots hides such a slot and
-        # `sca remove` cannot reach it by name, so the bytes were preserved in
-        # a place the user could not act on, and state.active_slot pointed at
-        # it. Not writing is the better answer; the next resolvable run
-        # captures the same bytes properly.
+        # The auto-save fallback requires a resolved identity. Running it
+        # without one writes an unlabeled slot file with no sidecar, which
+        # Get-Slots hides and `sca remove` cannot reach by name, while
+        # state.active_slot points at it: the bytes preserved somewhere the
+        # user cannot act on. Writing nothing is the better answer; the next
+        # resolvable run captures the same bytes properly.
         It 'writes nothing when both identity sources fail and no state file exists' {
             $credFile = Join-Path $script:CD '.credentials.json'
             Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
@@ -869,7 +858,7 @@ Describe 'switch_claude_account' {
         # Read-ScaState auto-migrates by hash on first call when the state
         # file is missing. Reconcile sees the result as a normal state and
         # branches into noop because the hash matches what the migration
-        # just wrote. Verifies migration -> noop integrates cleanly.
+        # just wrote.
         It 'noops on first run when hash matches an existing slot (silent migration)' {
             $credFile = Join-Path $script:CD '.credentials.json'
             Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline
@@ -889,8 +878,7 @@ Describe 'switch_claude_account' {
     # returns $null), reconcile falls back to /api/oauth/profile to learn
     # the current identity. The synthesized accountInfo carries the uuid and
     # the email; the other three fields are not in the response and stay
-    # $null. Exercises the branch the claude.json-only tests above cannot
-    # reach.
+    # $null.
 
     Context 'Invoke-Reconcile (profile-endpoint fallback identity)' {
         It 'auto-saves using the /api/oauth/profile email when claude.json has no oauthAccount' {
@@ -914,7 +902,6 @@ Describe 'switch_claude_account' {
             $r.Action | Should -Be 'auto-save'
             $r.Email  | Should -Be 'fallback@example.com'
 
-            # Auto-save slot is labeled with the fallback email and a sidecar exists.
             $autoPath    = Join-Path $script:CD ".credentials.$($r.Slot)(fallback@example.com).json"
             $autoSidecar = Join-Path $script:CD ".credentials.$($r.Slot)(fallback@example.com).account.json"
             Test-Path -LiteralPath $autoPath    | Should -BeTrue
@@ -983,10 +970,9 @@ Describe 'switch_claude_account' {
             @(Get-CredentialSlotFiles).Count | Should -Be $before
         }
 
-        # When state.active_slot points at a slot whose sidecar email
-        # matches the profile-fallback email, reconcile mirrors (no
-        # cross-account swap). Exercises the sidecar-email comparison
-        # via the profile fallback.
+        # When state.active_slot points at a slot whose sidecar email matches
+        # the profile-fallback email, reconcile mirrors rather than reading a
+        # cross-account swap.
         It 'mirrors when claude.json is empty but profile fallback email matches the tracked slot' {
             $credFile = Join-Path $script:CD '.credentials.json'
             Set-Content -LiteralPath $credFile -Value $script:CredsBody -NoNewline

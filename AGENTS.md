@@ -26,7 +26,7 @@ This repository's subject is live OAuth credentials. Three rules, in force in ev
 
 ## Script actions
 
-`save`, `switch`, `list`, `remove`, `usage`, `monitor`, `warmup`, `install`, `uninstall`, `help`. The list is the `ValidateSet` on `$Action`, each one's contract is its `Invoke-<Action>Action` function, and the user-facing summary is `sca help` and `README.md` → *Usage*. Which of them refuse beside a running Claude Code is `Test-ClaudeRunning`; which reconcile first is below.
+The list of actions is the `ValidateSet` on `$Action`, each one's contract is its `Invoke-<Action>Action` function, and the user-facing summary is `sca help` and `README.md` → *Usage*. Which of them refuse beside a running Claude Code is `Test-ClaudeRunning`; which reconcile first is below.
 
 ## Editing the script
 
@@ -57,9 +57,11 @@ The exit code is the verdict, so never narrow the run to find one: a filter that
 
 ## README image regeneration
 
-`pwsh -NoProfile -File tools/Render-ReadmeImages.ps1` re-renders every SVG in `docs/images/` via `charmbracelet/freeze`: four README scenes plus one `theme-<name>.svg` per selectable theme, which is every entry in `$Script:Base16Schemes`, read by dot-sourcing the script, and `default` besides. Re-run when a README example number changes, when a `Write-Color` / `Get-StatusColor` / `Get-AggregateBarColor` mapping changes, or when a theme is added; a new theme's image appears on its own, but its heading and alt text in `docs/themes.md` are hand-maintained. A theme panel takes its canvas from freeze's `--background`, not an SGR behind each row, so the color reaches the window padding too. Every image embeds its font and must: freeze emits no per-glyph positions, so a substituted face moves the text off the geometry and the usage bars stop filling their cells. That script's header owns the palette, the font and truecolor rationale, and the README `width` contract.
+`pwsh -NoProfile -File tools/Render-ReadmeImages.ps1` re-renders every SVG in `docs/images/` via `charmbracelet/freeze`: four README scenes plus one `theme-<name>.svg` per selectable theme, which is every entry in `$Script:Base16Schemes`, read by dot-sourcing the script, and `default` besides. Re-run when a README example number changes, when a `Write-Color` / `Get-StatusColor` / `Get-AggregateBarColor` mapping changes, or when a theme is added; a new theme's image appears on its own, but its heading and alt text in `docs/themes.md` are hand-maintained. Every image embeds its font and must: freeze emits no per-glyph positions, so a substituted face moves the text off the geometry and the usage bars stop filling their cells. That script's header owns the palette, the font and truecolor rationale, and the README `width` contract.
 
 ## Default Change Workflow
+
+Work of more than one step keeps the todo tool current, one item in progress and each ticked off as it finishes, so a human can follow along.
 
 After any code change, run `pwsh -NoProfile -File tests/Invoke-Tests.ps1` (the implicit parse-time check when the script is dot-sourced is the only "typecheck"). Commit and push are **not** automatic: commit only when explicitly asked, push only when explicitly asked, and "commit" does not imply "push."
 
@@ -86,15 +88,17 @@ When your changes overlap foreign WIP in the same file, stop and ask. Do not res
 
 ## Version Control
 
-- [Semantic Versioning](https://semver.org/). LF line endings enforced via `.gitattributes`.
+- [Semantic Versioning](https://semver.org/), with what counts as MAJOR, MINOR and PATCH for this script in `docs/conventions.md` → *Version numbers*. LF line endings enforced via `.gitattributes`.
 - **Branches**: `main` and `develop` are long-lived. A pull request takes `develop` into `main` and carries a release.
 - **Commits** take the [Conventional Commits](https://www.conventionalcommits.org/) form, `type(scope): imperative summary`, with the *why* in the body and no `Co-Authored-By` trailer. Common Changelog argues against this convention; the reason this repository keeps it anyway is `docs/conventions.md` → *Commit messages*.
-- **Changelog** follows [Common Changelog](https://common-changelog.org) with two deliberate deviations, each recorded with its reason in `docs/conventions.md` → *Changelog*. An entry is one imperative line of around 100 characters saying what changed, never why; the why is the commit body. Edit `CHANGELOG.md` only as a step of a release.
+- **Changelog** follows [Common Changelog](https://common-changelog.org) with two deliberate deviations, each recorded with its reason in `docs/conventions.md` → *Changelog*. An entry is one imperative line of around 100 characters saying what changed, never why; the why is the commit body. One entry per change rather than per commit, and prose earns one only in the four cases listed there. Edit `CHANGELOG.md` only as a step of a release.
 - A **pull request** body is English and answers **what** changed and **why**, names the **shortcomings** of the approach, says **which feedback** you want, and lists **what is not done**. A link supplements it and never carries it. A release groups its account by version, newest first. `docs/pull_requests.md`.
+- A **release** is tagged `vX.Y.Z` on the merge commit of its pull request, never on the `chore(release)` commit, and its asset is attached by `release-assets.yml` rather than by hand. `docs/releases.md`.
 
 ## Skills
 
 - `plan-review` / `pr-code-review` (under `.claude/skills/`): second-pass design review before non-trivial plans; multi-pass PR review.
+- `trim-prose` (under `.claude/skills/`): editing pass over the comments and documents a branch changed, before its pull request.
 
 ## Output Formatting
 
@@ -112,3 +116,4 @@ All under `docs/`; the sentence is the document's own opening line.
 | `testing.md`               | Read when writing or running a Pester test, or when the coverage gate is red            |
 | `claude-code-internals.md` | Read when an unofficial endpoint or constant needs re-verifying against a new build     |
 | `pull_requests.md`         | Read before opening a pull request or writing its description                           |
+| `releases.md`              | Read when tagging, publishing or verifying a release                                    |

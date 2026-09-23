@@ -25,18 +25,18 @@ Skip for pure Q&A, file inspection, one-line fixes, and mechanical edits.
 
 ## Lenses
 
-| Lens                              | Probe                                                                                  |
-| --------------------------------- | -------------------------------------------------------------------------------------- |
-| YAGNI                             | Anything in this plan not required by the current ticket / user request?               |
-| KISS                              | Simplest version that still solves the problem? Why isn't that the plan?               |
-| DRY                               | Is this knowledge already represented somewhere reusable in the codebase?              |
-| SOLID                             | Any single piece with more than one reason to change? Split it.                        |
-| Premature Optimization            | Adding complexity for an unmeasured perf concern?                                      |
-| Occam's Razor                     | Simpler explanation of the problem that would make a smaller plan sufficient?          |
-| Tesler's Conservation             | Is irreducible complexity placed in the right layer (api / service / library / client)? |
-| Gall's Law                        | Starting from a working simple system and growing it, or designing complexity up front? |
-| Principle of Least Astonishment   | Will the next reader be surprised by naming, dependency direction, or layering?        |
-| Inversion                         | What would make this plan obviously bad? Are we close to any failure mode?             |
+| Lens                            | Probe                                                                                   |
+| ------------------------------- | --------------------------------------------------------------------------------------- |
+| YAGNI                           | Anything in this plan not required by the current ticket / user request?                |
+| KISS                            | Simplest version that still solves the problem? Why isn't that the plan?                |
+| DRY                             | Is this knowledge already represented somewhere reusable in the codebase?               |
+| SOLID                           | Any single piece with more than one reason to change? Split it.                         |
+| Premature Optimization          | Adding complexity for an unmeasured perf concern?                                       |
+| Occam's Razor                   | Simpler explanation of the problem that would make a smaller plan sufficient?           |
+| Tesler's Conservation           | Is irreducible complexity placed in the right layer (api / service / library / client)? |
+| Gall's Law                      | Starting from a working simple system and growing it, or designing complexity up front? |
+| Principle of Least Astonishment | Will the next reader be surprised by naming, dependency direction, or layering?         |
+| Inversion                       | What would make this plan obviously bad? Are we close to any failure mode?              |
 
 ## Disclosure
 
@@ -51,8 +51,6 @@ Examples:
 - `[reviewed: YAGNI] dropped the IRoleCache layer, only one caller`
 - `[reviewed: KISS, DRY] collapsed two helpers into the existing util`
 - `[reviewed: SOLID] split the orchestrator from the persistence path`
-
-If the pass changed nothing, emit no marker. Silence is honest.
 
 ## Don't
 

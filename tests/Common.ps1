@@ -48,15 +48,12 @@ $global:PROFILE = [pscustomobject]@{ CurrentUserAllHosts = $script:FakeProfilePa
 # stops Invoke-Main from running, so tests drive individual functions.
 . $script:ScriptPath
 
-# Force PlainText rendering for the entire test session. With every colored
-# call site now going through Write-Color (which emits inline ANSI SGR
-# codes), PowerShell's WriteImpl -> GetOutputString filter strips those
-# codes when OutputRendering=PlainText. That keeps every existing
-# string-match assertion in the suite valid against the ANSI-stripped
-# byte stream -- no test pattern needs to know about ANSI codes. Tests
-# that need to verify the no-color toggle itself (Helpers.Tests.ps1's
-# 'No-color mode' Context) override this to 'Host' in their It bodies
-# and restore via try/finally.
+# Force PlainText rendering for the entire test session. Write-Color emits
+# inline ANSI SGR codes, and PowerShell's WriteImpl -> GetOutputString
+# filter strips them when OutputRendering=PlainText, so every string-match
+# assertion in the suite sees plain text. Tests that verify the no-color
+# toggle itself (Helpers.Tests.ps1's 'No-color mode' Context) override this
+# to 'Host' in their It bodies and restore via try/finally.
 $PSStyle.OutputRendering = 'PlainText'
 
 # Default /api/oauth/profile mock: fails so rows have no email and the
@@ -112,15 +109,12 @@ function Get-TestAccountUuid {
 }
 
 # New-SlotPair: build a slot file + sidecar pair as production save would
-# produce. Without a sidecar, Get-Slots hides the slot per the post-v2.1.0
-# contract, so every test that creates a slot via the filesystem (rather
-# than via Invoke-SaveAction) needs a paired sidecar to remain visible.
+# produce. Get-Slots hides a slot that has no sidecar, so every test that
+# creates a slot through the filesystem rather than through Invoke-SaveAction
+# needs a paired sidecar to stay visible.
 #
-# This helper is intentionally a thin wrapper: it writes the bytes you
-# pass to the slot file and a synthetic sidecar with stable test values
-# in the oauthAccount block. Tests that need to assert on specific
-# sidecar values override -OAuthAccount; the default derives the
-# accountUuid from the email via Get-TestAccountUuid.
+# Tests that assert on specific sidecar values override -OAuthAccount; the
+# default derives the accountUuid from the email via Get-TestAccountUuid.
 function New-SlotPair {
     Param (
         [Parameter(Mandatory)] [string] $CredDir,
@@ -176,9 +170,9 @@ function New-SlotPair {
 }
 
 # Set-SandboxClaudeJson: write a minimal ~/.claude.json into the sandbox
-# with the given oauthAccount. Used by Invoke-SaveAction tests to exercise
-# the "primary identity from ~/.claude.json" path. Default produces a
-# fully-populated oauthAccount so Get-OAuthAccountFromClaudeJson succeeds.
+# with the given oauthAccount, driving the "primary identity from
+# ~/.claude.json" path. The default is a fully-populated oauthAccount, so
+# Get-OAuthAccountFromClaudeJson succeeds.
 #
 # -AccountUuid defaults to the same derivation New-SlotPair uses, so a
 # ~/.claude.json and a slot written with one email describe one account. Pass
