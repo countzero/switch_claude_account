@@ -4122,7 +4122,7 @@ function Resolve-SlotAccessToken {
             $status = Get-ExceptionHttpStatus $ex
             return [pscustomobject]@{
                 Status     = 'expired'
-                Error      = $ex.Message
+                Error      = (Get-HttpFailureMessage -Exception $ex -TimeoutSec $Script:TokenTimeoutSec)
                 HttpStatus = $status
                 Transport  = (Test-IsTransportFailure -HttpStatus $status -Exception $ex)
             }
@@ -4249,7 +4249,7 @@ function Get-SlotUsage {
     catch {
         $ex      = $_.Exception
         $status  = Get-ExceptionHttpStatus $ex
-        $message = $ex.Message
+        $message = Get-HttpFailureMessage -Exception $ex -TimeoutSec $Script:UsageTimeoutSec
 
         if ($status -eq 401 -or $status -eq 403) {
             # No message: Format-UsageAdvisory prints the per-status remedy for
@@ -4341,7 +4341,8 @@ function Resolve-UsageErrorResult {
     if ($status -eq 401 -or $status -eq 403) { return New-UsageResult -Status 'unauthorized' }
 
     $label = if ($status -eq 429) { 'rate-limited' } else { 'error' }
-    return New-UsageResult -Status $label -HttpStatus $status -ErrorMessage $Exception.Message
+    return New-UsageResult -Status $label -HttpStatus $status `
+                           -ErrorMessage (Get-HttpFailureMessage -Exception $Exception -TimeoutSec $Script:UsageTimeoutSec)
 }
 
 # True when a failed /api/oauth/usage read is worth one more immediate attempt.
@@ -4446,6 +4447,19 @@ function Get-ExceptionHttpStatus {
     return $null
 }
 
+# The reason a failed HTTP call leaves on a row. A -TimeoutSec expiry gets a
+# short fixed text: .NET's own runs to 101 characters and wraps every footer
+# line it lands on. Detected by type, as in Test-IsRetriableUsageFailure.
+function Get-HttpFailureMessage {
+    Param (
+        [Parameter(Mandatory)] $Exception,
+        [Parameter(Mandatory)] [int] $TimeoutSec
+    )
+
+    if ($Exception -is [System.OperationCanceledException]) { return "request timed out after ${TimeoutSec}s" }
+    return $Exception.Message
+}
+
 # Resolve the OAuth account identity for a slot. Returns one of:
 #   @{ Status = 'ok';           Email = <string>; AccountUuid = <string> }
 #   @{ Status = 'no-oauth' }                        # slot has no claudeAiOauth
@@ -4512,7 +4526,7 @@ function Get-SlotProfile {
         if ($status -eq 429) {
             return [pscustomobject]@{ Status = 'rate-limited' }
         }
-        return [pscustomobject]@{ Status = 'error'; Error = $_.Exception.Message }
+        return [pscustomobject]@{ Status = 'error'; Error = (Get-HttpFailureMessage -Exception $_.Exception -TimeoutSec $Script:ProfileTimeoutSec) }
     }
 
     $email = $null
@@ -5893,16 +5907,66 @@ function Format-UsageFooter {
     # user's main horizontal landmark.
     Write-Host ""
     Write-Host ""
+    # Wrapped here rather than left to the terminal: a terminal-wrapped
+    # continuation row starts at column 0, outside the frame inset that
+    # ConvertTo-WatchFrameSequence adds per logical line. The 1-column margin
+    # is the one the header indicator and the bar clamp reserve.
+    $width = [Math]::Max(0, (Get-RenderWidth) - 1)
     if ($Advisory) {
         foreach ($line in ($Advisory -split "`r?`n")) {
-            Write-Color $line 'Warning'
+            foreach ($row in (Split-FooterLine -Text $line -Width $width)) { Write-Color $row 'Warning' }
         }
     }
     if ($Footer) {
         foreach ($line in ($Footer -split "`r?`n")) {
-            Write-Color $line 'Muted'
+            foreach ($row in (Split-FooterLine -Text $line -Width $width)) { Write-Color $row 'Muted' }
         }
     }
+}
+
+# Word-wrap one footer line to -Width columns. Continuation rows hang under the
+# text after the leading "[Tag] ", so a wrapped message reads as one block. A
+# word longer than a row is hard-broken; -Width 0 (unknown) wraps nothing.
+# The indent is dropped when it would leave less than half a row for text.
+function Split-FooterLine {
+    Param (
+        [AllowEmptyString()] [string] $Text,
+        [int] $Width
+    )
+
+    if ($Width -le 0 -or $Text.Length -le $Width) { return $Text }
+
+    $indent = if ($Text -match '^\s*\[[^\]]*\]\s') { $Matches[0].Length } else { 0 }
+    if ($indent -ge ($Width / 2)) { $indent = 0 }
+    $pad = ' ' * $indent
+
+    $rows  = [System.Collections.Generic.List[string]]::new()
+    $lead  = $Text.Length - $Text.TrimStart().Length
+    $line  = $Text.Substring(0, $lead)
+    $empty = $true
+    foreach ($word in ($Text.TrimStart() -split ' +')) {
+        if (-not $word) { continue }
+        $candidate = if ($empty) { $line + $word } else { "$line $word" }
+        if ($candidate.Length -le $Width) { $line = $candidate; $empty = $false; continue }
+
+        # A word that fits a fresh row moves there whole; one that fits no row
+        # is broken in place, so the row it starts on is not left short.
+        if (-not $empty) {
+            if (($indent + $word.Length) -le $Width) { $rows.Add($line); $line = $pad }
+            else { $line += ' ' }
+        }
+        while (($line.Length + $word.Length) -gt $Width) {
+            $take = $Width - $line.Length
+            if ($take -le 0) { $rows.Add($line.TrimEnd()); $line = $pad; continue }
+            $rows.Add($line + $word.Substring(0, $take))
+            $word = $word.Substring($take)
+            $line = $pad
+        }
+        $line += $word
+        $empty = $false
+    }
+    $rows.Add($line)
+    return $rows.ToArray()
 }
 
 # Brand suffix appended to the watch-mode terminal title. Lives as a

@@ -3608,6 +3608,74 @@ Describe 'switch_claude_account' {
         }
     }
 
+    Context 'Get-HttpFailureMessage' {
+        It 'replaces a timeout with a short text naming the budget' {
+            # Any wording: the .NET message is localized, so the type decides.
+            $ex = [System.Threading.Tasks.TaskCanceledException]::new('Die Anfrage wurde abgebrochen.')
+            Get-HttpFailureMessage -Exception $ex -TimeoutSec 12 | Should -Be 'request timed out after 12s'
+        }
+
+        It 'keeps the message of any other failure' {
+            $ex = [System.Net.Http.HttpRequestException]::new('No such host is known.')
+            Get-HttpFailureMessage -Exception $ex -TimeoutSec 12 | Should -Be 'No such host is known.'
+        }
+    }
+
+    Context 'Split-FooterLine' {
+        It 'returns a line that fits unchanged' {
+            Split-FooterLine -Text '[Usage] short' -Width 40 | Should -Be '[Usage] short'
+        }
+
+        It 'wraps nothing when the width is unknown' {
+            $text = '[Usage] ' + ('word ' * 40)
+            Split-FooterLine -Text $text -Width 0 | Should -Be $text
+        }
+
+        It 'wraps at word boundaries and hangs continuation rows under the tag' {
+            $rows = @(Split-FooterLine -Text "[Usage] 'slot-1', 'slot-2' could not be read live; showing last known usage." -Width 40)
+            $rows.Count | Should -BeGreaterThan 1
+            foreach ($row in $rows) { $row.Length | Should -BeLessOrEqual 40 }
+            foreach ($row in $rows[1..($rows.Count - 1)]) { $row | Should -Match '^ {8}\S' }
+            (($rows | ForEach-Object { $_.Trim() }) -join ' ') |
+                Should -Be "[Usage] 'slot-1', 'slot-2' could not be read live; showing last known usage."
+        }
+
+        It 'breaks a word longer than a row in place' {
+            $rows = @(Split-FooterLine -Text '[X] aaaaaaaaaaaaaaaaaaaaaaaaa bb' -Width 10)
+            $rows[0] | Should -Be '[X] aaaaaa'
+            foreach ($row in $rows) { $row.Length | Should -BeLessOrEqual 10 }
+            (($rows | ForEach-Object { $_.Trim() }) -join '') -replace ' ', '' |
+                Should -Be '[X]aaaaaaaaaaaaaaaaaaaaaaaaabb'
+        }
+
+        It 'does not indent a line without a tag' {
+            $rows = @(Split-FooterLine -Text 'abcdefghi jklmnopqrstuvwxyz' -Width 10)
+            $rows | Should -Be @('abcdefghi', 'jklmnopqrs', 'tuvwxyz')
+        }
+
+        It 'drops the hanging indent when it would leave under half a row' {
+            $rows = @(Split-FooterLine -Text '[LongTagName] one two three four' -Width 16)
+            foreach ($row in $rows[1..($rows.Count - 1)]) { $row | Should -Not -Match '^ ' }
+        }
+    }
+
+    Context 'Format-UsageFooter wrapping' {
+        AfterEach { $Script:FramePadColumns = 0 }
+
+        It 'keeps every row inside the inset render width' {
+            # A terminal-wrapped row starts at column 0, outside the frame
+            # inset; wrapping in the footer keeps each row inside it.
+            Mock Get-ConsoleWidth { 60 }
+            $Script:FramePadColumns = 2
+            $advisory = "[Usage] 'slot-1', 'slot-2', 'slot-3' could not be read live; showing last known usage."
+            $rows = @((Format-UsageFooter -Footer '[Watch] Last poll at 10:02:02' -Advisory $advisory 6>&1 | Out-String) -split "`r?`n" |
+                Where-Object { $_ })
+            $rows.Count | Should -Be 3
+            foreach ($row in $rows) { $row.Length | Should -BeLessOrEqual 55 }
+            $rows[1] | Should -Match '^ {8}\S'
+        }
+    }
+
     Context 'Get-EarlyRepollLastPoll' {
         It 'rewinds by (Interval - DelaySec) so the next poll fires ~DelaySec out' {
             # The watch loop polls when (now - lastPoll) >= Interval. With

@@ -2465,7 +2465,7 @@ Describe 'switch_claude_account' {
             $r.IsCachedFallback           | Should -BeTrue
             $r.FallbackReason             | Should -Be 'network'
             $r.Data.five_hour.utilization | Should -Be 49.0
-            $r.Error                      | Should -Match 'HttpClient.Timeout'
+            $r.Error                      | Should -Be "request timed out after $($Script:UsageTimeoutSec)s"
         }
 
         It 'retries once with NO sleep when nothing is cached, and succeeds' {
@@ -2527,7 +2527,7 @@ Describe 'switch_claude_account' {
 
             $r = Get-SlotUsage -SlotPath $slot
             $r.Status     | Should -Be 'error'
-            $r.Error      | Should -Match 'HttpClient.Timeout'
+            $r.Error      | Should -Be "request timed out after $($Script:UsageTimeoutSec)s"
             $r.HttpStatus | Should -BeNullOrEmpty
             $r.Data       | Should -BeNullOrEmpty
             Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -eq 'https://api.anthropic.com/api/oauth/usage' }
