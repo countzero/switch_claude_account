@@ -61,6 +61,8 @@ The exit code is the verdict, so never narrow the run to find one: a filter that
 
 ## Default Change Workflow
 
+Work of more than one step keeps the todo tool current, one item in progress and each ticked off as it finishes, so a human can follow along.
+
 After any code change, run `pwsh -NoProfile -File tests/Invoke-Tests.ps1` (the implicit parse-time check when the script is dot-sourced is the only "typecheck"). Commit and push are **not** automatic: commit only when explicitly asked, push only when explicitly asked, and "commit" does not imply "push."
 
 ## Code Comments
