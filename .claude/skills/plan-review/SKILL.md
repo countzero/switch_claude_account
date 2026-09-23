@@ -52,8 +52,6 @@ Examples:
 - `[reviewed: KISS, DRY] collapsed two helpers into the existing util`
 - `[reviewed: SOLID] split the orchestrator from the persistence path`
 
-If the pass changed nothing, emit no marker. Silence is honest.
-
 ## Don't
 
 - Don't recite the lens list in the plan body.

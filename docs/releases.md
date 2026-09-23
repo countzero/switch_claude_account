@@ -13,9 +13,8 @@ Read when tagging, publishing or verifying a release.
 | 5    | Let the workflow attach the asset                                                 | here                   |
 | 6    | Verify                                                                            | here                   |
 
-Steps 1 and 2 have their own documents and are not restated here. The version and the
-newest changelog heading are pinned to each other by a test, so a bump that forgets one
-of the two fails the suite rather than reaching a tag.
+The version and the newest changelog heading are pinned to each other by a test, so a
+bump that forgets one of the two fails the suite rather than reaching a tag.
 
 ## The tag sits on the merge commit
 
@@ -67,8 +66,7 @@ gh release create $tag --target (git rev-parse origin/main) --title $tag --notes
 
 Type the body against the rules above; do not copy the previous release's and edit the
 numbers in it. That copy is exactly how v4.2.0 shipped `v4.1.0...v4.3.0`, one of the two
-versions having been updated and the other not, and how a repository name three renames
-stale kept being carried forward release after release.
+versions having been updated and the other not.
 
 ## The asset attaches itself
 

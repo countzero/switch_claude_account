@@ -15,10 +15,9 @@ they describe what Anthropic ships, not why this tool is written the way it is.
 A fact that fails any of these stays in the code, at its point of use. Measured
 constants (HTTP budgets, retry policy) and the rules this tool derives from the
 findings below are *not* here for that reason: a number and what measured it
-must be adjacent, and a rule must be visible where it is applied.
-
-Nothing here is a second copy. Where the code needs a rule that follows from a
-finding, the code states the rule and this file states the evidence.
+must be adjacent, and a rule must be visible where it is applied. Where the code
+needs a rule that follows from a finding, the code states the rule and this file
+states the evidence.
 
 ## Re-extraction recipe
 

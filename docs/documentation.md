@@ -51,10 +51,10 @@ checked by a person in review; there is deliberately no CI gate.
 | `AGENTS.md`, loaded into every session | about 12,000 | 18,500 (roughly 4,600 tokens) |
 | A reference document under `docs/` | about 12,000 | 24,000 (roughly 6,000 tokens) |
 
-The target matters more than the limit. `AGENTS.md` sat at 18,484 bytes against an
-18,500-byte ceiling, which is a file that cannot accept a new rule without an
-unplanned split, and the split is then made under pressure by whoever needed the
-space. A target leaves the next rule somewhere to go.
+The target matters more than the limit. A document at 18,484 bytes against an
+18,500-byte ceiling cannot accept a new rule without an unplanned split, and the split
+is then made under pressure by whoever needed the space. A target leaves the next rule
+somewhere to go.
 
 ## One home per rule
 
@@ -69,11 +69,11 @@ Select-String -Path AGENTS.md, README.md, docs/*.md, .claude/skills/*/SKILL.md -
 
 `AGENTS.md` and `README.md` describe the same mechanics for different readers, which
 is the pair most prone to a second copy: `CLAUDE_CONFIG_DIR`, the 0600 and 0700 file
-modes, the state-file schema, name sanitization and the execution policy all once
-existed in both, with the reasoning written twice in different words. The split is by
-reader, not by topic. `README.md` says what happens; `docs/architecture.md` says what
-the contract is and which function owns it, and points at the README section once. The
-pointers run one way only, so the two cannot loop.
+modes, the state-file schema, name sanitization and the execution policy are each at
+risk of being written twice in different words. The split is by reader, not by topic.
+`README.md` says what happens; `docs/architecture.md` says what the contract is and
+which function owns it, and points at the README section once. The pointers run one way
+only, so the two cannot loop.
 
 ## Changing a document
 
@@ -107,8 +107,8 @@ check that parsed prose would make formatting an unwritten contract, and one tha
 parsed a document it also writes would make that document its own input.
 
 A fact a check depends on therefore lives in a file meant for machines, and the
-document points at it. The size budgets above follow the same logic: a person reads
-them in review, and the `Select-String` recipes here are review aids, never a gate.
+document points at it. The size budgets above follow the same logic, and the
+`Select-String` recipes here are review aids, never a gate.
 
 ## Review checklist
 

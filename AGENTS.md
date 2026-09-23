@@ -26,7 +26,7 @@ This repository's subject is live OAuth credentials. Three rules, in force in ev
 
 ## Script actions
 
-`save`, `switch`, `list`, `remove`, `usage`, `monitor`, `warmup`, `install`, `uninstall`, `help`. The list is the `ValidateSet` on `$Action`, each one's contract is its `Invoke-<Action>Action` function, and the user-facing summary is `sca help` and `README.md` → *Usage*. Which of them refuse beside a running Claude Code is `Test-ClaudeRunning`; which reconcile first is below.
+The list of actions is the `ValidateSet` on `$Action`, each one's contract is its `Invoke-<Action>Action` function, and the user-facing summary is `sca help` and `README.md` → *Usage*. Which of them refuse beside a running Claude Code is `Test-ClaudeRunning`; which reconcile first is below.
 
 ## Editing the script
 
@@ -57,7 +57,7 @@ The exit code is the verdict, so never narrow the run to find one: a filter that
 
 ## README image regeneration
 
-`pwsh -NoProfile -File tools/Render-ReadmeImages.ps1` re-renders every SVG in `docs/images/` via `charmbracelet/freeze`: four README scenes plus one `theme-<name>.svg` per selectable theme, which is every entry in `$Script:Base16Schemes`, read by dot-sourcing the script, and `default` besides. Re-run when a README example number changes, when a `Write-Color` / `Get-StatusColor` / `Get-AggregateBarColor` mapping changes, or when a theme is added; a new theme's image appears on its own, but its heading and alt text in `docs/themes.md` are hand-maintained. A theme panel takes its canvas from freeze's `--background`, not an SGR behind each row, so the color reaches the window padding too. Every image embeds its font and must: freeze emits no per-glyph positions, so a substituted face moves the text off the geometry and the usage bars stop filling their cells. That script's header owns the palette, the font and truecolor rationale, and the README `width` contract.
+`pwsh -NoProfile -File tools/Render-ReadmeImages.ps1` re-renders every SVG in `docs/images/` via `charmbracelet/freeze`: four README scenes plus one `theme-<name>.svg` per selectable theme, which is every entry in `$Script:Base16Schemes`, read by dot-sourcing the script, and `default` besides. Re-run when a README example number changes, when a `Write-Color` / `Get-StatusColor` / `Get-AggregateBarColor` mapping changes, or when a theme is added; a new theme's image appears on its own, but its heading and alt text in `docs/themes.md` are hand-maintained. Every image embeds its font and must: freeze emits no per-glyph positions, so a substituted face moves the text off the geometry and the usage bars stop filling their cells. That script's header owns the palette, the font and truecolor rationale, and the README `width` contract.
 
 ## Default Change Workflow
 

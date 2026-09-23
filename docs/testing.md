@@ -42,9 +42,9 @@ exit the failures are the `[-]` lines.
 ## Test conventions
 
 - **Layout**: one file per action at `tests/Invoke-<Action>Action.Tests.ps1`, plus
-  cross-cutting suites (`Helpers`, `Profile-Install`, `Invoke-Reconcile`,
-  `Invoke-AutoRotation`, `State-File`, `Test-ClaudeRunning`). Every outer `Describe`
-  is named `'switch_claude_account'` so `-FullNameFilter` recipes work uniformly.
+  cross-cutting suites named after the helper or subsystem they cover. Every outer
+  `Describe` is named `'switch_claude_account'` so `-FullNameFilter` recipes work
+  uniformly.
 - **Sandboxing**: `tests/Common.ps1`, dot-sourced from each `BeforeEach`, sandboxes
   `$env:USERPROFILE`, `$env:HOME`, `$env:CLAUDE_CONFIG_DIR` and
   `$PROFILE.CurrentUserAllHosts` per test via `$TestDrive` (both home variables,

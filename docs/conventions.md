@@ -29,9 +29,7 @@ also fine), and do not strip a dash where it is the right mark: a comma for a sh
 aside tightly bound to the sentence; parentheses for a tangential aside; a colon to
 introduce an explanation, list, or summary; a semicolon or period to join two related
 independent clauses; a rewrite or period for a rhetorical "not X, Y" contrast; an en
-dash (`–`) for a numeric or date range; a hyphen (`-`) for a compound modifier. The
-rule is to stop using `—` as a default joiner where `:`, `;`, `,`, `(...)`, or a
-period would be clearer.
+dash (`–`) for a numeric or date range; a hyphen (`-`) for a compound modifier.
 
 ## Spelling
 
@@ -99,10 +97,9 @@ and no entry for a change a consumer cannot observe.
 An entry is **one line**: what changed, not why. Around 100 characters, and past 200
 it is either two changes or a sentence of reasoning that belongs in the commit. §3.6
 sends the long form to "commits or other references", and declining the references
-does not make the commits unreachable, which is what the old fourth deviation assumed.
-Measured before it was dropped: where entries were long, the commits of that era
-carried 550-650 characters of body each; where commit bodies were sparse, the entries
-were already at 100.
+does not make the commits unreachable. Measured: where entries were long, the commits
+of that era carried 550-650 characters of body each; where commit bodies were sparse,
+the entries were already at 100.
 
 An entry is **one change, not one commit** (§3.4). Five commits converging on one fix
 are one entry naming the fix, not five naming the steps that found it, and a commit a

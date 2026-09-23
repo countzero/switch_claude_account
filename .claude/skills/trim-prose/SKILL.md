@@ -12,10 +12,9 @@ description: >
 
 # Trim Prose
 
-The rules have homes and are not restated here: `docs/conventions.md` →
-*Comments* holds what a comment is for, `docs/documentation.md` → *Review
-checklist* what a document is held to. This is the recipe for applying both to
-one branch's diff in one pass.
+The rules have homes: `docs/conventions.md` → *Comments* holds what a comment is
+for, `docs/documentation.md` → *Review checklist* what a document is held to.
+This is the recipe for applying both to one branch's diff in one pass.
 
 ## Setup
 
