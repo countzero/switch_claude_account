@@ -96,6 +96,7 @@ When your changes overlap foreign WIP in the same file, stop and ask. Do not res
 ## Skills
 
 - `plan-review` / `pr-code-review` (under `.claude/skills/`): second-pass design review before non-trivial plans; multi-pass PR review.
+- `trim-prose` (under `.claude/skills/`): editing pass over the comments and documents a branch changed, before its pull request.
 
 ## Output Formatting
 
