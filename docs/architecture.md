@@ -8,13 +8,13 @@ counterpart there.
 
 ## The four artifacts
 
-| File | Owner | What it holds |
-| ---------------------------------------- | ----------- | --------------------------------------------------------- |
-| `.credentials.json` | Claude Code | The active login's OAuth tokens |
-| `.credentials.<name>(<email>).json` | `sca` | One saved slot's tokens, byte-equal to the active file |
-| `.credentials.<name>(<email>).account.json` | `sca` | That slot's identity sidecar: uuid, email, org, display name |
-| `.sca-state.json` | `sca` | `{ schema, active_slot, last_sync_hash }` |
-| `~/.claude.json` | Claude Code | Claude Code's config, whose `oauthAccount` block is the "Email:" in `/status` |
+| File                                        | Owner       | What it holds                                                                 |
+| ------------------------------------------- | ----------- | ----------------------------------------------------------------------------- |
+| `.credentials.json`                         | Claude Code | The active login's OAuth tokens                                               |
+| `.credentials.<name>(<email>).json`         | `sca`       | One saved slot's tokens, byte-equal to the active file                        |
+| `.credentials.<name>(<email>).account.json` | `sca`       | That slot's identity sidecar: uuid, email, org, display name                  |
+| `.sca-state.json`                           | `sca`       | `{ schema, active_slot, last_sync_hash }`                                     |
+| `~/.claude.json`                            | Claude Code | Claude Code's config, whose `oauthAccount` block is the "Email:" in `/status` |
 
 The first four sit in `$CredDir`; where the fifth sits is *Claude Code's config* below.
 

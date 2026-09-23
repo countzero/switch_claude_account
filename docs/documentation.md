@@ -15,16 +15,16 @@ which is curated at release time and is history by design
 Every piece of information has exactly one home, chosen by its **kind**, not by its
 topic. This table is the routing rule for a new paragraph.
 
-| Kind of information | Home |
-| ------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| A rule an agent must follow in every session | `AGENTS.md`: one invariant per area, one or two sentences, ending in a pointer |
-| The contract or the reasoning behind one subsystem | the reference document of that subsystem, listed in `AGENTS.md` → *Reference* |
-| How one function works, and why it is written that way | a comment on that function |
-| A fact about someone else's binary | `docs/claude-code-internals.md`, under its own admission rule |
-| What a user of `sca` sees or does | `README.md` |
-| An inventory that changes on its own: the action list, the PowerShell floor, a file list | Nowhere. Point at the source: the `ValidateSet`, `sca help`, `#Requires` |
-| The history of this repository | git, never a document |
-| A second statement of a rule that already has a home | a pointer: `` `docs/<file>.md` → *Section* `` |
+| Kind of information                                                                      | Home                                                                           |
+| ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| A rule an agent must follow in every session                                             | `AGENTS.md`: one invariant per area, one or two sentences, ending in a pointer |
+| The contract or the reasoning behind one subsystem                                       | the reference document of that subsystem, listed in `AGENTS.md` → *Reference*  |
+| How one function works, and why it is written that way                                   | a comment on that function                                                     |
+| A fact about someone else's binary                                                       | `docs/claude-code-internals.md`, under its own admission rule                  |
+| What a user of `sca` sees or does                                                        | `README.md`                                                                    |
+| An inventory that changes on its own: the action list, the PowerShell floor, a file list | Nowhere. Point at the source: the `ValidateSet`, `sca help`, `#Requires`       |
+| The history of this repository                                                           | git, never a document                                                          |
+| A second statement of a rule that already has a home                                     | a pointer: `` `docs/<file>.md` → *Section* ``                                  |
 
 Two refinements the table cannot carry:
 
@@ -46,10 +46,10 @@ a long paragraph joined onto one line reads as a saving. The target is where a s
 is planned; the limit is what no pull request may push a document over. Both are
 checked by a person in review; there is deliberately no CI gate.
 
-| Kind of document | Target | Limit |
+| Kind of document                       | Target       | Limit                         |
 | -------------------------------------- | ------------ | ----------------------------- |
 | `AGENTS.md`, loaded into every session | about 12,000 | 18,500 (roughly 4,600 tokens) |
-| A reference document under `docs/` | about 12,000 | 24,000 (roughly 6,000 tokens) |
+| A reference document under `docs/`     | about 12,000 | 24,000 (roughly 6,000 tokens) |
 
 The target matters more than the limit. A document at 18,484 bytes against an
 18,500-byte ceiling cannot accept a new rule without an unplanned split, and the split

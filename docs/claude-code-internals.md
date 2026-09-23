@@ -137,13 +137,13 @@ request.
 **Cross-process lock, with peer-adopt rather than a race.** The core is `eE`,
 and it guards the grant three times over:
 
-| Step                                    | Behavior                                                                                     |
-| --------------------------------------- | --------------------------------------------------------------------------------------------- |
-| Pre-check                               | returns `not_needed` unless the access token is at or near expiry                            |
-| Re-read before locking                  | if `accessToken` changed since entry, returns `refreshed` and uses the peer's token           |
-| Lock acquire                            | `ELOCKED` retries 5 times at 1000 + random(1000) ms, then gives up as `lock_busy` / `lock_timeout` |
-| Re-read under the lock                  | same `accessToken` comparison again before the request goes out                              |
-| On refresh failure                      | re-reads once more; a moved token still returns `refreshed`                                  |
+| Step                   | Behavior                                                                                           |
+| ---------------------- | -------------------------------------------------------------------------------------------------- |
+| Pre-check              | returns `not_needed` unless the access token is at or near expiry                                  |
+| Re-read before locking | if `accessToken` changed since entry, returns `refreshed` and uses the peer's token                |
+| Lock acquire           | `ELOCKED` retries 5 times at 1000 + random(1000) ms, then gives up as `lock_busy` / `lock_timeout` |
+| Re-read under the lock | same `accessToken` comparison again before the request goes out                                    |
+| On refresh failure     | re-reads once more; a moved token still returns `refreshed`                                        |
 
 So two Claude Code processes on one account cannot both rotate the refresh
 token: the loser adopts the winner's result. Anthropic instruments the path for

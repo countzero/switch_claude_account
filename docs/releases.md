@@ -4,14 +4,14 @@ Read when tagging, publishing or verifying a release.
 
 ## Order of operations
 
-| Step | What                                                                              | Owner                  |
-| ---- | --------------------------------------------------------------------------------- | ---------------------- |
-| 1    | Bump `$Script:ScriptVersion` and add the `CHANGELOG.md` entry, in one commit      | `docs/conventions.md`  |
-| 2    | Open the release pull request, `develop` into `main`, titled `Release vX.Y.Z`     | `docs/pull_requests.md` |
-| 3    | Wait for all three CI legs, then merge                                            | here                   |
-| 4    | Tag and publish from the merge commit                                             | here                   |
-| 5    | Let the workflow attach the asset                                                 | here                   |
-| 6    | Verify                                                                            | here                   |
+| Step | What                                                                          | Owner                   |
+| ---- | ----------------------------------------------------------------------------- | ----------------------- |
+| 1    | Bump `$Script:ScriptVersion` and add the `CHANGELOG.md` entry, in one commit  | `docs/conventions.md`   |
+| 2    | Open the release pull request, `develop` into `main`, titled `Release vX.Y.Z` | `docs/pull_requests.md` |
+| 3    | Wait for all three CI legs, then merge                                        | here                    |
+| 4    | Tag and publish from the merge commit                                         | here                    |
+| 5    | Let the workflow attach the asset                                             | here                    |
+| 6    | Verify                                                                        | here                    |
 
 The version and the newest changelog heading are pinned to each other by a test, so a
 bump that forgets one of the two fails the suite rather than reaching a tag.
@@ -88,15 +88,15 @@ Two ways to publish and get no asset:
 Nothing here is inferable from the publish succeeding, and each check has caught or would
 catch a distinct failure.
 
-| Check                                                        | Command                                                                |
-| ------------------------------------------------------------ | ---------------------------------------------------------------------- |
-| The workflow ran and succeeded                               | `gh run list --workflow=release-assets.yml`                            |
-| Not a draft, not a prerelease, asset present                 | `gh release view vX.Y.Z --json isDraft,isPrerelease,assets`            |
-| The tag is on the merge commit                               | `git fetch --tags; git log -1 --format='%h %s' vX.Y.Z`                 |
-| The asset is the file at the tag, not a stale checkout       | compare the asset `digest` against `git cat-file blob vX.Y.Z:<file>`   |
-| This release is what `/releases/latest/` serves              | `gh release view --json tagName`                                       |
-| The compare link resolves and spans the intended commits     | `gh api repos/<owner>/<repo>/compare/vA...vB`                          |
-| The changelog anchor lands on the heading                    | `git show origin/main:CHANGELOG.md`                                    |
+| Check                                                    | Command                                                              |
+| -------------------------------------------------------- | -------------------------------------------------------------------- |
+| The workflow ran and succeeded                           | `gh run list --workflow=release-assets.yml`                          |
+| Not a draft, not a prerelease, asset present             | `gh release view vX.Y.Z --json isDraft,isPrerelease,assets`          |
+| The tag is on the merge commit                           | `git fetch --tags; git log -1 --format='%h %s' vX.Y.Z`               |
+| The asset is the file at the tag, not a stale checkout   | compare the asset `digest` against `git cat-file blob vX.Y.Z:<file>` |
+| This release is what `/releases/latest/` serves          | `gh release view --json tagName`                                     |
+| The compare link resolves and spans the intended commits | `gh api repos/<owner>/<repo>/compare/vA...vB`                        |
+| The changelog anchor lands on the heading                | `git show origin/main:CHANGELOG.md`                                  |
 
 The digest check is the one worth keeping. The workflow checks out the tag, so a release
 published against the wrong target ships a plausible file for the wrong commit, and

@@ -285,12 +285,12 @@ Code and run 'sca save work' to capture them by hand.
 
 ### Which actions still need Claude Code closed
 
-| Action | While Claude Code runs | Why |
-|---|---|---|
-| `switch`, `usage`, `list`, `remove` | fine | `switch` writes one destination and Claude Code follows it |
-| `monitor` | fine | rotation is one destination at a time, same as `switch` |
-| `save` | **refuses** | it pairs tokens from `.credentials.json` with an identity from `~/.claude.json`, and a `/login` updates those two separately. Catching that window writes a sidecar naming the wrong account, and nothing later corrects it |
-| `warmup`, `monitor -KeepWarm` | fine, with a warning | both make *every* slot active in turn and a live session follows, so a prompt sent mid-pass bills whichever slot is mounted. No login is at risk: Claude Code serializes token refreshes across its own processes and adopts a peer's result rather than racing it, so the `claude -p` a warm pass spawns cannot rotate the token out from under your session |
+| Action                              | While Claude Code runs | Why                                                                                                                                                                                                                                                                                                                                                           |
+| ----------------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `switch`, `usage`, `list`, `remove` | fine                   | `switch` writes one destination and Claude Code follows it                                                                                                                                                                                                                                                                                                    |
+| `monitor`                           | fine                   | rotation is one destination at a time, same as `switch`                                                                                                                                                                                                                                                                                                       |
+| `save`                              | **refuses**            | it pairs tokens from `.credentials.json` with an identity from `~/.claude.json`, and a `/login` updates those two separately. Catching that window writes a sidecar naming the wrong account, and nothing later corrects it                                                                                                                                   |
+| `warmup`, `monitor -KeepWarm`       | fine, with a warning   | both make *every* slot active in turn and a live session follows, so a prompt sent mid-pass bills whichever slot is mounted. No login is at risk: Claude Code serializes token refreshes across its own processes and adopts a peer's result rather than racing it, so the `claude -p` a warm pass spawns cannot rotate the token out from under your session |
 
 Slot-file updates done by `sca usage`'s token refresh use `MoveFileEx` with retry, so those survive an open Claude Code on `.credentials.json` itself.
 
