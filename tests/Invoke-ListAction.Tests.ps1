@@ -166,8 +166,8 @@ Describe 'switch_claude_account' {
         # Auto-migration on first call (no state file): hash-match
         # .credentials.json against existing slot files and seed state
         # transparently. Read-ScaState's auto-migration walks raw files
-        # (not Get-Slots) so the active slot is identified even when
-        # the slot's sidecar exists.
+        # (not Get-Slots) so the active slot is identified whether or
+        # not the slot has a sidecar.
         It 'auto-migrates state on first call by hash-matching .credentials.json' {
             New-SlotPair -CredDir $script:CredDirPath -Name 'alpha' -Content 'A' | Out-Null
             New-SlotPair -CredDir $script:CredDirPath -Name 'bravo' -Content 'B' | Out-Null

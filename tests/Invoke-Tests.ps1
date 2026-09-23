@@ -90,10 +90,8 @@ if (-not $SkipCoverage) {
     $config.CodeCoverage.UseBreakpoints = $false
     $config.CodeCoverage.OutputFormat   = 'JaCoCo'
     $config.CodeCoverage.OutputPath     = Join-Path $coverageDir 'coverage.xml'
-    # Pester-native gate: below this percent, $result.Result becomes
-    # 'Failed' and the exit predicate below picks it up. Keeping the
-    # threshold inside Pester avoids a second, slightly-different
-    # percent calculation drifting out of sync with the displayed value.
+    # Informational only: the gate is computed after the run, see
+    # $coverageGateFailed below.
     $config.CodeCoverage.CoveragePercentTarget = $CoverageThreshold
 }
 
@@ -131,7 +129,7 @@ if (-not $SkipCoverage -and $result.CodeCoverage) {
         Write-Host ('Code coverage: {0}% (threshold {1}%)' -f $pctText, $CoverageThreshold) -ForegroundColor $color
         if (-not $passed) {
             # Show two extra decimals on failure so a value that rounds
-            # up to the threshold (e.g. 89.95 -> 90.0) cannot make the
+            # up to the threshold (e.g. 96.95 -> 97.0) cannot make the
             # red line look like a contradiction with the summary above.
             $pctPrecise = $pct.ToString('N2', $invariant)
             Write-Host ('Coverage gate FAILED: {0}% < {1}% minimum.' -f $pctPrecise, $CoverageThreshold) -ForegroundColor Red

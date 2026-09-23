@@ -200,7 +200,7 @@ links to lines 41-46. The label always uses `:{start}-{end}` regardless of
 whether the URL uses `L` or `R` anchors.
 
 **SHA-256 hash for PR links:** Compute the SHA-256 hex digest of each unique
-file path. Prefer PowerShell (this is a Windows project):
+file path. Prefer PowerShell (the repository's required shell on every platform):
 `$hasher = [System.Security.Cryptography.SHA256]::Create(); $bytes = [System.Text.Encoding]::UTF8.GetBytes('{path}'); -join(($hasher.ComputeHash($bytes) | ForEach-Object ToString('x2')))`
 Fallback if Node.js is available:
 `node -e "process.stdout.write(require('crypto').createHash('sha256').update('{path}').digest('hex'))"`.

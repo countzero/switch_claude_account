@@ -2204,10 +2204,10 @@ function Get-SlotFileName {
     return ".credentials.$Name($Email).json"
 }
 
-# Enumerate saved credential slots and fingerprint each one against the
-# active .credentials.json so callers (list, rotation, usage) share a
-# single source of truth. Slots are returned sorted alphabetically by
-# name for deterministic rotation order and consistent list output.
+# Enumerate saved credential slots and mark the one state.active_slot names,
+# so callers (list, rotation, usage) share a single source of truth. Slots are
+# returned sorted alphabetically by name for deterministic rotation order and
+# consistent list output.
 #
 # Slots without a valid sidecar are hidden here; see the per-slot identity
 # sidecar section above for why, and for how a slot regains visibility.
