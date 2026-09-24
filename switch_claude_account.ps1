@@ -5833,38 +5833,66 @@ function Format-UsageFooter {
     # ConvertTo-WatchFrameSequence adds per logical line. The 1-column margin
     # is the one the header indicator and the bar clamp reserve.
     $width = [Math]::Max(0, (Get-RenderWidth) - 1)
-    if ($Advisory) {
-        foreach ($line in ($Advisory -split "`r?`n")) {
-            foreach ($row in (Split-FooterLine -Text $line -Width $width)) { Write-Color $row 'Warning' }
-        }
+    $advisoryLines = @(if ($Advisory) { $Advisory -split "`r?`n" })
+    $footerLines   = @(if ($Footer)   { $Footer   -split "`r?`n" })
+    # One text column for the whole block, set by the widest tag present, so a
+    # frame whose tags are all '[Usage]' renders exactly as it would unpadded.
+    $tagWidth = 0
+    foreach ($line in @($advisoryLines + $footerLines)) {
+        if ($line -match $Script:FooterTagPattern) { $tagWidth = [Math]::Max($tagWidth, $Matches[0].Length) }
     }
-    if ($Footer) {
-        foreach ($line in ($Footer -split "`r?`n")) {
-            foreach ($row in (Split-FooterLine -Text $line -Width $width)) { Write-Color $row 'Muted' }
-        }
+    foreach ($line in $advisoryLines) {
+        foreach ($row in (Split-FooterLine -Text $line -Width $width -TagWidth $tagWidth)) { Write-Color $row 'Warning' }
+    }
+    foreach ($line in $footerLines) {
+        foreach ($row in (Split-FooterLine -Text $line -Width $width -TagWidth $tagWidth)) { Write-Color $row 'Muted' }
     }
 }
+
+# A footer line's leading "[Tag]", without the space that ends it.
+$Script:FooterTagPattern = '^\[[^\]]*\](?=\s)'
 
 # Word-wrap one footer line to -Width columns. Continuation rows hang under the
 # text after the leading "[Tag] ", so a wrapped message reads as one block. A
 # word longer than a row is hard-broken; -Width 0 (unknown) wraps nothing.
+#
+# -TagWidth pads a shorter tag to that width, so every line of a block starts
+# its text in one column. Skipped when the hanging indent would be dropped, so
+# a narrow terminal loses the alignment rather than half of every row.
 function Split-FooterLine {
     Param (
         [AllowEmptyString()] [string] $Text,
-        [int] $Width
+        [int] $Width,
+        [int] $TagWidth = 0
     )
+
+    $head = $null
+    if ($TagWidth -gt 0 -and $Text -match $Script:FooterTagPattern -and $Matches[0].Length -lt $TagWidth -and
+        ($Width -le 0 -or ($TagWidth + 1) -lt ($Width / 2))) {
+        $tag  = $Matches[0]
+        $head = $tag.PadRight($TagWidth + 1)
+        $Text = $head + $Text.Substring($tag.Length).TrimStart()
+    }
 
     if ($Width -le 0 -or $Text.Length -le $Width) { return $Text }
 
-    $indent = if ($Text -match '^\s*\[[^\]]*\]\s') { $Matches[0].Length } else { 0 }
-    if ($indent -ge ($Width / 2)) { $indent = 0 }
+    # The padded head is placed whole: the word split below would squash its
+    # run of spaces back to one.
+    if ($head) {
+        $indent = $head.Length
+        $line   = $head
+        $body   = $Text.Substring($head.Length)
+    } else {
+        $indent = if ($Text -match '^\s*\[[^\]]*\]\s') { $Matches[0].Length } else { 0 }
+        if ($indent -ge ($Width / 2)) { $indent = 0 }
+        $body   = $Text.TrimStart()
+        $line   = $Text.Substring(0, $Text.Length - $body.Length)
+    }
     $pad = ' ' * $indent
 
     $rows  = [System.Collections.Generic.List[string]]::new()
-    $lead  = $Text.Length - $Text.TrimStart().Length
-    $line  = $Text.Substring(0, $lead)
     $empty = $true
-    foreach ($word in ($Text.TrimStart() -split ' +')) {
+    foreach ($word in ($body -split ' +')) {
         if (-not $word) { continue }
         $candidate = if ($empty) { $line + $word } else { "$line $word" }
         if ($candidate.Length -le $Width) { $line = $candidate; $empty = $false; continue }
