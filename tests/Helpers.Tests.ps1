@@ -3599,6 +3599,33 @@ Describe 'switch_claude_account' {
             $rows = @(Split-FooterLine -Text '[LongTagName] one two three four' -Width 16)
             foreach ($row in $rows[1..($rows.Count - 1)]) { $row | Should -Not -Match '^ ' }
         }
+
+        It 'pads a shorter tag to -TagWidth on a line that fits' {
+            Split-FooterLine -Text '[Watch] Last poll at 10:02:02' -Width 80 -TagWidth 9 |
+                Should -Be '[Watch]   Last poll at 10:02:02'
+        }
+
+        It 'pads when the width is unknown' {
+            Split-FooterLine -Text '[Usage] short' -Width 0 -TagWidth 9 | Should -Be '[Usage]   short'
+        }
+
+        It 'keeps the padding on a wrapped line and hangs continuation rows under it' {
+            $text = '[Warmup] Rate-limited at the rotation threshold; will re-warm after the next window reset.'
+            $rows = @(Split-FooterLine -Text $text -Width 40 -TagWidth 9)
+            $rows.Count | Should -BeGreaterThan 1
+            $rows[0] | Should -Match '^\[Warmup\]  Rate-limited'
+            foreach ($row in $rows) { $row.Length | Should -BeLessOrEqual 40 }
+            foreach ($row in $rows[1..($rows.Count - 1)]) { $row | Should -Match '^ {10}\S' }
+        }
+
+        It 'leaves a tag at or above -TagWidth and a line without a tag unpadded' {
+            Split-FooterLine -Text '[Monitor] on' -Width 80 -TagWidth 9 | Should -Be '[Monitor] on'
+            Split-FooterLine -Text 'no tag here' -Width 80 -TagWidth 9 | Should -Be 'no tag here'
+        }
+
+        It 'skips the padding where the hanging indent would be dropped' {
+            Split-FooterLine -Text '[X] short' -Width 16 -TagWidth 9 | Should -Be '[X] short'
+        }
     }
 
     Context 'Format-UsageFooter wrapping' {
@@ -3615,6 +3642,31 @@ Describe 'switch_claude_account' {
             $rows.Count | Should -Be 3
             foreach ($row in $rows) { $row.Length | Should -BeLessOrEqual 55 }
             $rows[1] | Should -Match '^ {8}\S'
+        }
+
+        It 'starts every message in the column of the widest tag in the block' {
+            Mock Get-ConsoleWidth { 120 }
+            $footer = "[Monitor] Rotated from `"a`" to `"b`" at 17:01:26`n[Warmup] Keeping all slots warm.`n[Watch] Last poll at 10:02:02"
+            $rows = @((Format-UsageFooter -Footer $footer -Advisory "[Usage] 'a': api key or non-claude.ai slot" 6>&1 | Out-String) -split "`r?`n" |
+                Where-Object { $_ })
+            $rows.Count | Should -Be 4
+            $rows[0] | Should -Match "^\[Usage\] {3}'a'"
+            $rows[1] | Should -Match '^\[Monitor\] Rotated'
+            foreach ($row in $rows) { $row.Substring(9, 2) | Should -Match '^ \S' }
+        }
+
+        It 'gives the shortest tag a 3-space gap even when the widest is only one wider' {
+            Mock Get-ConsoleWidth { 120 }
+            $rows = @((Format-UsageFooter -Footer "[Warmup] Keeping all slots warm.`n[Watch] Last poll at 10:02:02" 6>&1 | Out-String) -split "`r?`n" |
+                Where-Object { $_ })
+            $rows | Should -Be @('[Warmup]  Keeping all slots warm.', '[Watch]   Last poll at 10:02:02')
+        }
+
+        It 'leaves a block of one tag width unpadded' {
+            Mock Get-ConsoleWidth { 120 }
+            $rows = @((Format-UsageFooter -Footer '[Watch] Last poll at 10:02:02' -Advisory "[Usage] 'a': api key or non-claude.ai slot" 6>&1 | Out-String) -split "`r?`n" |
+                Where-Object { $_ })
+            $rows | Should -Be @("[Usage] 'a': api key or non-claude.ai slot", '[Watch] Last poll at 10:02:02')
         }
     }
 
