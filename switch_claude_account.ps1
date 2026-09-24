@@ -5835,10 +5835,15 @@ function Format-UsageFooter {
     $width = [Math]::Max(0, (Get-RenderWidth) - 1)
     $advisoryLines = @(if ($Advisory) { $Advisory -split "`r?`n" })
     $footerLines   = @(if ($Footer)   { $Footer   -split "`r?`n" })
-    # The widest tag present, so a block of '[Usage]' lines alone is unpadded.
+    # Mixed tags pad to the column that leaves the shortest one a 3-space gap
+    # (or the widest one a 1-space gap, whichever is further right); a block of
+    # one tag width, like '[Usage]' lines alone, is unpadded.
+    $tagWidths = @(foreach ($line in @($advisoryLines + $footerLines)) {
+        if ($line -match $Script:FooterTagPattern) { $Matches[0].Length }
+    } ) | Measure-Object -Minimum -Maximum
     $tagWidth = 0
-    foreach ($line in @($advisoryLines + $footerLines)) {
-        if ($line -match $Script:FooterTagPattern) { $tagWidth = [Math]::Max($tagWidth, $Matches[0].Length) }
+    if ($tagWidths.Count -gt 0 -and $tagWidths.Minimum -lt $tagWidths.Maximum) {
+        $tagWidth = [Math]::Max($tagWidths.Minimum + 2, $tagWidths.Maximum)
     }
     foreach ($line in $advisoryLines) {
         foreach ($row in (Split-FooterLine -Text $line -Width $width -TagWidth $tagWidth)) { Write-Color $row 'Warning' }
@@ -5855,10 +5860,9 @@ $Script:FooterTagPattern = '^\[[^\]]*\](?=\s)'
 # text after the leading "[Tag] ", so a wrapped message reads as one block. A
 # word longer than a row is hard-broken; -Width 0 (unknown) wraps nothing.
 #
-# -TagWidth right-aligns a shorter tag to that width, so every line of a block
-# starts its text in one column one space after its own tag. Skipped when the
-# hanging indent would be dropped, so a narrow terminal loses the alignment
-# rather than half of every row.
+# -TagWidth pads a shorter tag to that width, so every line of a block starts
+# its text in one column. Skipped when the hanging indent would be dropped, so
+# a narrow terminal loses the alignment rather than half of every row.
 function Split-FooterLine {
     Param (
         [AllowEmptyString()] [string] $Text,
@@ -5870,7 +5874,7 @@ function Split-FooterLine {
     if ($TagWidth -gt 0 -and $Text -match $Script:FooterTagPattern -and $Matches[0].Length -lt $TagWidth -and
         ($Width -le 0 -or ($TagWidth + 1) -lt ($Width / 2))) {
         $tag  = $Matches[0]
-        $head = $tag.PadLeft($TagWidth) + ' '
+        $head = $tag.PadRight($TagWidth + 1)
         $Text = $head + $Text.Substring($tag.Length).TrimStart()
     }
 

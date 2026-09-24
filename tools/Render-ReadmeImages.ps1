@@ -223,8 +223,8 @@ $verboseLines = @(
 #      right-aligned indicator.
 #
 #   3. Latched '[Monitor] Rotated from "<from>" to "<to>" at HH:mm:ss'
-#      footer line above the '[Watch] Last poll' line, whose tag is
-#      right-aligned to '[Monitor]' as Format-UsageFooter aligns it. Wording matches
+#      footer line above the '[Watch] Last poll' line, whose text is padded
+#      to the '[Monitor]' column as Format-UsageFooter pads it. Wording matches
 #      Invoke-AutoRotationStep. Narrative: the slot marked '*' is the
 #      rotation DESTINATION and the row at 100% utilization is the
 #      SOURCE.
@@ -269,7 +269,7 @@ function New-HeroLines {
         "$dg    legacy       team@example.com        12% (3h 18m)  100% (12h)   limited 7d$RESET",
         "",
         "$mt[Monitor] Rotated from `"legacy`" to `"work`" at 14:31:58$RESET",
-        "$mt  [Watch] Last poll at 14:32:07$RESET"
+        "$mt[Watch]   Last poll at 14:32:07$RESET"
     )
 }
 
