@@ -3,6 +3,11 @@
 This changelog follows [Common Changelog](https://common-changelog.org) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.2] - 2026-09-24
+
+### Changed
+- **Usage**: Start the footer messages of `sca usage` and `sca monitor` in one column when their tags differ in width.
+
 ## [4.3.1] - 2026-09-23
 
 ### Fixed
@@ -334,6 +339,7 @@ _Upgrading migrates active-slot tracking from hardlinks to a state file on first
 - Add a README with installation, usage, workflow, Windows notes and testing sections.
 - Add `CLAUDE.md` with agent guidance for the repo structure, gotchas and script-shape conventions.
 
+[4.3.2]: https://github.com/countzero/switch_claude_account/releases/tag/v4.3.2
 [4.3.1]: https://github.com/countzero/switch_claude_account/releases/tag/v4.3.1
 [4.3.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.3.0
 [4.2.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.2.0
