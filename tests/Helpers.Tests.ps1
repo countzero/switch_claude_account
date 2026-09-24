@@ -3600,20 +3600,20 @@ Describe 'switch_claude_account' {
             foreach ($row in $rows[1..($rows.Count - 1)]) { $row | Should -Not -Match '^ ' }
         }
 
-        It 'pads a shorter tag to -TagWidth on a line that fits' {
+        It 'right-aligns a shorter tag to -TagWidth on a line that fits' {
             Split-FooterLine -Text '[Watch] Last poll at 10:02:02' -Width 80 -TagWidth 9 |
-                Should -Be '[Watch]   Last poll at 10:02:02'
+                Should -Be '  [Watch] Last poll at 10:02:02'
         }
 
-        It 'pads when the width is unknown' {
-            Split-FooterLine -Text '[Usage] short' -Width 0 -TagWidth 9 | Should -Be '[Usage]   short'
+        It 'right-aligns when the width is unknown' {
+            Split-FooterLine -Text '[Usage] short' -Width 0 -TagWidth 9 | Should -Be '  [Usage] short'
         }
 
         It 'keeps the padding on a wrapped line and hangs continuation rows under it' {
             $text = '[Warmup] Rate-limited at the rotation threshold; will re-warm after the next window reset.'
             $rows = @(Split-FooterLine -Text $text -Width 40 -TagWidth 9)
             $rows.Count | Should -BeGreaterThan 1
-            $rows[0] | Should -Match '^\[Warmup\]  Rate-limited'
+            $rows[0] | Should -Match '^ \[Warmup\] Rate-limited'
             foreach ($row in $rows) { $row.Length | Should -BeLessOrEqual 40 }
             foreach ($row in $rows[1..($rows.Count - 1)]) { $row | Should -Match '^ {10}\S' }
         }
@@ -3650,7 +3650,7 @@ Describe 'switch_claude_account' {
             $rows = @((Format-UsageFooter -Footer $footer -Advisory "[Usage] 'a': api key or non-claude.ai slot" 6>&1 | Out-String) -split "`r?`n" |
                 Where-Object { $_ })
             $rows.Count | Should -Be 4
-            foreach ($row in $rows) { $row.Substring(9, 2) | Should -Match '^ \S' }
+            foreach ($row in $rows) { $row.Substring(8, 3) | Should -Match '^\] \S' }
         }
     }
 

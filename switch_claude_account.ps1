@@ -5855,9 +5855,10 @@ $Script:FooterTagPattern = '^\[[^\]]*\](?=\s)'
 # text after the leading "[Tag] ", so a wrapped message reads as one block. A
 # word longer than a row is hard-broken; -Width 0 (unknown) wraps nothing.
 #
-# -TagWidth pads a shorter tag to that width, so every line of a block starts
-# its text in one column. Skipped when the hanging indent would be dropped, so
-# a narrow terminal loses the alignment rather than half of every row.
+# -TagWidth right-aligns a shorter tag to that width, so every line of a block
+# starts its text in one column one space after its own tag. Skipped when the
+# hanging indent would be dropped, so a narrow terminal loses the alignment
+# rather than half of every row.
 function Split-FooterLine {
     Param (
         [AllowEmptyString()] [string] $Text,
@@ -5869,7 +5870,7 @@ function Split-FooterLine {
     if ($TagWidth -gt 0 -and $Text -match $Script:FooterTagPattern -and $Matches[0].Length -lt $TagWidth -and
         ($Width -le 0 -or ($TagWidth + 1) -lt ($Width / 2))) {
         $tag  = $Matches[0]
-        $head = $tag.PadRight($TagWidth + 1)
+        $head = $tag.PadLeft($TagWidth) + ' '
         $Text = $head + $Text.Substring($tag.Length).TrimStart()
     }
 
