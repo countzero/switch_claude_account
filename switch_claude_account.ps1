@@ -5835,8 +5835,7 @@ function Format-UsageFooter {
     $width = [Math]::Max(0, (Get-RenderWidth) - 1)
     $advisoryLines = @(if ($Advisory) { $Advisory -split "`r?`n" })
     $footerLines   = @(if ($Footer)   { $Footer   -split "`r?`n" })
-    # One text column for the whole block, set by the widest tag present, so a
-    # frame whose tags are all '[Usage]' renders exactly as it would unpadded.
+    # The widest tag present, so a block of '[Usage]' lines alone is unpadded.
     $tagWidth = 0
     foreach ($line in @($advisoryLines + $footerLines)) {
         if ($line -match $Script:FooterTagPattern) { $tagWidth = [Math]::Max($tagWidth, $Matches[0].Length) }
