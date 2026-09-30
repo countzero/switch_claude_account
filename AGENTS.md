@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file is the canonical agent-instructions source for this repository, read natively by both OpenCode and Claude Code (2.1.277+). Single-file PowerShell tool: core logic lives in `switch_claude_account.ps1`; tests live in `tests/` and use Pester 5. It carries the always-on rules as one invariant per area; the contracts behind them are the documents under `docs/`, read on demand through *Reference* at the end.
+This file is the canonical agent-instructions source for this repository, read natively by both OpenCode and Claude Code (2.1.277+). Single-file PowerShell tool: core logic lives in `switch_claude_account.ps1`; tests live in `tests/` and use Pester 5; `integrations/omp/` is an optional TypeScript extension for omp. It carries the always-on rules as one invariant per area; the contracts behind them are the documents under `docs/`, read on demand through *Reference* at the end.
 
 ## Security Rules
 
@@ -53,7 +53,7 @@ The `usage` action and the identity-fallback path depend on constants extracted 
 pwsh -NoProfile -File tests/Invoke-Tests.ps1; "EXIT=$LASTEXITCODE"
 ```
 
-The exit code is the verdict, so never narrow the run to find one: a filter that fits the output to a terminal drops the summary and costs a second full run. Coverage on `switch_claude_account.ps1` runs by default behind a **97% gate**, measured on one OS, so 100% is unreachable by construction and the residue is `docs/testing.md` → *The ceiling*; `-SkipCoverage` for the fastest local loop. One file per action at `tests/Invoke-<Action>Action.Tests.ps1`, every outer `Describe` named `'switch_claude_account'`, and `tests/Common.ps1` dot-sourced from each `BeforeEach` to sandbox both home variables, `CLAUDE_CONFIG_DIR` and `$PROFILE.CurrentUserAllHosts` into `$TestDrive`. The filter recipes, the direct-call pattern, the output-capture rule, reading the result and the complexity diagnostic are `docs/testing.md`.
+The exit code is the verdict, so never narrow the run to find one: a filter that fits the output to a terminal drops the summary and costs a second full run. Coverage on `switch_claude_account.ps1` runs by default behind a **97% gate**, measured on one OS, so 100% is unreachable by construction and the residue is `docs/testing.md` → *The ceiling*; `-SkipCoverage` for the fastest local loop. One file per action at `tests/Invoke-<Action>Action.Tests.ps1`, every outer `Describe` named `'switch_claude_account'`, and `tests/Common.ps1` dot-sourced from each `BeforeEach` to sandbox both home variables, `CLAUDE_CONFIG_DIR` and `$PROFILE.CurrentUserAllHosts` into `$TestDrive`. The filter recipes, the direct-call pattern, the output-capture rule, reading the result and the complexity diagnostic are `docs/testing.md`. When `integrations/omp/` changes, also run `node --test "integrations/omp/*.test.ts"` (`docs/testing.md` → *The omp extension*).
 
 ## README image regeneration
 
