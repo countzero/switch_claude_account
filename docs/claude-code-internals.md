@@ -219,3 +219,45 @@ bytes are split into base64 chunks named `<service>#0..#n` with a `#m` manifest.
 Reading that back would mean P/Invoking `CredRead`/`CredWrite` and
 reimplementing the chunking, which is not worth building against a flag nobody
 has been observed to receive.
+
+## omp (oh-my-pi)
+
+Read from the omp source at tag **`v18.4.4`** (commit `8ac1309b`) on 2026-09-30;
+the rows marked *spike* were also observed against the 18.4.4 binary through a
+throwaway extension. This is the evidence behind the rules stated in
+`integrations/omp/claude_credentials.ts`. Paths are relative to the omp
+repository.
+
+| Fact                                                                                                                                                                                           | Where                                            | Spike |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ | ----- |
+| omp itself never reads `.credentials.json` or `claudeAiOauth`                                                                                                                                  | code search                                      |       |
+| `registerProvider("anthropic", { oauth })` without `baseUrl` / `models` keeps the built-in model catalog                                                                                       | `config/model-registry.ts`                       | yes   |
+| The override replaces refresh and key building only; the built-in `/login anthropic` still runs and adds a row of its own                                                                      | `ai/src/auth/oauth.ts`                           |       |
+| `getApiKey(creds)` is synchronous and runs on every resolve, fresh token or not, model discovery included                                                                                      | `ai/src/auth/select.ts`                          | yes   |
+| The provider is consulted only when a stored `anthropic` oauth row exists                                                                                                                      | `select.ts` → `resolveOAuth`                     |       |
+| `session_start` gets `(event, ctx)`; `ctx.modelRegistry.authStorage.credentials` is the credential pool                                                                                        | `extensibility/extensions/types.ts`              | yes   |
+| `pool.set(provider, row)` leaves one enabled row and keeps each replaced one, disabled as "replaced by newer credential"; `entries()` lists enabled rows as `{ id, credential }`               | `ai/src/auth/pool.ts`                            | yes   |
+| `upsertOAuth` on a row with no email or accountId adds a row each time, and two rows engage omp's usage-ranked rotation                                                                        | `sqlite-credential-store.ts`, `select.ts`        |       |
+| A token containing `sk-ant-oat` is sent as a subscription login (Claude Code headers and system prompt)                                                                                        | `catalog/src/utils.ts`                           | yes   |
+| `refreshToken` runs once `now + 60 s >= expires`, or on a 401 with `expires: 0`; its result is persisted                                                                                       | `ai/src/auth/refresh.ts`                         |       |
+| A refresh error matching `invalid_grant`, `invalid_token`, `unauthorized_client`, `revoked`, `refresh token expired` or 401/403 disables the row for good; any other error blocks it 5 minutes | `ai/src/error/flags.ts`, `refresh.ts`            |       |
+| An upstream "invalidated oauth token" answer disables the row whatever its source, and emits `credential_disabled`                                                                             | `error/auth-classify.ts`, `auth/rotation.ts`     |       |
+| Usage polling and discovery preflight send the stored row's `access`, not `getApiKey`'s                                                                                                        | `ai/src/auth/usage.ts`, `ai/src/auth/cascade.ts` |       |
+| An auth broker (`OMP_AUTH_BROKER_URL`, `auth.broker.*`) refreshes through omp's built-in path instead                                                                                          | `ai/src/auth/refresh.ts`                         |       |
+
+Re-verify against a new omp release by checking out its tag and searching for
+the markers each row rests on:
+
+```powershell
+git clone --depth 1 --branch v<version> <omp repository> omp
+Set-Location omp
+git grep -n 'claudeAiOauth'                        # expect nothing
+git grep -n 'getApiKey' -- '*select.ts'            # still called per resolve
+git grep -n 'invalid_grant' -- '*flags.ts'         # the disable patterns
+git grep -n 'sk-ant-oat' -- '*utils.ts'            # subscription detection
+git grep -n 'broker' -- '*refresh.ts'              # broker bypass
+```
+
+Then run `node --test "integrations/omp/*.test.ts"`, whose disable-pattern test
+must be updated to match a changed `flags.ts`. A row whose marker moved needs
+its file re-read before the extension is trusted on that release.

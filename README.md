@@ -23,7 +23,7 @@ A zero-dependency PowerShell utility for Claude Code on Windows, Linux, and macO
 **Automation**
 
 - **Auto-reconcile**: silently captures Claude Code's hourly token refreshes into the tracked slot; auto-saves cross-account swaps under a timestamped name so you never lose state
-- **Smart rotation**: `sca monitor` auto-rotates to the next eligible slot when the active one hits a usage threshold (default 95%); works with Claude Code or OpenCode running, no restart needed
+- **Smart rotation**: `sca monitor` auto-rotates to the next eligible slot when the active one hits a usage threshold (default 95%); works with Claude Code, OpenCode or [omp](#using-oh-my-pi-omp) running, no restart needed
 - **Cold-slot warmup**: `sca warmup` (and `sca monitor -KeepWarm`) opens each dormant slot's 5h window by running the real Claude Code CLI, so Anthropic reports usage data for every account (billable)
 
 **Reliability & footprint**
@@ -232,7 +232,7 @@ Peer slots are walked in alphabetical wrap order (same direction as `sca switch`
 </p>
 
 > [!NOTE]
-> **Works with a live client, either one.** Rotation lands in `.credentials.json` and `~/.claude.json`, and both clients follow it without a restart: Claude Code from 2.1.274 on, and OpenCode via [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4**. Leave the app open while `sca monitor` runs, with or without `-KeepWarm`; see [which actions](#which-actions-still-need-claude-code-closed) for the only one that still needs it closed.
+> **Works with a live client.** Rotation lands in `.credentials.json` and `~/.claude.json`, and each client follows it without a restart: Claude Code from 2.1.274 on, OpenCode via [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4**, and omp via [the bundled extension](#using-oh-my-pi-omp). Leave the app open while `sca monitor` runs, with or without `-KeepWarm`; see [which actions](#which-actions-still-need-claude-code-closed) for the only one that still needs it closed.
 
 ### Install / uninstall alias
 
@@ -282,6 +282,20 @@ The active credentials could not be attributed to an account, so nothing capture
 account can be resolved; if it stays unresolved while you are online, close Claude
 Code and run 'sca save work' to capture them by hand.
 ```
+
+### Using oh-my-pi (omp)
+
+omp (oh-my-pi) keeps its own Anthropic login, so on its own it does not follow `sca`. The extension at `integrations/omp/claude_credentials.ts` makes it read Claude Code's `.credentials.json` instead, so `sca switch` and `sca monitor` switch omp as well, with no restart. Verified against omp 18.4.4. Load it from your checkout in `~/.omp/agent/config.yml`:
+
+```yaml
+extensions:
+  - D:/path/to/switch_claude_account/integrations/omp/claude_credentials.ts
+```
+
+- **It only reads the file.** It never refreshes a token itself, because a second party rotating the same refresh token invalidates the copy in your slot. When the token in the file has expired, it runs `claude -p` once on Haiku (~$0.004, up to 90 s) so Claude Code refreshes under its own lock. If that fails, omp retries in 5 minutes; start Claude Code or run `sca usage` in the meantime.
+- **omp's own rotation stays off.** The extension keeps exactly one Anthropic login in omp, so `sca monitor` stays the only thing that rotates. A `/login anthropic` inside omp is replaced on the next request.
+- **Needs the native `claude` CLI on `PATH`** for the expiry fallback. An npm-installed `claude.cmd` on Windows is not started.
+- **Not compatible with an omp auth broker** (`OMP_AUTH_BROKER_URL` or `auth.broker.*`), which bypasses the extension's refresh with omp's own.
 
 ### Which actions still need Claude Code closed
 

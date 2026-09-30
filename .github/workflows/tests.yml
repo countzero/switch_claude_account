@@ -135,3 +135,23 @@ jobs:
         shell: pwsh
         timeout-minutes: 3
         run: ./tests/Invoke-WatchPtyProbe.ps1
+
+  omp-extension:
+    # Separate from pester so a failure names the half that broke. Node 24 is
+    # the floor that runs the .ts files by type stripping, without a build.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Run omp extension tests
+        run: node --test "integrations/omp/*.test.ts"
