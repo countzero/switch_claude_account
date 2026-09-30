@@ -32,7 +32,8 @@ may use only erasable syntax: no `enum`, no parameter properties, `import type` 
 types. Quote the glob: Node expands it itself, identically on every OS, and does not
 accept a bare directory. The tests inject the file reader, the clock and the `claude`
 runner, so they touch no file and spawn no process; fake tokens only. They are
-independent of the Pester suite and its coverage gate.
+independent of the Pester suite and its coverage gate, and CI does not run them, so
+this local run is their only gate.
 
 ### Reading the result
 
