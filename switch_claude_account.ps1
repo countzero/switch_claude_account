@@ -1659,8 +1659,8 @@ function Show-Help {
         "NOTES",
         "  • 'switch', 'monitor' and 'warmup' work with Claude Code open; it follows the swap.",
         "  • Close Claude Code / VS Code before 'save'; every other action runs beside it.",
-        "  • Needs Claude Code >= 2.1.274, OpenCode + opencode-claude-auth >= 1.5.4,",
-        "    or omp + integrations/omp/claude_credentials.ts.",
+        "  • Needs Claude Code >= 2.1.274, OpenCode 2 + opencode-claude-auth >= 3.0.0",
+        "    (OpenCode 1: 1.5.4–2.2.1), or omp + integrations/omp/claude_credentials.ts.",
         ""
     )
 
@@ -6128,8 +6128,9 @@ function Invoke-UsageAction {
 # the whole slot fleet, so scoping to one slot is meaningless.
 #
 # Rotation needs the client to re-read .credentials.json when its cached token
-# misses, which opencode-claude-auth >= 1.5.4, Claude Code >= 2.1.274 and the
-# omp extension in integrations/omp all do, so `monitor` runs beside any of
+# misses, which Claude Code >= 2.1.274, the omp extension in integrations/omp
+# and opencode-claude-auth (>= 3.0.0 on OpenCode 2, 1.5.4-2.2.1 on OpenCode 1;
+# only before a refresh or after a 401) all do, so `monitor` runs beside any of
 # them with or without -KeepWarm; see
 # Test-ClaudeRunning for what the keep-warm round-robin costs a live session.
 function Invoke-MonitorAction {

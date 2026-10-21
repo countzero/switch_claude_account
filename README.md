@@ -23,7 +23,7 @@ A zero-dependency PowerShell utility for Claude Code on Windows, Linux, and macO
 **Automation**
 
 - **Auto-reconcile**: silently captures Claude Code's hourly token refreshes into the tracked slot; auto-saves cross-account swaps under a timestamped name so you never lose state
-- **Smart rotation**: `sca monitor` auto-rotates to the next eligible slot when the active one hits a usage threshold (default 95%); works with Claude Code, OpenCode or [omp](#using-oh-my-pi-omp) running, no restart needed
+- **Smart rotation**: `sca monitor` auto-rotates to the next eligible slot when the active one hits a usage threshold (default 95%); works with Claude Code, OpenCode or [omp](#using-oh-my-pi-omp) running, no restart needed (OpenCode follows at its next token refresh or 401)
 - **Cold-slot warmup**: `sca warmup` (and `sca monitor -KeepWarm`) opens each dormant slot's 5h window by running the real Claude Code CLI, so Anthropic reports usage data for every account (billable)
 
 **Reliability & footprint**
@@ -232,7 +232,7 @@ Peer slots are walked in alphabetical wrap order (same direction as `sca switch`
 </p>
 
 > [!NOTE]
-> **Works with a live client.** Rotation lands in `.credentials.json` and `~/.claude.json`, and each client follows it without a restart: Claude Code from 2.1.274 on, OpenCode via [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4**, and omp via [the bundled extension](#using-oh-my-pi-omp). Leave the app open while `sca monitor` runs, with or without `-KeepWarm`; see [which actions](#which-actions-still-need-claude-code-closed) for the only one that still needs it closed.
+> **Works with a live client.** Rotation lands in `.credentials.json` and `~/.claude.json`, and each client follows it without a restart: Claude Code from 2.1.274 on, OpenCode via [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) (**>= 3.0.0** on OpenCode 2, 1.5.4–2.2.1 on OpenCode 1), and omp via [the bundled extension](#using-oh-my-pi-omp). On OpenCode 2, run `/connect` → Anthropic → "Import Claude Code subscription" once after installing the plugin; OpenCode then picks up a rotated account at its next token refresh or after a 401, not instantly. Leave the app open while `sca monitor` runs, with or without `-KeepWarm`; see [which actions](#which-actions-still-need-claude-code-closed) for the only one that still needs it closed.
 
 ### Install / uninstall alias
 
@@ -266,7 +266,7 @@ sca help         # Show usage info
 
 Claude Code 2.1.274 follows both files on its own: it polls `~/.claude.json` once a second and picks up external edits, and it re-`stat`s `.credentials.json` at the top of every token-refresh check, dropping its cached credentials when the file moved. Verified against 2.1.274 by handing a running session a different account's credentials mid-request; it re-read them and hit the *new* account's rate limit four seconds later.
 
-That makes Claude Code equivalent to [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) **>= 1.5.4** for this purpose.
+OpenCode does the same through [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) (**>= 3.0.0** on OpenCode 2, 1.5.4–2.2.1 on OpenCode 1), with two differences: on OpenCode 2 it needs a one-time `/connect` → Anthropic → "Import Claude Code subscription", and it re-reads `.credentials.json` only before a token refresh or after a 401, so a rotation reaches it then rather than instantly.
 
 One residual difference from closing the app: `sca` does not take Claude Code's `~/.claude.json.lock`. It re-reads that file immediately before writing and starts over, then gives up, rather than overwrite a change that landed while it was working. That narrows the window to the write itself without closing it. What is at stake there is configuration and per-project prompt history, never a credential.
 
