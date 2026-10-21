@@ -3,6 +3,19 @@
 This changelog follows [Common Changelog](https://common-changelog.org) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.4.0] - 2026-10-21
+
+_On OpenCode 2 a hot swap needs `opencode-claude-auth` >= 3.0.0 and a one-time `/connect` → Anthropic → "Import Claude Code subscription"._
+
+### Changed
+- Name `opencode-claude-auth` >= 3.0.0 as the OpenCode 2 requirement in `sca help` and the README, and 1.5.4–2.2.1 for OpenCode 1.
+
+### Added
+- Add an omp extension at `integrations/omp/claude_credentials.ts`, so `sca switch` and `sca monitor` reach a running omp.
+
+### Fixed
+- Correct the README's claim that OpenCode follows a rotation at once; it picks it up at its next token refresh or 401.
+
 ## [4.3.2] - 2026-09-24
 
 ### Changed
@@ -339,6 +352,7 @@ _Upgrading migrates active-slot tracking from hardlinks to a state file on first
 - Add a README with installation, usage, workflow, Windows notes and testing sections.
 - Add `CLAUDE.md` with agent guidance for the repo structure, gotchas and script-shape conventions.
 
+[4.4.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.4.0
 [4.3.2]: https://github.com/countzero/switch_claude_account/releases/tag/v4.3.2
 [4.3.1]: https://github.com/countzero/switch_claude_account/releases/tag/v4.3.1
 [4.3.0]: https://github.com/countzero/switch_claude_account/releases/tag/v4.3.0
