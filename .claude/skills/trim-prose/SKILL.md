@@ -23,7 +23,7 @@ dies with the shell call that set it and a pass always spans several calls:
 
 ```powershell
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-$SessionId = $env:SESSION_ID   # Claude Code: the id from the session-start context
+$SessionId = $env:OPENCODE_SESSION_ID ?? $env:SESSION_ID   # Claude Code: the id from the session-start context
 if ($SessionId -notmatch '^[\w-]+$') { throw 'No session id: AGENTS.md → Multi-Agent Working Tree Discipline, rule 3' }
 $Root    = git rev-parse --show-toplevel
 $Scratch = Join-Path $Root ".tmp/sessions/$SessionId/trim-prose"
