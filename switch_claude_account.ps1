@@ -86,13 +86,15 @@ Param (
     # -Threshold: utilization percentage at or above which `sca monitor`
     # rotates to the next eligible slot. Applied to
     # max(five_hour.utilization, seven_day.utilization) on the active slot;
-    # null bucket counts as 0%. Range [1, 100]; default 95 leaves a small
-    # safety margin because /api/oauth/usage reporting lags real
-    # consumption; rotating exactly at 100 risks overshooting before the
-    # next poll lands. In __AllParameterSets (monitor has no switch anchor;
-    # see -Interval); a non-monitor action ignores it.
+    # null bucket counts as 0%. Range [1, 100]; default 100 drains a slot
+    # before leaving it. A margin strands the left slot's remainder, and a
+    # peer entered later holding only that remainder spends it on the
+    # cache-cold re-read of the whole context the switch forces. The price is
+    # one turn rejected at the limit per rotation, until the next poll swaps.
+    # In __AllParameterSets (monitor has no switch anchor; see -Interval); a
+    # non-monitor action ignores it.
     [ValidateRange(1, 100)]
-    [int] $Threshold = 95,
+    [int] $Threshold = 100,
 
     # -KeepWarm: in `sca monitor`, also keep every saved slot warm for the
     # life of the watch -- a startup warm pass plus a per-poll re-warm of
@@ -250,7 +252,7 @@ $ProfilePath    = $PROFILE.CurrentUserAllHosts
 # the [switch] $Version parameter declared above: a same-named parameter
 # enforces its [switch] type on every assignment to the script-scope
 # variable, silently coercing this string to $true.
-$Script:ScriptVersion = '4.4.0'
+$Script:ScriptVersion = '4.5.0'
 
 # Marker constants delimiting the block we manage in the user's profile.
 # Kept at script scope so both Add-To-Profile and Remove-From-Profile share
@@ -1613,7 +1615,7 @@ function Show-Help {
         "    -Json            Emit usage as machine-readable JSON",
         "",
         "  MONITOR",
-        "    -Threshold <n>   Rotate slots at or above this utilization % (default 95)",
+        "    -Threshold <n>   Rotate slots at or above this utilization % (default 100)",
         "    -KeepWarm        Keep every slot warm by re-opening closed 5h windows each poll",
         "    -Interval <sec>  Seconds between polls (default 60)",
         "",
@@ -1635,8 +1637,8 @@ function Show-Help {
         "  sca usage -Json                  # machine-readable JSON for scripting",
         "  sca warmup                       # open every slot's 5h window once",
         "  sca warmup slot-2                # warm just one slot",
-        "  sca monitor                      # auto-rotate when the active slot hits 95%",
-        "  sca monitor -Threshold 90        # rotate earlier (default is 95%)",
+        "  sca monitor                      # auto-rotate when the active slot hits 100%",
+        "  sca monitor -Threshold 90        # rotate earlier (default is 100%)",
         "  sca monitor -KeepWarm            # auto-rotate AND keep all slots warm (recommended)",
         "",
         # Resolved rather than written as literals: the paths differ per
@@ -6136,7 +6138,7 @@ function Invoke-UsageAction {
 function Invoke-MonitorAction {
     Param (
         [string] $Name,
-        [int]    $Threshold = 95,
+        [int]    $Threshold = 100,
         [switch] $KeepWarm,
         [int]    $Interval  = $Script:UsageWatchMinInterval
     )
@@ -7711,7 +7713,7 @@ function Invoke-UsageWatch {
         [switch] $Auto,
         # -Threshold: utilization percentage (1..100) at or above which
         # -Auto fires a rotation. Ignored when -Auto is absent.
-        [int]    $Threshold = 95,
+        [int]    $Threshold = 100,
         # -Warmup: keep every saved slot warm for the life of the watch.
         # Invoke-WatchStartupWarm activates every slot via the real Claude
         # Code CLI (`claude -p`) before the first poll; thereafter

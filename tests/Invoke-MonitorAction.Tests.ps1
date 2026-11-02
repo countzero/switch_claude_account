@@ -43,10 +43,10 @@ Describe 'switch_claude_account' {
             Should -Invoke Invoke-UsageWatch -Times 1 -Exactly -ParameterFilter { $Auto }
         }
 
-        It 'passes the default threshold of 95 and no keep-warm by default' {
+        It 'passes the default threshold of 100 and no keep-warm by default' {
             Invoke-MonitorAction
             Should -Invoke Invoke-UsageWatch -Times 1 -Exactly -ParameterFilter {
-                $Auto -and $Threshold -eq 95 -and -not $Warmup
+                $Auto -and $Threshold -eq 100 -and -not $Warmup
             }
         }
 

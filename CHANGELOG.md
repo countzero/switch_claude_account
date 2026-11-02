@@ -3,6 +3,13 @@
 This changelog follows [Common Changelog](https://common-changelog.org) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.5.0] - 2026-11-02
+
+_`sca monitor` now leaves a slot only once it is full, so the turn that hits the limit fails until the next poll; `-Threshold 95` restores the old margin._
+
+### Changed
+- **Monitor**: Raise the default `-Threshold` of `sca monitor` from 95% to 100%.
+
 ## [4.4.0] - 2026-10-21
 
 _On OpenCode 2 a hot swap needs `opencode-claude-auth` >= 3.0.0 and a one-time `/connect` → Anthropic → "Import Claude Code subscription"._

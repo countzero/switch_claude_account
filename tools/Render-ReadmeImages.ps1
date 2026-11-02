@@ -204,7 +204,7 @@ $verboseLines = @(
 # --- Block 4: monitor ------------------------------------------------------
 # Same five-row watch frame as Block 1, plus the two auto-rotation artifacts:
 #
-#   1. Right-aligned header indicator '▶ switching slot at 95%'. Glyph
+#   1. Right-aligned header indicator '▶ switching slot at 100%'. Glyph
 #      in Neutral (white-ish, high-contrast lozenge); text in Muted
 #      (matches footer ambient-metadata weight). Format-UsageTable in
 #      switch_claude_account.ps1 has the runtime's three-segment Write-Color
@@ -213,8 +213,8 @@ $verboseLines = @(
 #      Pad count math (right-edge alignment): widest body row in the
 #      watch frame is 78 cols (e.g. the 'legacy' row). Header
 #      '[Usage] Plan usage' = 18 chars. Indicator '▶ switching slot at
-#      95%' = 23 chars ('▶' = 1 by .Length, matching the runtime which
-#      also uses .Length for its width math). Pad = 78 - 18 - 23 = 37.
+#      100%' = 24 chars ('▶' = 1 by .Length, matching the runtime which
+#      also uses .Length for its width math). Pad = 78 - 18 - 24 = 36.
 #      Result: indicator's right edge lines up with the right edge of
 #      the table's Status column.
 #
@@ -231,7 +231,7 @@ $verboseLines = @(
 #
 # Body rows identical to $watchLines so the two SVGs diff visually as
 # auto-mode-on vs. auto-mode-off with no other deltas.
-$autoHeaderPad   = ' ' * 37
+$autoHeaderPad   = ' ' * 36
 $autoGlyph       = "$([char]0x25B6)"
 
 # Role -> SGR for the palette the four README scenes are drawn in. Campbell is
@@ -253,7 +253,7 @@ function New-HeroLines {
     $dg = $Palette.Danger;  $mt = $Palette.Muted;   $nt = $Palette.Neutral
 
     return @(
-        "$hd[Usage] Plan usage$RESET$autoHeaderPad$nt$autoGlyph$RESET$mt switching slot at 95%$RESET",
+        "$hd[Usage] Plan usage$RESET$autoHeaderPad$nt$autoGlyph$RESET$mt switching slot at 100%$RESET",
         "",
         "",
         "$sc  Session [██████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]  25%$RESET",
