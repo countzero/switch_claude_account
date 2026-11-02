@@ -5,7 +5,7 @@
 A zero-dependency PowerShell utility for Claude Code on Windows, Linux, and macOS that combines secure multi-account management with a live usage dashboard and automated limit-based rotation.
 
 <p align="center">
-  <img src="docs/images/monitor.svg" alt="sca monitor: pool-aggregate Session bar at 25% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, a right-aligned '▶ switching slot at 95%' header indicator, and a '[Monitor] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
+  <img src="docs/images/monitor.svg" alt="sca monitor: pool-aggregate Session bar at 25% (green) and Week bar at 62% (yellow), then a five-row slot table with the active 'work' row in green, two inactive 'ok' rows, one yellow 'near limit' row, one red 'limited 7d' row, a right-aligned '▶ switching slot at 100%' header indicator, and a '[Monitor] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
 </p>
 
 ## Features
@@ -23,7 +23,7 @@ A zero-dependency PowerShell utility for Claude Code on Windows, Linux, and macO
 **Automation**
 
 - **Auto-reconcile**: silently captures Claude Code's hourly token refreshes into the tracked slot; auto-saves cross-account swaps under a timestamped name so you never lose state
-- **Smart rotation**: `sca monitor` auto-rotates to the next eligible slot when the active one hits a usage threshold (default 95%); works with Claude Code, OpenCode or [omp](#using-oh-my-pi-omp) running, no restart needed (OpenCode follows at its next token refresh or 401)
+- **Smart rotation**: `sca monitor` auto-rotates to the next eligible slot when the active one hits a usage threshold (default 100%); works with Claude Code, OpenCode or [omp](#using-oh-my-pi-omp) running, no restart needed (OpenCode follows at its next token refresh or 401)
 - **Cold-slot warmup**: `sca warmup` (and `sca monitor -KeepWarm`) opens each dormant slot's 5h window by running the real Claude Code CLI, so Anthropic reports usage data for every account (billable)
 
 **Reliability & footprint**
@@ -220,7 +220,7 @@ Both `sca warmup` and `sca monitor -KeepWarm` run with Claude Code open, and `sc
 `sca monitor` is a live watch that auto-rotates to the next eligible slot when the active slot's `max(Session, Week)` utilization hits the threshold. Rotation is what `monitor` is for, so it is always on; for a live view that does not rotate use `sca usage -Watch` instead.
 
 ```powershell
-sca monitor                  # rotate when active slot hits 95% (default)
+sca monitor                  # rotate when active slot hits 100% (default)
 sca monitor -Threshold 90    # rotate earlier on either bucket
 sca monitor -KeepWarm        # also keep every slot warm (billable)
 ```
@@ -228,7 +228,7 @@ sca monitor -KeepWarm        # also keep every slot warm (billable)
 Peer slots are walked in alphabetical wrap order (same direction as `sca switch` without a name); peers that are themselves at or above the threshold are skipped, as are peers with non-`ok` HTTP status. When no peer is eligible, the footer surfaces the soonest reset across all slots as a cooldown ETA: `[Monitor] No free slot available! Cooling down for 1h 12m.`. The mode is indicated on every frame by a right-aligned `▶ switching slot at N%` header indicator plus a latched `[Monitor] …` footer line.
 
 <p align="center">
-  <img src="docs/images/monitor.svg" alt="sca monitor: same five-row slot table as the watch view, with a right-aligned '▶ switching slot at 95%' header indicator and a '[Monitor] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
+  <img src="docs/images/monitor.svg" alt="sca monitor: same five-row slot table as the watch view, with a right-aligned '▶ switching slot at 100%' header indicator and a '[Monitor] Rotated from \"legacy\" to \"work\" at 14:31:58' footer line above the [Watch] Last poll line" width="720">
 </p>
 
 > [!NOTE]
